@@ -1,0 +1,14 @@
+{
+  "name": "Xenia Canary — Web",
+  "short_name": "Xenia Web",
+  "description": "Browser port of the xenia-canary Xbox 360 emulator core: Xenon PPC interpreter, XEX2 inspection, OPFS dump library.",
+  "id": "/",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0e1420",
+  "theme_color": "#0e1420",
+  "categories": ["games", "developer-tools", "utilities"],
+  "icons": [
+    { "src": "icons/xenia-web.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
