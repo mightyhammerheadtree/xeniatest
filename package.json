@@ -10,9 +10,10 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "npm run test:core && npm run test:builtins && npm run test:web",
+    "test": "npm run test:core && npm run test:builtins && npm run test:elf && npm run test:web",
     "test:core": "node --test core/tests/test_core.mjs",
     "test:builtins": "node --test core/tests/test_builtins.mjs",
+    "test:elf": "node --test core/tests/test_elf_loader.mjs",
     "test:web": "node --test core/tests/test_webapp.mjs",
     "build:core": "python3 core/build_core.py",
     "port:decoder": "./core/port_xenia_decoder.sh /path/to/xenia-canary"
