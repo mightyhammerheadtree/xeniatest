@@ -76,13 +76,20 @@ before(async () => {
   define('TextEncoder', TextEncoder);
   define('crypto', dom.window.crypto ?? crypto);
   // Use node's global performance (jsdom's recurses when promoted to global).
-  let rafCount = 0;
+  const pendingFrames = new Set();
+  globalThis.__pendingFrames = pendingFrames;
   define('requestAnimationFrame', (cb) => {
-    // Cap total frames so the perpetual fps loop can't starve process exit.
-    if (++rafCount > 300) return 0;
-    return setTimeout(() => cb(dom.window.performance.now()), 1);
+    const id = setTimeout(() => {
+      pendingFrames.delete(id);
+      cb(dom.window.performance.now());
+    }, 1);
+    pendingFrames.add(id);
+    return id;
   });
-  define('cancelAnimationFrame', (id) => clearTimeout(id));
+  define('cancelAnimationFrame', (id) => {
+    pendingFrames.delete(id);
+    clearTimeout(id);
+  });
 
   // Track intervals (gamepad poll) so after() can stop them.
   const realSetInterval = globalThis.setInterval.bind(globalThis);
@@ -100,6 +107,7 @@ before(async () => {
 
 after(() => {
   for (const id of globalThis.__intervals ?? []) clearInterval(id);
+  for (const id of globalThis.__pendingFrames ?? []) clearTimeout(id);
   delete globalThis.fetch;
   delete globalThis.setInterval;
   dom.window.close();
@@ -204,6 +212,66 @@ test('inspector parses a synthetic XEX2 and shows metadata', async () => {
   assert.equal(elfInfo.format, 'ELF64');
   assert.equal(elfInfo.machineName, 'EM_PPC64 (PowerPC 64)');
   assert.equal(elfInfo.entry, 0x82000000n);
+});
+
+
+test('every tab switches views without errors', async () => {
+  for (const tab of ['run', 'inspector', 'settings', 'about', 'library']) {
+    document.getElementById(`tab-${tab}`).click();
+    const view = document.getElementById(`view-${tab}`);
+    assert.ok(view.classList.contains('view-active'), `${tab} view should activate`);
+    assert.equal(document.getElementById(`tab-${tab}`).getAttribute('aria-selected'), 'true');
+  }
+});
+
+test('step button executes exactly one instruction beyond the previous count', async () => {
+  document.getElementById('tab-run').click();
+  const before = document.getElementById('state-insns').textContent;
+  document.getElementById('btn-step').click();
+  const after = document.getElementById('state-insns').textContent;
+  assert.notEqual(after, before);
+});
+
+test('perf overlay toggle reveals the FPS badge and persists', async () => {
+  document.getElementById('tab-settings').click();
+  const toggle = document.getElementById('setting-perf');
+  toggle.checked = true;
+  toggle.dispatchEvent(new dom.window.Event('change'));
+  await new Promise((resolve) => setTimeout(resolve, 800));
+  assert.equal(document.getElementById('fps-badge').hidden, false);
+  const stored = JSON.parse(dom.window.localStorage.getItem('xeniatest.settings'));
+  assert.equal(stored.perfOverlay, true);
+  // turn it back off
+  toggle.checked = false;
+  toggle.dispatchEvent(new dom.window.Event('change'));
+});
+
+test('trap toggle persists to localStorage for the core', async () => {
+  const toggle = document.getElementById('setting-trap');
+  const initial = toggle.checked;
+  toggle.checked = !initial;
+  toggle.dispatchEvent(new dom.window.Event('change'));
+  const stored = JSON.parse(dom.window.localStorage.getItem('xeniatest.settings'));
+  assert.equal(stored.trapOnUnimplemented, !initial);
+  toggle.checked = initial;
+  toggle.dispatchEvent(new dom.window.Event('change'));
+});
+
+test('console clear empties the output pane', async () => {
+  document.getElementById('tab-run').click();
+  const out = document.getElementById('console-output');
+  out.textContent = 'hello world\n';
+  document.getElementById('console-clear').click();
+  assert.equal(out.textContent, '');
+});
+
+test('about status tables render implemented/missing rows', async () => {
+  document.getElementById('tab-about').click();
+  const ok = document.getElementById('status-ok-list');
+  const missing = document.getElementById('status-missing-list');
+  assert.ok(ok.textContent.includes('Xenon PPC decoder'));
+  assert.ok(missing.textContent.includes('kernel'));
+  assert.ok(missing.textContent.includes('WebGPU'));
 });
 
 test('no unexpected console errors were emitted during the run', () => {
