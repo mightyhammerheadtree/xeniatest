@@ -1,7 +1,7 @@
 """PPC64 (big-endian) → C lifter for Xbox 360 code.
 
 Emits C against templates/web-runtime/recomp_types.h. Register semantics
-mirror this repo's validated WASM interpreter (core/src/xenon_cpu.cc).
+mirror the semantics used by the JS recompiler (public/js/recomp/).
 
 An instruction with no translation becomes `recomp_unimpl(...)` — it never
 fails to compile; reaching it at run time is reported through the runtime.

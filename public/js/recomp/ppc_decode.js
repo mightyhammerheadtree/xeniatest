@@ -1,8 +1,7 @@
 /**
  * ppc_decode.js — PowerPC64 (big-endian) decoder for the web static
  * recompiler. Dependency-free. X-form/A-form opcode matching uses xenia's
- * masked base-opcode constants (BSD-3, xenia-canary), which this repo already
- * mirrors in its WASM interpreter.
+ * masked base-opcode constants (BSD-3, xenia-canary).
  *
  * Returns { name, address, word, ...fields }. Unknown instructions get
  * { name: 'op<primary>' } and are rejected loudly by the lifter.

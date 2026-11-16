@@ -15,12 +15,12 @@
  *
  * MMIO console window [0x00F00000, 0x00F01000) and the exit door at
  * 0x00F00FFC are routed to host imports (xenorecomp.mmio_store / mmio_load),
- * identical in behavior to the interpreter core.
+ * identical in behavior to the guest's architectural semantics.
  */
 import { decodeInstruction } from './ppc_decode.js';
 import { WasmBuilder, Ops, sleb, uleb } from './wasm_emitter.js';
 
-const GUEST_MEM_MASK = 0x03ffffff; // 64 MiB flat arena, same as the interpreter
+export const GUEST_MEM_MASK = 0x03ffffff; // 64 MiB flat arena
 export const GUEST_MEM_SIZE = 64 * 1024 * 1024;
 export const MMIO_BASE = 0x00f00000;
 export const MMIO_END = 0x00f01000;
@@ -46,12 +46,13 @@ export function buildImage(kind, parsed, bytes) {
   const arena = new Uint8Array(GUEST_MEM_SIZE);
   let entry = 0;
   let base = IMAGE_BASE_DEFAULT;
+  const segments = [];
   if (kind === 'bin') {
     const n = Math.min(bytes.length, GUEST_MEM_SIZE);
     arena.set(bytes.subarray(0, n), IMAGE_BASE_DEFAULT);
+    segments.push({ addr: IMAGE_BASE_DEFAULT, data: bytes.subarray(0, n).slice() });
     entry = IMAGE_BASE_DEFAULT;
   } else if (kind === 'elf') {
-    const is64 = parsed.klass === 64;
     for (const ph of parsed.programHeaders) {
       if (ph.type !== 1) continue; // PT_LOAD
       const off = Number(ph.offset), vaddr = Number(ph.vaddr) & GUEST_MEM_MASK;
@@ -59,6 +60,7 @@ export function buildImage(kind, parsed, bytes) {
       const n = Math.min(filesz, Math.max(0, GUEST_MEM_SIZE - vaddr));
       arena.set(bytes.subarray(off, off + n), vaddr);
       if (memsz > filesz) arena.fill(0, vaddr + n, Math.min(vaddr + memsz, GUEST_MEM_SIZE));
+      segments.push({ addr: vaddr, data: bytes.subarray(off, off + n).slice() });
     }
     entry = Number(parsed.entry) & GUEST_MEM_MASK;
     base = entry;
@@ -73,13 +75,14 @@ export function buildImage(kind, parsed, bytes) {
     const n = Math.min(Math.max(0, imgSize), bytes.length - headerSize, GUEST_MEM_SIZE - loadBase);
     if (n <= 0) throw new RecompError('XEX2: no image data found (encrypted XEX2 is not supported — see docs/KERNELS.md)');
     arena.set(bytes.subarray(headerSize, headerSize + n), loadBase);
+    segments.push({ addr: loadBase, data: bytes.subarray(headerSize, headerSize + n).slice() });
     // Entry point from opt header 0x00010100
     entry = parsed.entryPoint != null ? Number(parsed.entryPoint) & GUEST_MEM_MASK : loadBase;
     base = loadBase;
   } else {
     throw new RecompError('unsupported image kind: ' + kind);
   }
-  return { arena, entry, base };
+  return { arena, entry, base, segments };
 }
 
 /** Discovery -------------------------------------------------------------- */
@@ -760,7 +763,7 @@ Object.assign(FragmentCompiler.prototype, {
 
 Object.assign(FragmentCompiler.prototype, {
   /**
-   * Unified 64-bit add-with-carry chain matching the interpreter:
+   * Unified 64-bit add-with-carry chain matching PowerISA semantics:
    *   t1 = a + b (wraps); c1 = t1 <u a; sum = t1 + cin; c2 = sum <u t1; ca = c1|c2
    * @param aOps operand A (i64 on stack producer) @param bOps operand B producer
    * @param cinOps 'one' | 'xer' | 'zero' @param setCA whether to write XER.CA
@@ -805,7 +808,7 @@ Object.assign(FragmentCompiler.prototype, {
   emitSubf(insn, name) {
     const RT = insn.RT, RA = insn.RA, RB = insn.RB;
     const isBase = name === 'subf' || name === 'subfc';
-    const setCA = name !== 'subf'; // subf (plain) does not write CA; interpreter parity
+    const setCA = name !== 'subf'; // subf (plain) does not write CA
     const aOps = RA === 0 ? [O.i64_const(0n)] : [O.global_get(RA)];
     const aInv = [...aOps, ...O.i64_const(-1n), O.i64_xor];
     let bOps, cin;
@@ -1143,7 +1146,7 @@ export function makeImports({ onConsoleByte, onSc } = {}) {
         fn();
       },
       mmio_store(addr, value, size) {
-        // Mirror the interpreter: echo big-endian bytes before the exit door; exit door halts.
+        // Echo big-endian bytes before the exit door; the exit door halts the guest.
         const a = Number(addr);
         const sizeBytes = size | 0;
         const v = BigInt(value);

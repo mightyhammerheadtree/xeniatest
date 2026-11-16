@@ -1,5 +1,5 @@
 /**
- * Xenia Canary - Web: static file server.
+ * Xenon Recompiler: static file server.
  *
  * Serves public/ on 0.0.0.0:$PORT (default 3000) with the headers a modern
  * emulator front-end needs:
@@ -96,7 +96,7 @@ app.get('*', (req, res) => {
 });
 
 const server = app.listen(PORT, HOST, () => {
-  console.log(`xenia-canary-web listening on http://${HOST}:${PORT}`);
+  console.log(`xenorecomp-web listening on http://${HOST}:${PORT}`);
   console.log(`crossOriginIsolated headers: COOP=same-origin COEP=require-corp`);
 });
 

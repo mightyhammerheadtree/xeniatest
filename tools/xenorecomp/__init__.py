@@ -7,7 +7,7 @@ big-endian) → C → WebAssembly". The generated project is a static binary wit
 the kernel minimally HLE'd for the guest's used subset, compiled to WASM and
 loaded by the browser host in this repository.
 
-xenia-canary (via this repo's WASM core) remains the interpreter/validator;
+The JS recompiler in public/js/recomp/ is the shipping pipeline;
 xenorecomp is the native path.
 """
 

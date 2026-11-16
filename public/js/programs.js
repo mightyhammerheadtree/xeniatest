@@ -2,9 +2,9 @@
  * programs.js — built-in demo payloads for the web runner.
  *
  * Each program is real Xenon PPC64 (big-endian) assembly assembled at load
- * time by js/ppc_asm.js and executed by the WASM interpreter core. They are
+ * time by js/ppc_asm.js and recompiled to WebAssembly on click. They are
  * the web equivalent of xenia-canary's homebrew test harnesses: they prove
- * the decoder, interpreter, and MMIO console path end to end in a browser.
+ * the assembler, decoder, lifter and MMIO console path end to end in a browser.
  */
 
 const PREAMBLE = `

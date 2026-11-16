@@ -1,7 +1,7 @@
 {
-  "name": "xeniatest",
+  "name": "xenorecomp-web",
   "version": "0.1.0",
-  "description": "Xenia Canary for the Web: Xbox 360 (Xenon PPC) emulator tooling, a WebAssembly PPC core ported from xenia-canary, and a browser-based library/runner/inspector - built to run without OOMing.",
+  "description": "Xenon Recompiler for the web: recompiles Xbox 360 (Xenon PPC) binaries to WebAssembly in the browser, runs them in-page, and exports a project zip.",
   "type": "module",
   "private": true,
   "license": "BSD-3-Clause",
@@ -10,13 +10,10 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "npm run test:core && npm run test:builtins && npm run test:elf && npm run test:web",
-    "test:core": "node --test core/tests/test_core.mjs",
-    "test:builtins": "node --test core/tests/test_builtins.mjs",
+    "test": "npm run test:recomp && npm run test:elf && npm run test:web",
+    "test:recomp": "node --test core/tests/test_recompiler.mjs",
     "test:elf": "node --test core/tests/test_elf_loader.mjs",
-    "test:web": "node --test core/tests/test_webapp.mjs",
-    "build:core": "python3 core/build_core.py",
-    "port:decoder": "./core/port_xenia_decoder.sh /path/to/xenia-canary"
+    "test:web": "node --test core/tests/test_webapp.mjs"
   },
   "dependencies": {
     "compression": "^1.7.5",
