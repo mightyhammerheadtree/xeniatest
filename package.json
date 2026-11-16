@@ -1,17 +1,28 @@
 {
-    "name": "router-info-app",
-    "version": "1.0.0",
-    "description": "A web app to display router information using socket.io",
-    "main": "server.js",
-    "scripts": {
-        "start": "node server.js"
-    },
-    "dependencies": {
-        "compression": "^1.7.4",
-        "express": "^4.19.2",
-        "node.js": "^0.0.1-security",
-        "socket.io": "^4.7.5"
-    },
-    "author": "Your Name",
-    "license": "MIT"
+  "name": "xeniatest",
+  "version": "0.1.0",
+  "description": "Xenia Canary for the Web: Xbox 360 (Xenon PPC) emulator tooling, a WebAssembly PPC core ported from xenia-canary, and a browser-based library/runner/inspector - built to run without OOMing.",
+  "type": "module",
+  "private": true,
+  "license": "BSD-3-Clause",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "npm run test:core && npm run test:builtins && npm run test:elf && npm run test:web",
+    "test:core": "node --test core/tests/test_core.mjs",
+    "test:builtins": "node --test core/tests/test_builtins.mjs",
+    "test:elf": "node --test core/tests/test_elf_loader.mjs",
+    "test:web": "node --test core/tests/test_webapp.mjs",
+    "build:core": "python3 core/build_core.py",
+    "port:decoder": "./core/port_xenia_decoder.sh /path/to/xenia-canary"
+  },
+  "dependencies": {
+    "compression": "^1.7.5",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
+  }
 }
