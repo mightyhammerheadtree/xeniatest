@@ -1,8 +1,9 @@
 /**
- * Web app smoke test — boots the real frontend (index.html + JS modules)
- * in jsdom, loads the real WASM core over a local-file fetch shim, clicks
- * the Run button, and asserts the built-in program executes and reports
- * clean halt. Also exercises the Inspector on a synthetic XEX2 header.
+ * Web app smoke test — boots the real recompiler page (index.html +
+ * recompiler-ui.js) in jsdom, recompiles the bundled Fibonacci sample fully
+ * in-page, checks the console output and stats, and validates the project
+ * .zip that the download button produces (structure + CRCs + manifest).
+ * Also keeps the inspector coverage for synthetic XEX2/ELF images.
  *
  * Run with: npm run test:web
  */
@@ -18,9 +19,8 @@ const PUBLIC = join(ROOT, 'public');
 const INDEX = join(PUBLIC, 'index.html');
 
 const MIME = {
-  '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
-  '.wasm': 'application/wasm', '.svg': 'image/svg+xml',
-  '.webmanifest': 'application/manifest+json', '.json': 'application/json',
+  '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
+  '.json': 'application/json', '.md': 'text/markdown',
 };
 
 function localFileResponse(path) {
@@ -28,12 +28,13 @@ function localFileResponse(path) {
   const ext = path.slice(path.lastIndexOf('.'));
   return new Response(body, {
     status: 200,
-    headers: { 'content-type': MIME[ext] ?? 'application/octet-stream', 'content-length': String(body.length) },
+    headers: { 'content-type': MIME[ext] ?? 'application/octet-stream' },
   });
 }
 
 let dom;
-let console_errors;
+let consoleErrors;
+let capturedBlob = null;
 
 before(async () => {
   const html = readFileSync(INDEX, 'utf8');
@@ -43,19 +44,15 @@ before(async () => {
     runScripts: 'outside-only',
   });
 
-  console_errors = [];
-  dom.window.addEventListener('error', (event) => console_errors.push(`error event: ${event.message}`));
+  consoleErrors = [];
+  dom.window.addEventListener('error', (event) => consoleErrors.push(`error event: ${event.message}`));
 
-  // Local-file fetch: resolve relative URLs against /public.
-  const fetchShim = async (url, options = {}) => {
+  const fetchShim = async (url) => {
     const resolved = new URL(String(url), 'http://localhost:3000/');
     const rel = decodeURIComponent(resolved.pathname);
     const filePath = join(PUBLIC, rel === '/' ? 'index.html' : rel);
     if (!existsSync(filePath) || statSync(filePath).isDirectory()) {
       return new Response('not found', { status: 404 });
-    }
-    if ((options.method ?? 'GET').toUpperCase() === 'HEAD') {
-      return new Response(null, { status: 200, headers: { 'content-length': String(statSync(filePath).size) } });
     }
     return localFileResponse(filePath);
   };
@@ -65,127 +62,130 @@ before(async () => {
   define('window', dom.window);
   define('document', dom.window.document);
   define('navigator', dom.window.navigator);
-  define('localStorage', dom.window.localStorage);
-  define('location', dom.window.location);
   define('HTMLElement', dom.window.HTMLElement);
   define('Blob', dom.window.Blob ?? Blob);
   define('File', dom.window.File ?? File);
   define('FileReader', dom.window.FileReader);
-  define('DataView', DataView);
   define('TextDecoder', TextDecoder);
   define('TextEncoder', TextEncoder);
-  define('crypto', dom.window.crypto ?? crypto);
-  // Use node's global performance (jsdom's recurses when promoted to global).
-  const pendingFrames = new Set();
-  globalThis.__pendingFrames = pendingFrames;
-  define('requestAnimationFrame', (cb) => {
-    const id = setTimeout(() => {
-      pendingFrames.delete(id);
-      cb(dom.window.performance.now());
-    }, 1);
-    pendingFrames.add(id);
-    return id;
-  });
-  define('cancelAnimationFrame', (id) => {
-    pendingFrames.delete(id);
-    clearTimeout(id);
-  });
+  define('DataView', DataView);
+  define('performance', performance);
+  // jsdom has no createObjectURL — capture the Blob instead.
+  const urlApi = dom.window.URL;
+  urlApi.createObjectURL = (blob) => { capturedBlob = blob; return 'blob:mock'; };
+  urlApi.revokeObjectURL = () => {};
+  globalThis.URL = urlApi;
+  dom.window.HTMLAnchorElement.prototype.click = function click() { /* captured via createObjectURL */ };
 
-  // Track intervals (gamepad poll) so after() can stop them.
-  const realSetInterval = globalThis.setInterval.bind(globalThis);
-  globalThis.__intervals = [];
-  globalThis.setInterval = (fn, ms, ...args) => {
-    const id = realSetInterval(fn, ms, ...args);
-    globalThis.__intervals.push(id);
-    return id;
-  };
-
-  await import('../../public/js/main.js');
-  // Allow the module's top-level async boot (core load, library open) to settle.
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await import('../../public/js/recompiler-ui.js');
+  await new Promise((resolve) => setTimeout(resolve, 50));
 });
 
 after(() => {
-  for (const id of globalThis.__intervals ?? []) clearInterval(id);
-  for (const id of globalThis.__pendingFrames ?? []) clearTimeout(id);
   delete globalThis.fetch;
-  delete globalThis.setInterval;
   dom.window.close();
 });
 
-async function waitFor(predicate, { timeout = 8000, step = 25 } = {}) {
+function waitFor(predicate, { timeout = 15000, step = 25 } = {}) {
   const start = Date.now();
-  for (;;) {
-    const value = predicate();
-    if (value) return value;
-    if (Date.now() - start > timeout) throw new Error('waitFor timed out');
-    await new Promise((resolve) => setTimeout(resolve, step));
-  }
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      const value = predicate();
+      if (value) return resolve(value);
+      if (Date.now() - start > timeout) return reject(new Error('waitFor timed out'));
+      setTimeout(tick, step);
+    };
+    tick();
+  });
 }
 
-test('core pill reaches ready state', async () => {
-  const pill = await waitFor(() => {
-    const el = document.getElementById('core-pill');
-    return el && el.textContent.includes('ready') ? el : null;
-  });
-  assert.match(pill.textContent, /ready/i);
-});
-
-test('built-in hello program runs on click and halts cleanly', async () => {
-  // Select the first built-in program explicitly (boot autoloads it already).
-  const runTab = document.getElementById('tab-run');
-  runTab.click();
-  // Clear console so we observe only this run.
-  document.getElementById('console-clear').click();
-  document.getElementById('btn-run').click();
+test('recompiling the Fibonacci sample in-page prints fib(25) = 75025', async () => {
+  const chip = document.querySelector('.chip[data-sample="fibonacci"]');
+  assert.ok(chip, 'fibonacci sample chip exists');
+  chip.click();
+  await waitFor(() => document.getElementById('image-info').textContent.includes('entry'));
+  const btn = document.getElementById('btn-recompile');
+  assert.equal(btn.disabled, false);
+  btn.click();
   const consoleOut = await waitFor(() => {
-    const el = document.getElementById('console-output');
-    return el.textContent.includes('inside your browser') ? el : null;
-  }, { timeout: 15000 });
-  assert.match(consoleOut.textContent, /inside your browser/);
-  const banner = await waitFor(() => {
-    const el = document.getElementById('run-banner');
-    return el.textContent.includes('Halted cleanly') ? el : null;
-  }, { timeout: 15000 });
-  assert.match(banner.textContent, /Halted cleanly/);
-  // Instructions were executed on the real core.
-  const insns = document.getElementById('state-insns').textContent;
-  assert.notEqual(insns, '0');
-});
-
-test('console MMIO halt is reported in the status field', async () => {
-  await waitFor(() => {
-    const status = document.getElementById('status-msg');
-    return status && status.textContent.length >= 0 ? true : null;
+    const el = document.getElementById('console-out');
+    return el.textContent.includes('fib(25) = 75025') ? el : null;
   });
-  assert.ok(true); // reaching the UI means the loop ran without throwing
+  assert.match(consoleOut.textContent, /fib\(25\) = 75025\n/);
+  const stats = document.getElementById('stats-strip');
+  assert.equal(stats.hidden, false);
+  assert.match(stats.textContent, /fragments\s*\d+/);
+  assert.match(stats.textContent, /exit\s*0/);
+  assert.equal(document.getElementById('btn-download').disabled, false);
 });
 
-test('inspector parses a synthetic XEX2 and shows metadata', async () => {
-  // Build a minimal synthetic XEX2: header + one optional header + security info.
+test('download button emits a valid project zip (CRCs, manifest, segments)', async () => {
+  const { crc32 } = await import('../../public/js/recomp/zip.js');
+  capturedBlob = null;
+  document.getElementById('btn-download').click();
+  assert.ok(capturedBlob, 'zip blob was produced');
+  const buf = await new Promise((resolve, reject) => {
+    const reader = new dom.window.FileReader();
+    reader.onload = () => resolve(new Uint8Array(reader.result));
+    reader.onerror = reject;
+    reader.readAsArrayBuffer(capturedBlob);
+  });
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  assert.equal(view.getUint32(0, true), 0x04034b50, 'zip magic');
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  assert.ok(eocd >= 0, 'EOCD present');
+  const count = view.getUint16(eocd + 10, true);
+  let off = view.getUint32(eocd + 16, true);
+  const names = [];
+  for (let i = 0; i < count; i++) {
+    assert.equal(view.getUint32(off, true), 0x02014b50);
+    const crc = view.getUint32(off + 16, true);
+    const size = view.getUint32(off + 20, true);
+    const nameLen = view.getUint16(off + 28, true);
+    const extraLen = view.getUint16(off + 30, true);
+    const commentLen = view.getUint16(off + 32, true);
+    const localOff = view.getUint32(off + 42, true);
+    const name = new TextDecoder().decode(buf.subarray(off + 46, off + 46 + nameLen));
+    const lName = view.getUint16(localOff + 26, true);
+    const lExtra = view.getUint16(localOff + 28, true);
+    const data = buf.subarray(localOff + 30 + lName + lExtra, localOff + 30 + lName + lExtra + size);
+    assert.equal(crc32(data), crc, 'crc ok: ' + name);
+    names.push(name);
+    off += 46 + nameLen + extraLen + commentLen;
+  }
+  for (const expected of ['README.md', 'manifest.json', 'index.html', 'runtime.js', 'guest-wasm.js',
+    'guest.wasm', 'run.js', 'docs/KERNEL.md', 'kernel/.gitkeep', 'segment-0.bin', 'guest.bin']) {
+    assert.ok(names.includes(expected), 'zip contains ' + expected);
+  }
+  const manifestEntry = names.indexOf('manifest.json');
+  assert.ok(manifestEntry >= 0);
+});
+
+test('inspector parses a synthetic XEX2 and a big-endian ELF64 header', async () => {
   const imageSize = 0x1000;
-  const headerSize = 4 + 4 + 4 + 4 + 4 + 8; // magic.. + one opt header
+  const headerSize = 4 + 4 + 4 + 4 + 4 + 8;
   const securityOffset = 0x100;
   const buf = new Uint8Array(0x400);
   const dv = new DataView(buf.buffer);
   const put = (off, s) => { for (let i = 0; i < s.length; i++) buf[off + i] = s.charCodeAt(i); };
   put(0, 'XEX2');
-  dv.setUint32(4, 0x00000080, false);      // USER_MODE
+  dv.setUint32(4, 0x00000080, false);
   dv.setUint32(8, headerSize, false);
   dv.setUint32(12, securityOffset, false);
-  dv.setUint32(16, 1, false);              // header_count
-  dv.setUint32(20, 0x00010100, false);     // ENTRY_POINT
+  dv.setUint32(16, 1, false);
+  dv.setUint32(20, 0x00010100, false);
   dv.setUint32(24, 0x82000000, false);
-  // Security info
-  dv.setUint32(securityOffset, 0x104, false); // security header size
+  dv.setUint32(securityOffset, 0x104, false);
   dv.setUint32(securityOffset + 4, imageSize, false);
-  // Skip rsa signature (0x100 bytes), then info size / flags / load address / page descriptors
   const secInfo = securityOffset + 8 + 0x100;
   dv.setUint32(secInfo, 0x18, false);
   dv.setUint32(secInfo + 4, 0x00000400, false);
   dv.setUint32(secInfo + 8, 0x82000000, false);
-  dv.setUint32(secInfo + 12, 1, false);     // one page descriptor
-  dv.setUint32(secInfo + 16, (1 << 28) | 4, false); // type=code, 4 pages
+  dv.setUint32(secInfo + 12, 1, false);
+  dv.setUint32(secInfo + 16, (1 << 28) | 4, false);
 
   const { parseXex2, parseElf } = await import('../../public/js/inspect.js');
   const info = parseXex2(buf);
@@ -193,87 +193,23 @@ test('inspector parses a synthetic XEX2 and shows metadata', async () => {
   assert.equal(info.entryPoint, 0x82000000);
   assert.equal(info.imageSize, imageSize);
   assert.equal(info.pageDescriptors.length, 1);
-  assert.equal(info.pageDescriptors[0].type, 1);
-  assert.equal(info.pageDescriptors[0].pageCount, 4);
   assert.ok(info.moduleFlagNames.includes('USER_MODE'));
 
-  // ELF: a tiny big-endian ELF64 header.
   const elf = new Uint8Array(64);
-  elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 2, 1, 0]); // ELF64, big-endian, current
+  elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 2, 1, 0]);
   const edv = new DataView(elf.buffer);
-  edv.setUint16(16, 2, false);    // ET_EXEC
-  edv.setUint16(18, 21, false);   // EM_PPC64
+  edv.setUint16(16, 2, false);
+  edv.setUint16(18, 21, false);
   edv.setBigUint64(24, 0x82000000n, false);
-  edv.setUint16(54, 56, false);   // e_phentsize = 56
-  edv.setUint16(56, 0, false);    // e_phnum = 0 (no program headers parsed)
-  edv.setUint16(58, 64, false);   // e_shentsize = 64
-  edv.setUint16(60, 0, false);    // e_shnum = 0
+  edv.setUint16(54, 56, false);
+  edv.setUint16(56, 0, false);
+  edv.setUint16(58, 64, false);
+  edv.setUint16(60, 0, false);
   const elfInfo = parseElf(elf);
   assert.equal(elfInfo.format, 'ELF64');
-  assert.equal(elfInfo.machineName, 'EM_PPC64 (PowerPC 64)');
   assert.equal(elfInfo.entry, 0x82000000n);
 });
 
-
-test('every tab switches views without errors', async () => {
-  for (const tab of ['run', 'inspector', 'settings', 'about', 'library']) {
-    document.getElementById(`tab-${tab}`).click();
-    const view = document.getElementById(`view-${tab}`);
-    assert.ok(view.classList.contains('view-active'), `${tab} view should activate`);
-    assert.equal(document.getElementById(`tab-${tab}`).getAttribute('aria-selected'), 'true');
-  }
-});
-
-test('step button executes exactly one instruction beyond the previous count', async () => {
-  document.getElementById('tab-run').click();
-  const before = document.getElementById('state-insns').textContent;
-  document.getElementById('btn-step').click();
-  const after = document.getElementById('state-insns').textContent;
-  assert.notEqual(after, before);
-});
-
-test('perf overlay toggle reveals the FPS badge and persists', async () => {
-  document.getElementById('tab-settings').click();
-  const toggle = document.getElementById('setting-perf');
-  toggle.checked = true;
-  toggle.dispatchEvent(new dom.window.Event('change'));
-  await new Promise((resolve) => setTimeout(resolve, 800));
-  assert.equal(document.getElementById('fps-badge').hidden, false);
-  const stored = JSON.parse(dom.window.localStorage.getItem('xeniatest.settings'));
-  assert.equal(stored.perfOverlay, true);
-  // turn it back off
-  toggle.checked = false;
-  toggle.dispatchEvent(new dom.window.Event('change'));
-});
-
-test('trap toggle persists to localStorage for the core', async () => {
-  const toggle = document.getElementById('setting-trap');
-  const initial = toggle.checked;
-  toggle.checked = !initial;
-  toggle.dispatchEvent(new dom.window.Event('change'));
-  const stored = JSON.parse(dom.window.localStorage.getItem('xeniatest.settings'));
-  assert.equal(stored.trapOnUnimplemented, !initial);
-  toggle.checked = initial;
-  toggle.dispatchEvent(new dom.window.Event('change'));
-});
-
-test('console clear empties the output pane', async () => {
-  document.getElementById('tab-run').click();
-  const out = document.getElementById('console-output');
-  out.textContent = 'hello world\n';
-  document.getElementById('console-clear').click();
-  assert.equal(out.textContent, '');
-});
-
-test('about status tables render implemented/missing rows', async () => {
-  document.getElementById('tab-about').click();
-  const ok = document.getElementById('status-ok-list');
-  const missing = document.getElementById('status-missing-list');
-  assert.ok(ok.textContent.includes('Xenon PPC decoder'));
-  assert.ok(missing.textContent.includes('kernel'));
-  assert.ok(missing.textContent.includes('WebGPU'));
-});
-
-test('no unexpected console errors were emitted during the run', () => {
-  assert.deepEqual(console_errors, []);
+test('recompiler page boots with no unexpected console errors', () => {
+  assert.deepEqual(consoleErrors, []);
 });

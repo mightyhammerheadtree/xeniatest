@@ -1,4 +1,4 @@
-Xenia Canary - Web — third-party notices
+Xenon Recompiler — third-party notices
 =======================================
 
 This project is a derivative work of xenia-canary (https://github.com/xenia-canary/xenia-canary),

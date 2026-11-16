@@ -1,58 +1,58 @@
-# Xenia Canary — Web
+# Xenon Recompiler — Xbox 360 → WebAssembly, in your browser
 
-A browser port of [xenia-canary](https://github.com/xenia-canary/xenia-canary), the Xbox 360 emulator, focused on doing the PPC core *right* as WebAssembly and being honest about the rest.
+A **static recompiler** for Xbox 360 (Xenon PPC64, big-endian) executables that runs entirely client-side. It lifts PPC machine code to WebAssembly at click-time, executes the result in the page, and can export the recompiled program as a standalone project `.zip` (double-clickable runner, no server required).
 
-**Runs entirely client-side. No accounts, no telemetry, no uploads.**
+**No accounts, no telemetry, no uploads — your binary never leaves the machine.**
+
+> Derivative work of [xenia-canary](https://github.com/xenia-canary/xenia-canary) (decoder semantics), not an emulator. You bring the binary; the recompiler does the rest.
 
 ## What works today (tested)
 
-- **Xenon PPC (PowerPC64, big-endian) decoder** — the full xenia-canary opcode table, ported to C and compiled to WASM (`public/core/xeniatest-core.wasm`).
-- **Interpreter** — 64-bit integer ALU, rotate/mask/shift, 32/64-bit loads & stores, branches (CTR loops, link register), `sc`, supervisor-call console path. Not a JIT yet — see roadmap.
-- **Disassembler** — xenia's opcode descriptors, exact same output as the desktop project.
-- **XEX2 inspection** — header, optional headers, security info, page descriptors, import libraries.
-- **ELF inspection** — ELF32/ELF64, any endianness, PPC-focused; program headers and sections.
-- **Library** — your dumps stored in the browser's Origin Private File System (OPFS), streamed in chunks, SHA-256 or size-based fingerprinting.
-- **Runner** — built-in Xenon assembly programs (an honest smoke test: a real two-pass PPC assembler in `public/js/ppc_asm.js`), raw low-memory PPC binaries, and ELF64 images whose LOAD segments fit the guest window.
-- **Bounded memory** — one 64 MiB guest RAM, one fixed WASM linear memory (88,080,384 B), zero 64-bit copies in JS. The core physically cannot grow memory, so it cannot OOM your tab.
+- **Static recompilation, end to end** — discovery of reachable code from the entry point, fragment lifting (integer ALU, rotate/mask/shift, 32/64-bit loads/stores, branches incl. CTR loops & link register, `bl`/`blr` calls, `sc`, FP fcmpo/fcmpu decode), wasm emission, instantiation, execution.
+- **Built-in samples** — Hello, Fibonacci (`fib(25) = 75025`) and Countdown are real hand-assembled PPC binaries recompiled in-page; they print through the guest MMIO console and halt via the exit door.
+- **In-page run** — drop a `.xex`, `.elf` or raw `.bin`; it recompiles and runs with one click, output shown in the on-page console.
+- **Project export** — one click downloads a `.zip` containing the `guest.wasm`, the image segments, a `file://`-double-clickable runner, a Node runner (`run.js`), `manifest.json`, README and kernel notes. Works offline, nothing to install.
+- **XEX2 inspection** — header, optional headers, security info, page descriptors, import libraries. Retail Xbox 360 executables load and run where the decrypted base image is supplied; encrypted titles need your own console NAND (see [docs/KERNELS.md](docs/KERNELS.md)).
+- **ELF (PPC) inspection** — ELF32/ELF64, program headers, sections; ELF homebrew recompiles end to end.
 
 ## What does not work (yet)
 
-Xbox 360 games **cannot boot**. That requires the kernel (HLE), the Xenos GPU, AltiVec, and your console's own NAND to decrypt retail executables. See [docs/PORTING_ROADMAP.md](docs/PORTING_ROADMAP.md) for the honest milestone plan and [docs/LEGAL.md](docs/LEGAL.md) for what is and isn't legal to do.
-
-The interpreter is also not cycle-accurate and the floating-point path is partial; AltiVec/VMX instructions trap by default (status 2) and can be configured to skip.
+Xbox 360 games **cannot boot**. That requires the kernel (HLE surface for the imported library set), the Xenos GPU, AltiVec/VMX, and — for retail executables — your own console NAND to decrypt them. The recompiler covers a real subset of the ISA (integer + branch + load/store + control); anything it does not know is emitted as a trap with the offending PC, never silently miscompiled. See [docs/KERNELS.md](docs/KERNELS.md) for the kernel situation and `docs/` for the porting roadmap.
 
 ## Quick start
 
 ```bash
-npm install     # express + compression, that's all
+npm ci          # express + compression + jsdom (dev)
 npm start       # serves on http://0.0.0.0:3000 (PORT env var overrides)
 ```
 
-Open the printed URL. The app needs **crossOriginIsolated** headers (COOP/COEP) — already set by the bundled server — to enable SharedArrayBuffer for the future threaded core.
+Then open the printed URL, pick a sample (or drop your own `.xex`/`.elf`/`.bin`), hit **Recompile & Run**.
 
 ## Development
 
 ```bash
-npm test               # node --test core/tests/*.mjs (wasm tests, needs the built core)
-npm run build:core     # rebuild the WASM core (requires zig; see core/README)
+npm test        # recompiler end-to-end, ELF loader, web app (jsdom) suites
 ```
 
 Layout:
 
 ```
-core/src/xenia/        ported xenia-canary opcode tables & decoders (BSD-3, see THIRD_PARTY_NOTICES.md)
-core/src/xenon_cpu.*   freestanding C ABI + interpreter written for this project
-core/tests/            node:test suites that execute hand-assembled PPC and assert architectural state
-public/js/ppc_asm.js   two-pass PPC assembly subset used by the built-in programs
-public/js/storage.js   OPFS-backed dump library (streaming import, no 256 MiB buffers)
-public/js/inspect.js   XEX2 / ELF parsers
-public/js/runner.js    frame-budgeted core driver (keeps the tab responsive)
-server/server.js       static server with crossOriginIsolated + CSP + caching
+public/js/recomp/recompiler.js   discovery + fragment lifter + wasm glue (entry: buildImage/recompileImage/runImage)
+public/js/recomp/wasm_emitter.js minimal, validated WebAssembly module builder
+public/js/recomp/ppc_decode.js   PPC instruction decoder used by the lifter
+public/js/recomp/zip.js          dependency-free ZIP writer (store method)
+public/js/recomp/templates.js    the project scaffold that ships inside the exported .zip
+public/js/inspect.js             XEX2 / ELF parsers (shared by UI and tests)
+public/js/recompiler-ui.js       browser wiring for the three-step page
+public/js/ppc_asm.js             two-pass PPC assembler for the built-in samples
+server/server.js                 static server with crossOriginIsolated + CSP + caching
+docs/KERNELS.md                  what the Xbox 360 kernel is, why you supply your own
+tools/xenorecomp/                Python reference pieces (disassembler, lifter sketches)
 ```
 
 ## Testing philosophy
 
-The WASM core is tested *as an architectural sandbox*: tests hand-assemble real big-endian PPC instructions, run them in the sandbox, and assert on guest architectural state (PC, GPRs, XER carry, console bytes, halt status). The built-in browser programs are tested the same way — if the assembler, the decoder, or the interpreter breaks, tests fail.
+Tests assemble real big-endian Xenon PPC, lift it to WASM **exactly as the browser does**, execute the result and assert on guest-visible output (console bytes, exit code, stats) and on the structure of the exported project zip. If the assembler, decoder, lifter or zip writer breaks, tests fail — no mocks of the pipeline itself.
 
 ## License
 

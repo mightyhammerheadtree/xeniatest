@@ -78,7 +78,7 @@ function buildEncoders() {
     (31 << 26) | (rs << 21) | (ra << 16) | (rb << 11) | (xo << 1);
   enc.xor = xlogic(316); enc.and = xlogic(28); enc.or = xlogic(444); enc.nor = xlogic(124);
   enc.neg = ([rt, ra]) => (31 << 26) | (rt << 21) | (ra << 16) | (104 << 1);
-  enc.mr = ([ra, rs]) => (31 << 26) | (rs << 21) | (ra << 16) | (rs << 11) | (444 << 1);
+  enc.mr = ([rd, rs]) => (31 << 26) | (rd << 21) | (rs << 16) | (rs << 11) | (444 << 1);
   enc.nop = () => (24 << 26); // ori r0, r0, 0
   enc.mulli = ([rt, ra, imm]) => (7 << 26) | (rt << 21) | (ra << 16) | (imm & 0xffff);
   // Loads / stores.
