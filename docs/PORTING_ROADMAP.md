@@ -43,7 +43,9 @@ Reality constraints:
 - ✅ Register file (reset defaults, write log) + generated register table from xenia (3435 registers).
 - ✅ PM4 command processor: packet decode, SET_CONSTANT windows, REG_RMW (incl. register operands), MEM_WRITE / REG_TO_MEM with xenia GpuSwap32 endianness, EVENT_WRITE family (counter + WRITEBACK window mapping), DRAW_INDX decode (kDMA/kAutoIndex; kImmediate traps as in xenia), loud traps for everything else.
 - ✅ WebGPU plumbing: adapter/device/canvas configuration, depth attachment, index-buffer upload (BE→swap→LE), present; bring-up triangle behind explicit `{ placeholderShader: true }` — never silently rendered.
-- ⬜ Ring buffer from guest memory + doorbell; vertex fetch (`FETCH_*`); shader HIR → WGSL (replaces the placeholder gate); render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
+- ✅ Ring buffer: host-side ring (`VdInitializeRingBuffer` / writeback / CP_RB_WPTR doorbell, wraparound + overrun trap) wired to the HLE Vd* exports and an in-page `XenonGpuHost`; end-to-end tested.
+- ✅ Vertex fetch decode: `FETCH_*` constants, ucode walker, `GPUVertexFormat` mapping, `GPUVertexBufferLayout` descriptors — formats WebGPU can't represent trap.
+- ⬜ GPU MMIO aperture in the recompiler so real guests can ring the doorbell; shader HIR → WGSL (replaces the placeholder gate) + vertex buffer binding; render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
 
 ### M5 — Audio & input
 - XMA decoding (ffmpeg→wasm drop-in or a clean decoder).

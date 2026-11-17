@@ -161,6 +161,17 @@ async function recompileAndRun() {
     imports.__exports = instance.exports;
     imports.__attachMemory(instance.exports.memory);
     new Uint8Array(instance.exports.memory.buffer).set(state.built.arena);
+    // --- GPU subsystem: expose the ring-buffer doorbell to the HLE (Vd* exports) ---
+    try {
+      if (typeof globalThis.XenonGpuHostFactory === 'function' && !globalThis.XenonGpuHost) {
+        globalThis.XenonGpuHost = new globalThis.XenonGpuHostFactory({
+          memory: instance.exports.memory,
+          onLog: (level, msg) => appendConsole(`[gpu] ${msg}\n`),
+        });
+      }
+    } catch (e) {
+      appendConsole(`[gpu] GPU subsystem unavailable: ${e && e.message ? e.message : String(e)}\n`);
+    }
     const t1 = performance.now();
     try {
       instance.exports[entryName]();

@@ -48,7 +48,7 @@ public/js/recomp/hle_tables.js   2918 xboxkrnl/xam/xbdm export ordinals → name
 public/js/recomp/hle_bundle.js   generated embed of hle.js/hle_tables.js/docs/HLE.md for the zip (npm run build:hle-bundle)
 public/js/recomp/zip.js          dependency-free ZIP writer (store method)
 public/js/recomp/templates.js    the project scaffold that ships inside the exported .zip
-public/js/gpu/                 Xenos GPU port: PM4 command processor, register file, WebGPU backend (M4, in progress)
+public/js/gpu/                 Xenos GPU port: PM4 command processor, register file, ring buffer, vertex fetch decode, WebGPU backend (M4, in progress)
 public/js/inspect.js             XEX2 / ELF parsers (shared by UI and tests)
 public/js/recompiler-ui.js       browser wiring for the three-step page
 public/js/ppc_asm.js             two-pass PPC assembler for the built-in samples
