@@ -24,6 +24,7 @@ import { decodeInstruction } from './ppc_decode.js';
 import { WasmBuilder, Ops, sleb, uleb } from './wasm_emitter.js';
 import { loadXex2, XexLoadError } from './xex_loader.js';
 import { detectSwitchTables } from './switch_tables.js';
+import { detectSaveRestoreStubs, emitVmxStubOps } from './save_restore.js';
 import './hle.js'; // UMD side effect: sets globalThis.XenonHLE (the HLE host)
 import './hle_tables.js'; // UMD side effect: sets globalThis.XenonHLETables (ordinal → name)
 
@@ -62,6 +63,7 @@ export function buildImage(kind, parsed, bytes, opts = {}) {
   let peSections = null;   // XEX2 PE section table (null when unparseable or not XEX2)
   let peError = null;      // XEX2 PE parse breadcrumb, if any
   let switchTables = new Map(); // masked bctr addr → switch table descriptor (XEX2 code sections)
+  let vmxStubs = new Map();   // masked VMX save/restore entry addr → synthesized-stub descriptor
   if (kind === 'bin') {
     const n = Math.min(bytes.length, GUEST_MEM_SIZE);
     arena.set(bytes.subarray(0, n), IMAGE_BASE_DEFAULT);
@@ -130,12 +132,23 @@ export function buildImage(kind, parsed, bytes, opts = {}) {
           }
         }
         functionStarts = [...labels].sort((a, b) => a - b);
+        // Save/restore stub detection (XenonRecomp-style): FPR/GPR entries are
+        // liftable — seed them. VMX entries are seeded too but synthesized
+        // (zero-filled save slots / no-op restore) since there is no VMX model.
+        const saved = detectSaveRestoreStubs(arena, { ranges, mask: GUEST_MEM_MASK });
+        vmxStubs = saved.vmxStubs;
+        if (saved.seedAddresses.length) {
+          for (const a of saved.seedAddresses) {
+            if (!hleCalls.has(a)) labels.add(a);
+          }
+          functionStarts = [...labels].sort((a, b) => a - b);
+        }
       }
     }
   } else {
     throw new RecompError('unsupported image kind: ' + kind);
   }
-  return { arena, entry, base, segments, hleCalls, functionStarts, peSections, peError, switchTables };
+  return { arena, entry, base, segments, hleCalls, functionStarts, peSections, peError, switchTables, vmxStubs };
 }
 
 /** Discovery -------------------------------------------------------------- */
@@ -166,7 +179,7 @@ function branchFallsThrough(insn) {
  * next known start, so every direct branch becomes a wasm call or block jump
  * with no exponential re-scanning.
  */
-export function discoverFragments(arena, entry, hleCalls, seedStarts) {
+export function discoverFragments(arena, entry, hleCalls, seedStarts, vmxStubs) {
   const starts = new Set([entry]);
   if (Array.isArray(seedStarts)) {
     for (const s of seedStarts) {
@@ -204,10 +217,10 @@ export function discoverFragments(arena, entry, hleCalls, seedStarts) {
       addr += 4;
     }
   }
-  return finalizeFragments(arena, entry, starts);
+  return finalizeFragments(arena, entry, starts, vmxStubs);
 }
 
-function finalizeFragments(arena, entry, startsSet) {
+function finalizeFragments(arena, entry, startsSet, vmxStubs) {
   const starts = [...startsSet].sort((a, b) => a - b);
   const startSet = new Set(starts);
   const fragments = new Map();
@@ -215,6 +228,10 @@ function finalizeFragments(arena, entry, startsSet) {
     const insns = [];
     let addr = start, steps = 0;
     let cutTo = null;
+    // Synthesized VMX stub: no guest bytes are decoded; the body is emitted
+    // from the descriptor (see emitVmxStubOps).
+    const vmxStub = vmxStubs ? vmxStubs.get(start) : null;
+    if (vmxStub) { fragments.set(start, { start, insns: [], cutTo: null, vmxStub }); continue; }
     while (steps++ < (1 << 16)) {
       if (addr + 4 > GUEST_MEM_SIZE) break;
       if (addr !== start && startSet.has(addr)) { cutTo = addr; break; } // cut: falls into another fragment
@@ -275,7 +292,7 @@ class Lifter {
     this.b.addGlobal(0x7f, true, O.i32_const(0)); // XER
     this.b.addGlobal(0x7e, true, O.i64_const(0n)); // LR
     this.b.addGlobal(0x7e, true, O.i64_const(0n)); // CTR
-    this.stats = { fragments: fragments.size, insns: 0, unimpl: 0, blocks: 0, switchTables: this.switchTables?.size ?? 0 };
+    this.stats = { fragments: fragments.size, insns: 0, unimpl: 0, blocks: 0, switchTables: this.switchTables?.size ?? 0, vmxStubs: 0 };
   }
 
   // -- operand helpers --
@@ -597,7 +614,7 @@ Object.assign(FragmentCompiler.prototype, {
     if (size === 1) out.push(...O.i32_load8_u(0, 0), O.i64_extend_i32_u);
     else if (size === 2) out.push(...O.i32_load16_u(0, 0), ...O.local_set(L_T32), ...this.bswap16Seq(), O.local_get(L_T32), O.i64_extend_i32_u);
     else if (size === 4) out.push(...O.i32_load(0, 0), ...O.local_set(L_T32), ...this.bswap32Seq(), O.local_get(L_T32), O.i64_extend_i32_u);
-    else out.push(...O.i64_load(0, 0), ...O.local_set(L_T64B), ...this.bswap64Seq(), O.local_get(L_T64));
+    else out.push(...O.i64_load(0, 0), ...O.local_set(L_T64), ...this.bswap64Seq(), O.local_get(L_T64)); // value must land in L_T64 for bswap64Seq — bswap64(ea) is never a load result
     out.push(O.end);
     // single, uniform extension
     if (size === 2 && signed === 's16') out.push(O.i32_wrap_i64, O.i32_extend16_s, O.i64_extend_i32_s);
@@ -1167,7 +1184,7 @@ Object.assign(FragmentCompiler.prototype, {
     out.push(O.else);
     out.push(...O.local_get(L_T64), ...this.lifter.addrMem());
     if (size === 8) {
-      out.push(...O.i64_load(0, 0), ...O.local_set(L_T64B), ...this.bswap64Seq(), O.local_get(L_T64));
+      out.push(...O.i64_load(0, 0), ...O.local_set(L_T64), ...this.bswap64Seq(), O.local_get(L_T64)); // value in L_T64 for bswap64Seq
     } else {
       out.push(...O.i32_load(0, 0), ...O.local_set(L_T32), ...this.bswap32Seq(), O.local_get(L_T32), O.i64_extend_i32_u);
     }
@@ -1204,7 +1221,8 @@ Object.assign(FragmentCompiler.prototype, {
 // ---------- module assembly & host harness ----------
 
 export function recompileImage(arena, entry, opts = {}) {
-  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls, opts.functionStarts), { switchTables: opts.switchTables ?? null }, opts.hleCalls);
+  const vmxStubs = opts.vmxStubs ?? null;
+  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls, opts.functionStarts, vmxStubs), { switchTables: opts.switchTables ?? null }, opts.hleCalls);
   const L = lifter;
   // Pre-assign wasm function indices: imports 0..6, store_ctx at 7, then one per fragment (sorted).
   const sorted = [...L.fragments.keys()].sort((a, b) => a - b);
@@ -1224,8 +1242,13 @@ export function recompileImage(arena, entry, opts = {}) {
   const codeBodies = [];
   for (const addr of sorted) {
     const frag = L.fragments.get(addr);
-    const fc = new FragmentCompiler(L, frag, cutOf.get(addr), fnIndex);
     L.stats.fragments = sorted.length;
+    if (frag.vmxStub) {
+      L.stats.vmxStubs++;
+      codeBodies.push({ addr, ops: emitVmxStubOps(L, frag.vmxStub, O) });
+      continue;
+    }
+    const fc = new FragmentCompiler(L, frag, cutOf.get(addr), fnIndex);
     codeBodies.push({ addr, ops: fc.emit(L.b) });
   }
   // Splice bodies in creation order (functions were created in sorted order),
@@ -1314,11 +1337,11 @@ export function makeImports({ onConsoleByte, onSc, onLog } = {}) {
 }
 
 /**
- * @param {{arena: Uint8Array, entry: number, hleCalls?: Map, functionStarts?: number[], switchTables?: Map}} built
+ * @param {{arena: Uint8Array, entry: number, hleCalls?: Map, functionStarts?: number[], switchTables?: Map, vmxStubs?: Map}} built
  */
-export async function runImage({ arena, entry, hleCalls, functionStarts, switchTables }, { onConsole, onSc, onLog } = {}) {
+export async function runImage({ arena, entry, hleCalls, functionStarts, switchTables, vmxStubs }, { onConsole, onSc, onLog } = {}) {
   entry = entry & GUEST_MEM_MASK;
-  const { wasm, stats } = recompileImage(arena, entry, { hleCalls, functionStarts, switchTables });
+  const { wasm, stats } = recompileImage(arena, entry, { hleCalls, functionStarts, switchTables, vmxStubs });
   const imports = makeImports({ onConsoleByte: onConsole ? (b) => onConsole(String.fromCharCode(typeof b === 'string' ? b.charCodeAt(0) : b)) : undefined, onSc, onLog });
   if (hleCalls) imports.__setHleCalls(hleCalls);
   const { instance } = await WebAssembly.instantiate(wasm, imports);

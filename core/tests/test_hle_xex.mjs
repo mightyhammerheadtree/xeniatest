@@ -24,7 +24,16 @@ import {
   PDATA_HELPER_R3,
   PDATA_OUTPUT,
   PDATA_THUNK_ADDR,
+  buildVmxStubXex,
+  VMX_SAVE_66,
+  VMX_REST_66,
+  VMX_PASS_OUTPUT,
+  VMX_BAD_OUTPUT,
+  buildFprStubXex,
+  FPR_PASS_OUTPUT,
+  FPR_SAVE_15,
 } from './hle_xex.mjs';
+import { detectSaveRestoreStubs } from '../../public/js/recomp/save_restore.js';
 import { assemble } from '../../public/js/ppc_asm.js';
 import { buildImage, recompileImage, runImage, RecompError, RecompUnimpl } from '../../public/js/recomp/recompiler.js';
 import { loadXex2, XexLoadError } from '../../public/js/recomp/xex_loader.js';
@@ -354,5 +363,145 @@ test('pdata-style seeding alone lets the icall fall through to the case fragment
   let out = '';
   const res = await runImage({ arena: built.arena, entry: built.entry, hleCalls: built.hleCalls, functionStarts: built.functionStarts, switchTables: new Map() }, { onConsole: (s) => { out += s; } });
   assert.equal(out, 'case1\n');
+  assert.equal(res.exitCode, 0);
+});
+
+// ---------- save/restore stub detection ----------
+
+function writeWordBE(arena, off, word) {
+  arena[off] = (word >>> 24) & 0xff;
+  arena[off + 1] = (word >>> 16) & 0xff;
+  arena[off + 2] = (word >>> 8) & 0xff;
+  arena[off + 3] = word & 0xff;
+}
+const GUEST_MASK = 0x03ffffff;
+const BLR_WORD = 0x4E800020;
+const stfdWord = (f, imm) => (54 << 26) | (f << 21) | (12 << 16) | ((imm & 0xffff));
+const liR11 = (imm) => (14 << 26) | (11 << 21) | (imm & 0xffff);
+const lvxWord = (v) => (31 << 26) | ((v & 31) << 21) | (11 << 16) | (12 << 11) | (103 << 1);
+const stvxWord = (v) => (31 << 26) | ((v & 31) << 21) | (11 << 16) | (12 << 11) | (231 << 1);
+const vd128Word = (v) => ((v & 0x60) >> 3) | ((v & 0x1f) << 21);
+const lvx128Word = (v) => (4 << 26) | vd128Word(v) | (11 << 16) | (12 << 11) | (195 & 0x7f3);
+const stvx128Word = (v) => (4 << 26) | vd128Word(v) | (11 << 16) | (12 << 11) | (451 & 0x7f3);
+
+function detectorArena(builds) {
+  const arena = new Uint8Array(0x1000);
+  for (const { offset, words } of builds) {
+    words.forEach((w, i) => writeWordBE(arena, offset + i * 4, w >>> 0));
+  }
+  return arena;
+}
+const detect = (arena) => detectSaveRestoreStubs(arena, { ranges: [[0, arena.length]], mask: GUEST_MASK });
+
+test('save/restore stub detection — FPR/GPR stubs seed every mid-entry', () => {
+  const savefpr = [];
+  for (let f = 14; f <= 31; f++) savefpr.push(stfdWord(f, -0x90 + (f - 14) * 8));
+  savefpr.push(BLR_WORD);
+  const restgpr = [];
+  for (let r = 14; r <= 31; r++) {
+    // `ld rN, imm(r12)` with imm ascending by 8 — detector only cares about
+    // the uniform sequence, not the absolute origin.
+    restgpr.push((58 << 26) | (r << 21) | (12 << 16) | ((((-0x98 + (r - 14) * 8) >> 2) & 0x3fff) << 2));
+  }
+  restgpr.push(BLR_WORD);
+  const arena = detectorArena([{ offset: 0x000, words: savefpr }, { offset: 0x080, words: restgpr }]);
+  const res = detect(arena);
+  assert.equal(res.stubs.length, 2);
+  assert.equal(res.vmx.length, 0);
+  assert.equal(res.seedAddresses.length, 36); // 18 FPR saves + 18 GPR restores
+  assert.deepEqual(res.seedAddresses.slice(0, 3), [0, 4, 8]);
+  // every mid-entry is seeded: caller can target any __restgprlr_N directly
+  assert.deepEqual(res.seedAddresses.slice(18), Array.from({ length: 18 }, (_, i) => 0x80 + i * 4));
+  assert.equal(res.dropped, 0);
+});
+
+test('save/restore stub detection — VMX64 stubs seed pairs and describe synthesis', () => {
+  const savevmx = [];
+  for (let k = 0; k < 64; k++) { savevmx.push(liR11(-0x400 + k * 0x10), stvx128Word(64 + k)); }
+  savevmx.push(BLR_WORD);
+  const restvmx = [];
+  for (let k = 0; k < 64; k++) { restvmx.push(liR11(-0x400 + k * 0x10), lvx128Word(64 + k)); }
+  restvmx.push(BLR_WORD);
+  const arena = detectorArena([{ offset: 0x000, words: savevmx }, { offset: 0x220, words: restvmx }]);
+  const res = detect(arena);
+  assert.equal(res.vmx.length, 2);
+  assert.equal(res.seedAddresses.length, 128);
+  assert.equal(res.vmxStubs.size, 128);
+  assert.equal(res.dropped, 0);
+  const entry = res.vmxStubs.get(0x10); // __savevmx_66 == pair k=2
+  assert.deepEqual({ ...entry, simmBase: entry.simmBase }, { save: true, firstReg: 66, lastReg: 127, simmBase: -0x400, famFirst: 64 });
+  const lastSave = res.vmxStubs.get(0x1f8); // pair k=63
+  assert.equal(lastSave.firstReg, 127);
+  assert.equal(lastSave.save, true);
+  const restEntry = res.vmxStubs.get(0x220 + 0x10);
+  assert.equal(restEntry.save, false);
+});
+
+test('save/restore stub detection — VMX14 stubs (opcode 31 lvx/stvx) detected', () => {
+  const savevmx = [];
+  for (let k = 0; k < 18; k++) { savevmx.push(liR11(-0x120 + k * 0x10), stvxWord(14 + k)); }
+  savevmx.push(BLR_WORD);
+  const arena = detectorArena([{ offset: 0x000, words: savevmx }]);
+  const res = detect(arena);
+  assert.equal(res.vmx.length, 1);
+  assert.equal(res.seedAddresses.length, 18);
+  const e = res.vmxStubs.get(0x08); // __savevmx_15 == pair k=1
+  assert.deepEqual({ ...e }, { save: true, firstReg: 15, lastReg: 31, simmBase: -0x120, famFirst: 14 });
+});
+
+test('save/restore stub detection — broken stubs are dropped, never misrun', () => {
+  // FPR sequence missing its blr terminator
+  const noBlr = [];
+  for (let f = 14; f <= 31; f++) noBlr.push(stfdWord(f, -0x90 + (f - 14) * 8));
+  noBlr.push(0x00000000);
+  // VMX pair sequence with one corrupted vector op (wrong opcode)
+  const brokenVmx = [];
+  for (let k = 0; k < 64; k++) { brokenVmx.push(liR11(-0x400 + k * 0x10), k === 7 ? 0x60000000 : stvx128Word(64 + k)); }
+  brokenVmx.push(BLR_WORD);
+  const arena = detectorArena([{ offset: 0x000, words: noBlr }, { offset: 0x100, words: brokenVmx }]);
+  const res = detect(arena);
+  assert.equal(res.stubs.length, 0);
+  assert.equal(res.vmx.length, 0);
+  assert.equal(res.seedAddresses.length, 0);
+  assert.ok(res.dropped >= 1);
+});
+
+// ---------- VMX stub synthesis, end to end ----------
+
+test('VMX save/restore stubs are synthesized — guest runs past them', async () => {
+  const { xex } = buildVmxStubXex();
+  const built = buildImage('xex2', null, xex);
+  assert.equal(built.vmxStubs.size, 128);
+  // the mid-entry descriptors are what the bctr dispatch resolves to
+  assert.ok(built.vmxStubs.has(VMX_SAVE_66 & GUEST_MASK));
+  assert.ok(built.vmxStubs.has(VMX_REST_66 & GUEST_MASK));
+  assert.ok(built.functionStarts.includes(VMX_SAVE_66 & GUEST_MASK));
+  let out = '';
+  const res = await runImage(built, { onConsole: (s) => { out += s; } });
+  assert.equal(out, VMX_PASS_OUTPUT); // sentinels intact, slots zeroed
+  assert.equal(res.exitCode, 0);
+  assert.equal(res.stats.vmxStubs, 128);
+  assert.equal(typeof res.exports['fn_' + (VMX_SAVE_66 & GUEST_MASK).toString(16)], 'function');
+});
+
+test('without VMX stub synthesis the stub traps loudly', async () => {
+  const { xex } = buildVmxStubXex();
+  const built = buildImage('xex2', null, xex);
+  // Pre-synthesis world: no vmxStubs and no seeded stub fragments — the bctr
+  // finds no fn_<savevmx> export and must trap rather than misrun.
+  const strippedSeeds = built.functionStarts.filter((a) => !built.vmxStubs.has(a));
+  await assert.rejects(
+    () => runImage({ arena: built.arena, entry: built.entry, hleCalls: built.hleCalls, functionStarts: strippedSeeds, switchTables: new Map(), vmxStubs: new Map() }, { onConsole: () => {} }),
+    (e) => e instanceof RecompUnimpl || /unimplemented/i.test(String(e && e.message)),
+  );
+});
+
+test('FPR save/restore stubs lift and round-trip (mid-entry, lfd/stfd)', async () => {
+  const { xex } = buildFprStubXex();
+  const built = buildImage('xex2', null, xex);
+  assert.ok(built.functionStarts.includes(FPR_SAVE_15 & GUEST_MASK));
+  let out = '';
+  const res = await runImage(built, { onConsole: (s) => { out += s; } });
+  assert.equal(out, FPR_PASS_OUTPUT);
   assert.equal(res.exitCode, 0);
 });

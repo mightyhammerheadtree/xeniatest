@@ -31,6 +31,12 @@ function parseRegister(token) {
   throw new Error(`bad register: '${token}' (expected r0..r31, lr, ctr)`);
 }
 
+function parseFpRegister(token) {
+  const m = /^f([0-9]|[12][0-9]|3[01])$/.exec(token);
+  if (m) return Number(m[1]);
+  throw new Error(`bad FP register: '${token}' (expected f0..f31)`);
+}
+
 function parseImmediate(token, symbols) {
   if (/^-?0x[0-9a-fA-F]+$/.test(token)) return parseInt(token, 16);
   if (/^-?\d+$/.test(token)) return parseInt(token, 10);
@@ -94,6 +100,9 @@ function buildEncoders() {
   enc.ld = ds(58, 0);
   enc.lwa = ds(58, 2);
   enc.std = ([rs, ra, d]) => (62 << 26) | (rs << 21) | (ra << 16) | (((d >> 2) & 0x3fff) << 2);
+  // FP loads/stores, D-form (fpr = {fp:n} sentinel — see resolveInstructionOperands).
+  enc.lfd = ([frt, ra, d]) => (50 << 26) | (frt.fp << 21) | (ra << 16) | (d & 0xffff);
+  enc.stfd = ([frs, ra, d]) => (54 << 26) | (frs.fp << 21) | (ra << 16) | (d & 0xffff);
   // Compares. cr field defaults to 0.
   enc.cmpw = ([ra, rb, crf = 0]) => (31 << 26) | ((crf << 2) << 21) | (ra << 16) | (rb << 11);
   enc.cmplw = ([ra, rb, crf = 0]) => (31 << 26) | ((crf << 2) << 21) | (ra << 16) | (rb << 11) | (32 << 1);
@@ -333,6 +342,8 @@ function resolveInstructionOperands(item, symbols) {
     }
     const isRegister = /^([r][0-9]|[r][12][0-9]|[r]3[01]|lr|ctr|xer)$/.test(tok);
     if (isRegister) { out.push(parseRegister(tok)); continue; }
+    const isFpRegister = /^f([0-9]|[12][0-9]|3[01])$/.test(tok);
+    if (isFpRegister) { out.push({ fp: parseFpRegister(tok) }); continue; }
     out.push(parseImmediate(tok, symbols));
   }
   return out;
@@ -352,7 +363,14 @@ function writeData(out, view, item, symbols, lineno, base) {
   } else if (dir === 'word') {
     toks.forEach((t, i) => view.setUint32(addr + i * 4, valueOf(t, symbols, lineno) >>> 0, false));
   } else if (dir === 'dword') {
-    toks.forEach((t, i) => view.setBigUint64(addr + i * 8, BigInt(valueOf(t, symbols, lineno)) >>> 0n, false));
+    toks.forEach((t, i) => {
+      const txt = String(t).trim();
+      let v;
+      if (/^-?0x[0-9a-fA-F]+$/.test(txt) || /^-?\d+$/.test(txt)) v = BigInt(txt);
+      else if (txt in symbols) v = BigInt(symbols[txt] >>> 0);
+      else throw new Error(`line ${lineno}: cannot resolve '${txt}'`);
+      view.setBigUint64(addr + i * 8, v & 0xffffffffffffffffn, false);
+    });
   }
 }
 

@@ -526,3 +526,191 @@ thunk_0:
   const { bytes } = assemble(src);
   return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
 }
+
+/**
+ * VMX_* — a PE-shaped image containing the compiler's __savevmx_64 /
+ * __restvmx_64 stubs (64 pairs of `li r11, slot; stvx|lvx128 vI, r11, r12`
+ * plus a blr). Opcode-4 words are what a real Xenon emits for the 128-bit
+ * vector loads/stores; the lifter has no VMX model yet, so the recompiler
+ * SYNTHESIZES these stubs (see save_restore.js): the save entry zero-fills
+ * its register save slots, the restore entry is a no-op.
+ *
+ * The guest stores sentinel values into the v64/v65 slots, then enters
+ * __savevmx_66 (pair k=2) INDIRECTLY via bctr. It then re-reads the slots:
+ *   v64/v65 slots → must still contain the sentinels (mid-entry must not
+ *                   touch earlier registers)
+ *   v66/v127 slots → must read back zero (the synthesized save defined them)
+ * after which it enters __restvmx_66 via bctr as well (must be a safe no-op).
+ */
+const VMX_SAVE_RVA = 0x600;
+const VMX_REST_RVA = 0x820;
+export const VMX_SAVE_BASE = IMAGE_BASE + VMX_SAVE_RVA;
+export const VMX_REST_BASE = IMAGE_BASE + VMX_REST_RVA;
+export const VMX_SAVE_66 = VMX_SAVE_BASE + (66 - 64) * 8;
+export const VMX_REST_66 = VMX_REST_BASE + (66 - 64) * 8;
+export const VMX_PASS_OUTPUT = 'vmxok\n';
+export const VMX_BAD_OUTPUT = 'vmxbad\n';
+
+// VDS128 field: split v-register across bits 2..3 (high 2 bits) and 21..25 (low 5 bits).
+const vd128 = (v) => ((v & 0x60) >> 3) | ((v & 0x1f) << 21);
+const lvx128 = (v, ra = 11, rb = 12) => (4 << 26) | vd128(v) | (ra << 16) | (rb << 11) | (195 & 0x7f3);
+const stvx128 = (v, ra = 11, rb = 12) => (4 << 26) | vd128(v) | (ra << 16) | (rb << 11) | (451 & 0x7f3);
+
+function vmxPairs(kind, midLabel, midK) {
+  const lines = [];
+  for (let k = 0; k < 64; k++) {
+    if (k === midK) lines.push(`${midLabel}:`);
+    lines.push(`    li    r11, ${-0x400 + k * 0x10}`);
+    lines.push(`    .word 0x${(kind === 'save' ? stvx128(64 + k) : lvx128(64 + k)).toString(16)}`);
+  }
+  lines.push('    blr');
+  return lines.join('\n');
+}
+
+export function buildVmxStubXex() {
+  const src = pePrologue([
+    { name: '.text', rva: 0x200, virtualSize: 0x900, characteristics: 0x60000020 },
+  ]) + `
+.org 0x82000200
+entry:
+    lis   r12, 0x8300
+    addi  r12, r12, 0x0200          # r12 = frame top 0x83000200
+    li    r3, 0x1234
+    std   r3, -1024(r12)            # v64 slot — sentinel
+    std   r3, -1008(r12)            # v65 slot — sentinel
+    bl    save66                      # mid-entry into the synthesized save stub
+    ld    r5, -1024(r12)            # v64 slot intact?
+    cmpdi r5, 0x1234
+    bne   Lbad
+    ld    r5, -1008(r12)            # v65 slot intact?
+    cmpdi r5, 0x1234
+    bne   Lbad
+    ld    r5, -992(r12)             # v66 slot lo zeroed?
+    cmpdi r5, 0
+    bne   Lbad
+    ld    r5, -984(r12)             # v66 slot hi zeroed?
+    cmpdi r5, 0
+    bne   Lbad
+    ld    r5, -16(r12)              # v127 slot lo zeroed?
+    cmpdi r5, 0
+    bne   Lbad
+    bl    rest66                      # synthesized restore: must be a safe no-op
+    lis   r3, fmtok@ha
+    addi  r3, r3, fmtok@l
+    b     Lprint
+Lbad:
+    lis   r3, fmtbad@ha
+    addi  r3, r3, fmtbad@l
+Lprint:
+    bl    thunk_0
+    li    r9, 0
+    lis   r10, 0x00f0
+    ori   r10, r10, 0x0ffc
+    stw   r9, 0(r10)                # exit door
+spin:
+    b     spin
+fmtok:
+    .asciiz "vmxok\\n"
+fmtbad:
+    .asciiz "vmxbad\\n"
+    .org 0x82000600
+__savevmx_64:
+${vmxPairs('save', 'save66', 2)}
+    .org 0x82000820
+__restvmx_64:
+${vmxPairs('rest', 'rest66', 2)}
+    .org 0x82001000
+thunk_0:
+    .word 0x01000003                # type=1 (thunk), ordinal 3 (DbgPrint)
+`;
+  const { bytes } = assemble(src);
+  return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
+}
+
+/**
+ * FPR_* — a PE-shaped image containing the compiler's __savefpr_14 stub
+ * (18 `stfd fN, slot(r12)` + blr) and __restfpr_14 (the lfd mirror). These
+ * are LIFTABLE (stfd/lfd supported) — no synthesis — so this exercises the
+ * plain lift path plus the mid-entry seeding. End-to-end: f15 <- 1.0
+ * (pins the lfd fix — lfd used to return bswap64(ea)), mid-entry save, check
+ * the slot, mid-entry restore, then stfd again and check the high word.
+ * The round trip only works if the f-register globals and FP loads/stores
+ * are consistent.
+ */
+export const FPR_SAVE_BASE = IMAGE_BASE + 0x600;
+export const FPR_REST_BASE = IMAGE_BASE + 0x660;
+export const FPR_SAVE_15 = FPR_SAVE_BASE + 4;
+export const FPR_REST_15 = FPR_REST_BASE + 4;
+export const FPR_PASS_OUTPUT = 'fprok\n';
+export const FPR_BAD_OUTPUT = 'fprbad\n';
+
+function fprStub(kind, midLabel, midK) {
+  const lines = [];
+  for (let f = 14; f <= 31; f++) {
+    if (f === 14 + midK) lines.push(`${midLabel}:`);
+    const off = -0x90 + (f - 14) * 8;
+    lines.push(`    ${kind === 'save' ? 'stfd' : 'lfd'} f${f}, ${off}(r12)`);
+  }
+  lines.push('    blr');
+  return lines.join('\n');
+}
+
+export function buildFprStubXex() {
+  const src = pePrologue([
+    // virtualSize must cover the stubs (0x600..0x6ac) — the detector scans PE code sections
+    { name: '.text', rva: 0x200, virtualSize: 0x500, characteristics: 0x60000020 },
+  ]) + `
+.org 0x82000200
+entry:
+    lis   r12, 0x8300
+    addi  r12, r12, 0x0200          # r12 = frame top 0x83000200
+    lis   r11, one@ha
+    addi  r11, r11, one@l
+    lfd   f15, 0(r11)               # f15 = 1.0 (0x3FF0000000000000)
+    bl    savefpr_15                # mid-entry: saves f15..f31 (f14 not touched)
+    lwz   r3, -136(r12)             # f15 slot = -0x88, high word = 0x3FF00000
+    lis   r6, 0x3FF0
+    cmpw  r3, r6
+    bne   Lbad
+    lwz   r4, -132(r12)             # low word = 0x00000000
+    cmpwi r4, 0
+    bne   Lbad
+    bl    restfpr_15                # f15 = restored 1.0
+    stfd  f15, -160(r12)            # scratch slot below the save area
+    lwz   r3, -160(r12)
+    lis   r6, 0x3FF0
+    cmpw  r3, r6
+    bne   Lbad
+    lis   r3, fmtok@ha
+    addi  r3, r3, fmtok@l
+    b     Lprint
+Lbad:
+    lis   r3, fmtbad@ha
+    addi  r3, r3, fmtbad@l
+Lprint:
+    bl    thunk_0
+    li    r9, 0
+    lis   r10, 0x00f0
+    ori   r10, r10, 0x0ffc
+    stw   r9, 0(r10)                # exit door
+spin:
+    b     spin
+fmtok:
+    .asciiz "fprok\\n"
+fmtbad:
+    .asciiz "fprbad\\n"
+one:
+    .dword 0x3ff0000000000000
+    .org 0x82000600
+__savefpr_14:
+${fprStub('save', 'savefpr_15', 1)}
+    .org 0x82000660
+__restfpr_14:
+${fprStub('rest', 'restfpr_15', 1)}
+    .org 0x82001000
+thunk_0:
+    .word 0x01000003                # type=1 (thunk), ordinal 3 (DbgPrint)
+`;
+  const { bytes } = assemble(src);
+  return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
+}
