@@ -18,6 +18,7 @@ Reality constraints:
 
 ### M0 — Recompiler core (done)
 - Entry-point discovery → fragment lifter (64-bit integer ALU, rotate/mask/shift, load/store, branches incl. CTR loops and `bl`/`blr`) → validated WebAssembly emission.
+- XEX2 `.pdata`-seeded discovery (XenonRecomp-style): the decrypted image's PE section table is parsed, `.pdata` (`IMAGE_CE_RUNTIME_FUNCTION`, big-endian) contributes every `BeginAddress` as a function start, so functions reached only indirectly (function pointers, `bctr`) are still recompiled and exported. Seeds never include HLE import thunks; a missing/unparseable `.pdata` degrades to the previous control-flow-only discovery with a `peError` breadcrumb instead of failing the image.
 - 64 MiB flat guest arena with the 0x03ffffff mask, MMIO console at 0x00F00000, exit door at 0x00F00FFC.
 - Built-in samples (Hello / Fibonacci / Countdown) recompile and run in-page and under `node --test`.
 - Project export: `guest.wasm` + segments + `file://` runner + manifest + HLE host (`hle.js`/`hle_tables.js`) + `docs/HLE.md` as one `.zip`; `node run.js` in the archive prints DbgPrint output end-to-end.
@@ -43,7 +44,9 @@ Reality constraints:
 - ✅ Register file (reset defaults, write log) + generated register table from xenia (3435 registers).
 - ✅ PM4 command processor: packet decode, SET_CONSTANT windows, REG_RMW (incl. register operands), MEM_WRITE / REG_TO_MEM with xenia GpuSwap32 endianness, EVENT_WRITE family (counter + WRITEBACK window mapping), DRAW_INDX decode (kDMA/kAutoIndex; kImmediate traps as in xenia), loud traps for everything else.
 - ✅ WebGPU plumbing: adapter/device/canvas configuration, depth attachment, index-buffer upload (BE→swap→LE), present; bring-up triangle behind explicit `{ placeholderShader: true }` — never silently rendered.
-- ⬜ Ring buffer from guest memory + doorbell; vertex fetch (`FETCH_*`); shader HIR → WGSL (replaces the placeholder gate); render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
+- ✅ Ring buffer: host-side ring (`VdInitializeRingBuffer` / writeback / CP_RB_WPTR doorbell, wraparound + overrun trap) wired to the HLE Vd* exports and an in-page `XenonGpuHost`; end-to-end tested.
+- ✅ Vertex fetch decode: `FETCH_*` constants, ucode walker, `GPUVertexFormat` mapping, `GPUVertexBufferLayout` descriptors — formats WebGPU can't represent trap.
+- ⬜ GPU MMIO aperture in the recompiler so real guests can ring the doorbell; shader HIR → WGSL (replaces the placeholder gate) + vertex buffer binding; render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
 
 ### M5 — Audio & input
 - XMA decoding (ffmpeg→wasm drop-in or a clean decoder).

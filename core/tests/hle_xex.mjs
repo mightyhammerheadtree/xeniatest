@@ -237,6 +237,128 @@ export function buildSyntheticXexFromImage(image, { compression = 'basic', encry
   return { xex: concat(header, image), image, sessionKey };
 }
 
+/**
+ * PDATA_* — a PE-shaped guest image with a real `.pdata`
+ * (IMAGE_CE_RUNTIME_FUNCTION) section, mirroring what XenonRecomp parses:
+ *
+ *   - record 0: the entry function (baseline — control-flow discovery finds it too)
+ *   - record 1: `helper_fn`, a function NOTHING in the image branches to —
+ *     only visible through .pdata. This is the regression test for
+ *     pdata-seeded fragment discovery.
+ *   - record 2: the HLE import thunk — must NOT be exported as a wasm
+ *     function (HLE imports resolve to host calls, not recompiled code).
+ *
+ * PE headers are little-endian (Windows PE convention); the code and the
+ * .pdata records are big-endian PPC/guest data. The image is wrapped with
+ * the public retail key like every other fixture in this file.
+ */
+export const PDATA_ENTRY_ADDR = 0x82000200;
+export const PDATA_HELPER_ADDR = 0x82000300; // pdata-only, unreachable from entry
+export const PDATA_THUNK_ADDR = THUNK_ADDR;  // 0x82001000
+export const PDATA_HELPER_R3 = 0x2a;         // helper_fn leaves 42 in r3
+export const PDATA_OUTPUT = 'pdata seeded run\n';
+
+const PDATA_SOURCE = `
+.org 0x82000000
+.byte 0x4D, 0x5A            # 'MZ'
+.space 0x3A                 # 0x02..0x3B
+.byte 0x80, 0x00, 0x00, 0x00  # e_lfanew = 0x80 (LE)
+.space 0x40                 # 0x40..0x7F
+.byte 0x50, 0x45, 0x00, 0x00  # 'PE\\0\\0'
+.byte 0xF2, 0x01            # Machine = POWERPCFP (0x01F2, LE)
+.byte 0x02, 0x00            # NumberOfSections = 2
+.byte 0x00, 0x00, 0x00, 0x00  # TimeDateStamp
+.byte 0x00, 0x00, 0x00, 0x00  # PointerToSymbolTable
+.byte 0x00, 0x00, 0x00, 0x00  # NumberOfSymbols
+.byte 0xE0, 0x00            # SizeOfOptionalHeader = 0xE0
+.byte 0x02, 0x01            # Characteristics = EXECUTABLE_IMAGE | 32BIT_MACHINE
+# ---- optional header @ 0x98 (0xE0 bytes, little-endian) ----
+.byte 0x0B, 0x01            # Magic = PE32
+.byte 0x09, 0x00            # Linker 9.0
+.byte 0x00, 0x02, 0x00, 0x00  # SizeOfCode = 0x200
+.byte 0x00, 0x00, 0x00, 0x00  # SizeOfInitializedData
+.byte 0x00, 0x00, 0x00, 0x00  # SizeOfUninitializedData
+.byte 0x00, 0x02, 0x00, 0x00  # AddressOfEntryPoint = 0x200
+.byte 0x00, 0x02, 0x00, 0x00  # BaseOfCode = 0x200
+.byte 0x00, 0x04, 0x00, 0x00  # BaseOfData = 0x400
+.byte 0x00, 0x00, 0x00, 0x82  # ImageBase = 0x82000000
+.byte 0x00, 0x02, 0x00, 0x00  # SectionAlignment = 0x200
+.byte 0x00, 0x02, 0x00, 0x00  # FileAlignment = 0x200
+.byte 0x06, 0x00, 0x02, 0x00  # OS 6.2
+.byte 0x00, 0x00, 0x00, 0x00  # Image 0.0
+.byte 0x06, 0x00, 0x02, 0x00  # Subsystem 6.2
+.byte 0x00, 0x00, 0x00, 0x00  # Win32VersionValue
+.byte 0x00, 0x20, 0x00, 0x00  # SizeOfImage = 0x2000
+.byte 0x00, 0x02, 0x00, 0x00  # SizeOfHeaders = 0x200
+.byte 0x00, 0x00, 0x00, 0x00  # CheckSum
+.byte 0x02, 0x00            # Subsystem = WINDOWS_GUI
+.byte 0x00, 0x00            # DllCharacteristics
+.byte 0x00, 0x00, 0x10, 0x00  # SizeOfStackReserve = 0x00100000
+.byte 0x00, 0x10, 0x00, 0x00  # SizeOfStackCommit = 0x00001000
+.byte 0x00, 0x00, 0x10, 0x00  # SizeOfHeapReserve = 0x00100000
+.byte 0x00, 0x10, 0x00, 0x00  # SizeOfHeapCommit = 0x00001000
+.byte 0x00, 0x00, 0x00, 0x00  # LoaderFlags
+.byte 0x10, 0x00, 0x00, 0x00  # NumberOfRvaAndSizes = 16
+.space 128                  # DataDirectory
+# ---- section table @ 0x178 (2 × 40 bytes) ----
+.byte 0x2E, 0x74, 0x65, 0x78, 0x74, 0x00, 0x00, 0x00  # '.text'
+.byte 0x00, 0x02, 0x00, 0x00  # VirtualSize = 0x200
+.byte 0x00, 0x02, 0x00, 0x00  # VirtualAddress = 0x200
+.byte 0x00, 0x02, 0x00, 0x00  # SizeOfRawData = 0x200
+.byte 0x00, 0x02, 0x00, 0x00  # PointerToRawData = 0x200
+.byte 0x00, 0x00, 0x00, 0x00  # PointerToRelocations
+.byte 0x00, 0x00, 0x00, 0x00  # PointerToLinenumbers
+.byte 0x00, 0x00            # NumberOfRelocations
+.byte 0x00, 0x00            # NumberOfLinenumbers
+.byte 0x20, 0x00, 0x00, 0x60  # Characteristics = CODE|EXECUTE|READ (0x60000020)
+.byte 0x2E, 0x70, 0x64, 0x61, 0x74, 0x61, 0x00, 0x00  # '.pdata'
+.byte 0x18, 0x00, 0x00, 0x00  # VirtualSize = 0x18 (3 records)
+.byte 0x00, 0x04, 0x00, 0x00  # VirtualAddress = 0x400
+.byte 0x18, 0x00, 0x00, 0x00  # SizeOfRawData = 0x18
+.byte 0x00, 0x04, 0x00, 0x00  # PointerToRawData = 0x400
+.byte 0x00, 0x00, 0x00, 0x00  # PointerToRelocations
+.byte 0x00, 0x00, 0x00, 0x00  # PointerToLinenumbers
+.byte 0x00, 0x00            # NumberOfRelocations
+.byte 0x00, 0x00            # NumberOfLinenumbers
+.byte 0x40, 0x00, 0x00, 0x40  # Characteristics = INITIALIZED_DATA|READ (0x40000040)
+.space 0x38                 # 0x1C8..0x1FF pad to 0x200
+# ---- .text @ 0x200 ----
+.org 0x82000200
+entry:
+    lis   r3, fmt@ha
+    addi  r3, r3, fmt@l
+    bl    thunk_0
+    li    r3, 0
+    lis   r10, 0x00f0
+    ori   r10, r10, 0x0ffc
+    stw   r3, 0(r10)            # exit door
+spin:
+    b     spin
+fmt:
+    .asciiz "pdata seeded run\\n"
+    .org 0x82000300
+helper_fn:                      # never referenced — only visible via .pdata
+    li    r3, 0x2a
+    blr
+    .org 0x82000400
+# ---- .pdata @ 0x400 (big-endian IMAGE_CE_RUNTIME_FUNCTION records) ----
+    .byte 0x82, 0x00, 0x02, 0x00  # record 0: entry (0x82000200)
+    .byte 0x00, 0x00, 0x01, 0x02  # FunctionLength=0x40 (0x100 B), ThirtyTwoBit
+    .byte 0x82, 0x00, 0x03, 0x00  # record 1: helper_fn (0x82000300)
+    .byte 0x00, 0x00, 0x00, 0x12  # FunctionLength=4 (0x10 B), ThirtyTwoBit
+    .byte 0x82, 0x00, 0x10, 0x00  # record 2: HLE thunk (0x82001000)
+    .byte 0x00, 0x00, 0x00, 0x06  # FunctionLength=1 (0x04 B), ThirtyTwoBit
+    .org 0x82001000
+thunk_0:
+    .word 0x01000003            # type=1 (thunk), ordinal 3 (DbgPrint)
+`;
+
+/** Build the PE-shaped synthetic XEX2 carrying a `.pdata` section. */
+export function buildPdataXex() {
+  const { bytes } = assemble(PDATA_SOURCE);
+  return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
+}
+
 /** compression=none + encryption=normal helper (uncompressed but encrypted image) */
 export function buildEncryptedUncompressedXex({ importOrdinals } = {}) {
   const image = assembleGuest(importOrdinals ? { importOrdinals, calls: importOrdinals.map((_, i) => (i % 2 === 0 ? 'fmt1' : 'fmt2')) } : undefined);

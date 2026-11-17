@@ -93,6 +93,8 @@ Nothing about them is uploaded; everything happens client-side.
 | 0x0130 | `RtlLeaveCriticalSection` | recursion-aware; unlocking a section not owned by the current thread traps loudly |
 | 0x0141 | `RtlTryEnterCriticalSection` | returns 1 on acquire/recurse, 0 when locked elsewhere |
 | 0x0195 | `XexGetModuleHandle` | `NULL` name → synthetic main-module handle (`STATUS_SUCCESS`); name lookup → `X_STATUS_OBJECT_NAME_NOT_FOUND` (not implemented, refuses to fabricate a module) |
+| 0x01B6 | `VdEnableRingBufferRPtrWriteBack` | forwards `(ptr, block_size_log2)` to `globalThis.XenonGpuHost` (public/js/gpu/gpu_host.js); traps loudly when no GPU host is attached |
+| 0x01C3 | `VdInitializeRingBuffer` | forwards `(ptr, size_log2)` to `globalThis.XenonGpuHost` (zeroes the ring like xenia, seeds the read pointer); traps loudly when no GPU host is attached |
 
 ### The managed guest heap
 
@@ -111,6 +113,16 @@ Critical sections are implemented with **single-threaded host semantics**:
 the recompiled guest runs on one WASM thread, so `Enter`/`Leave`/`TryEnter`
 model recursion and lock counts exactly, and a genuine contention or
 unbalanced unlock throws an `HleError` instead of deadlocking silently.
+
+### The GPU host hook (Vd* exports)
+
+The `Vd*` ring-buffer exports need a live GPU subsystem they cannot import
+(hle.js stays dependency-free so it can ship in the exported zip). They
+therefore forward to `globalThis.XenonGpuHost` when one is attached — the
+in-page frontend creates it from public/js/gpu/gpu_host.js after instantiating
+the guest wasm. Without a host they **trap loudly naming the export** — they
+never fabricate success. The exported zip does not ship the GPU modules yet,
+so Vd* calls trap there with the same message until it does.
 
 Everything else in the 2918 known exports traps with its name and ordinal.
 
