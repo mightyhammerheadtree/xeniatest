@@ -58,7 +58,7 @@ const XEX_OPT_KEYS = {
   0x00E10402: 'EXPORTS_BY_NAME',
 };
 
-const COMPRESSION_NAMES = { 0: 'raw', 1: 'lzx', 2: 'basic-compression', 3: 'others' };
+const COMPRESSION_NAMES = { 0: 'none', 1: 'basic', 2: 'normal (lzx)', 3: 'delta' };
 
 /** Parse an XEX2 header. Pass the first `min(size, 4 MiB)` bytes of the file. */
 export function parseXex2(bytes) {
@@ -69,8 +69,8 @@ export function parseXex2(bytes) {
 
   const moduleFlags = view.getUint32(4, false);
   const headerSize = view.getUint32(8, false);
-  const securityOffset = view.getUint32(12, false);
-  const headerCount = view.getUint32(16, false);
+  const securityOffset = view.getUint32(16, false);
+  const headerCount = view.getUint32(20, false);
 
   const info = {
     format: 'XEX2',
@@ -92,7 +92,7 @@ export function parseXex2(bytes) {
     importLibraries: [],
   };
 
-  const optOffset = 20;
+  const optOffset = 24;
   for (let i = 0; i < headerCount && optOffset + i * 8 + 8 <= bytes.length; i++) {
     const key = view.getUint32(optOffset + i * 8, false);
     const value = view.getUint32(optOffset + i * 8 + 4, false);
@@ -123,18 +123,24 @@ export function parseXex2(bytes) {
     info.securityHeaderSize = view.getUint32(sec, false);
     info.imageSize = view.getUint32(sec + 4, false);
     // rsa_signature[0x100] skipped at sec + 8
-    const infoSizeOff = sec + 8 + 0x100;
-    if (infoSizeOff + 20 <= bytes.length) {
+    const infoSizeOff = sec + 0x108;
+    if (infoSizeOff + 8 <= bytes.length) {
       info.securityInfoSize = view.getUint32(infoSizeOff, false);
       info.imageFlags = view.getUint32(infoSizeOff + 4, false);
       info.loadAddress = view.getUint32(infoSizeOff + 8, false);
-      info.pageDescriptorCount = view.getUint32(infoSizeOff + 12, false);
-      let pd = infoSizeOff + 16;
-      for (let i = 0; i < info.pageDescriptorCount && pd + 24 <= bytes.length; i++) {
-        const type = (view.getUint32(pd, false) >>> 28) & 0xf;
-        const pageCount = view.getUint32(pd, false) & 0x0fffffff;
-        info.pageDescriptors.push({ type, pageCount, bytes: pageCount * 4096 });
-        pd += 24;
+      const pageSize = (info.imageFlags & 0x10000000) ? 0x1000 : 0x10000;
+      const pdCountOff = sec + 0x180;
+      if (pdCountOff + 4 <= bytes.length) {
+        info.pageDescriptorCount = view.getUint32(pdCountOff, false);
+        let pd = sec + 0x184;
+        for (let i = 0; i < info.pageDescriptorCount && pd + 24 <= bytes.length; i++) {
+          // xenia decodes: type = word & 0xf, page_count = word >>> 4 (big-endian word)
+          const word = view.getUint32(pd, false);
+          const type = word & 0x0f;
+          const pageCount = (word >>> 4) & 0x0fffffff;
+          info.pageDescriptors.push({ type, pageCount, bytes: pageCount * pageSize });
+          pd += 24; // 4-byte flags + 20-byte page digest
+        }
       }
     }
   }
@@ -145,28 +151,56 @@ const PAGE_TYPE_NAMES = { 1: 'code', 2: 'data', 3: 'rodata' };
 
 function parseFormatInfo(view, offset) {
   if (!offset || offset + 8 > view.byteLength) return null;
-  const infoOffset = view.getUint32(offset, false);
-  const size = view.byteLength;
-  if (infoOffset >= size || infoOffset + 16 > size) return { raw: null };
-  const info = view.getUint32(infoOffset, false);
-  // xex2_opt_file_format_info: flags (u16), type (u16), ... compression_type at +? best effort:
-  return { compressionType: info & 0xffff, compressionName: COMPRESSION_NAMES[info & 0xffff] ?? `type ${info & 0xffff}` };
+  const infoSize = view.getUint32(offset, false);
+  const encryptionType = view.getUint16(offset + 4, false);
+  const compressionType = view.getUint16(offset + 6, false);
+  const info = { infoSize, encryptionType, compressionType,
+    compressionName: COMPRESSION_NAMES[compressionType] ?? `type ${compressionType}` };
+  if (compressionType === 1) { // BASIC: {data_size, zero_size} blocks from +8
+    const blockCount = Math.floor((infoSize - 8) / 8);
+    info.blocks = [];
+    for (let i = 0; i < blockCount && offset + 8 + (i + 1) * 8 <= view.byteLength; i++) {
+      info.blocks.push({
+        dataSize: view.getUint32(offset + 8 + i * 8, false),
+        zeroSize: view.getUint32(offset + 8 + i * 8 + 4, false),
+      });
+    }
+  }
+  return info;
 }
 
 function parseImportLibraries(bytes, view, offset) {
-  if (!offset || offset + 8 > bytes.length) return [];
-  const count = view.getUint32(offset, false);
+  if (!offset || offset + 12 > bytes.length) return [];
+  const size = view.getUint32(offset, false);
+  if (!size || offset + size > bytes.length) return [];
+  // string_table: { size, count, data[] } at +4
+  const tableSize = view.getUint32(offset + 4, false);
+  const tableCount = view.getUint32(offset + 8, false);
   const names = [];
-  let cursor = offset + 4;
-  // Each import library descriptor: name (null-terminated ASCII) then a table
-  // of (ordinal, hint) pairs. Read names best-effort.
-  for (let i = 0; i < Math.min(count, 64) && cursor + 4 <= bytes.length; i++) {
-    const libNameOff = view.getUint32(cursor, false);
-    cursor += 4;
-    const name = readAsciiZ(bytes, libNameOff, 64);
-    if (name) names.push(name);
+  let i = 0, o = 0;
+  const tableEnd = Math.min(offset + 12 + tableSize, bytes.length);
+  while (o < tableCount && offset + 12 + i < tableEnd) {
+    let str = '';
+    let j = offset + 12 + i;
+    while (j < tableEnd && bytes[j] !== 0 && str.length < 256) { str += String.fromCharCode(bytes[j]); j++; }
+    if (str) names.push(str);
+    i = j - (offset + 12) + 1;
+    if (i % 4 !== 0) i += 4 - (i % 4);
+    o++;
   }
-  return names;
+  // libraries follow the string table, each { size, digest[0x14], id, version, version_min, name_index(u16), count(u16), import_table[] }
+  const libraries = [];
+  let cursor = offset + 12 + tableSize;
+  const end = offset + size;
+  while (cursor + 0x28 <= Math.min(end, bytes.length)) {
+    const libSize = view.getUint32(cursor, false);
+    if (!libSize || libSize < 0x28) break;
+    const nameIndex = view.getUint16(cursor + 0x24, false) & 0xff;
+    const count = view.getUint16(cursor + 0x26, false);
+    libraries.push({ name: names[nameIndex] ?? `module-${nameIndex}`, count });
+    cursor += libSize;
+  }
+  return libraries.map((l) => `${l.name} (${l.count} imports)`);
 }
 
 function readAsciiZ(bytes, offset, maxLen) {

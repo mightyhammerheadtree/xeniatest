@@ -157,7 +157,7 @@ test('download button emits a valid project zip (CRCs, manifest, segments)', asy
     off += 46 + nameLen + extraLen + commentLen;
   }
   for (const expected of ['README.md', 'manifest.json', 'index.html', 'runtime.js', 'guest-wasm.js',
-    'guest.wasm', 'run.js', 'docs/KERNEL.md', 'kernel/.gitkeep', 'segment-0.bin', 'guest.bin']) {
+    'guest.wasm', 'run.js', 'hle.js', 'hle_tables.js', 'docs/HLE.md', 'segment-0.bin', 'guest.bin']) {
     assert.ok(names.includes(expected), 'zip contains ' + expected);
   }
   const manifestEntry = names.indexOf('manifest.json');
@@ -166,33 +166,39 @@ test('download button emits a valid project zip (CRCs, manifest, segments)', asy
 
 test('inspector parses a synthetic XEX2 and a big-endian ELF64 header', async () => {
   const imageSize = 0x1000;
-  const headerSize = 4 + 4 + 4 + 4 + 4 + 8;
   const securityOffset = 0x100;
-  const buf = new Uint8Array(0x400);
+  const headerSize = securityOffset + 0x200;
+  const buf = new Uint8Array(headerSize + 0x100);
   const dv = new DataView(buf.buffer);
   const put = (off, s) => { for (let i = 0; i < s.length; i++) buf[off + i] = s.charCodeAt(i); };
   put(0, 'XEX2');
   dv.setUint32(4, 0x00000080, false);
   dv.setUint32(8, headerSize, false);
-  dv.setUint32(12, securityOffset, false);
-  dv.setUint32(16, 1, false);
-  dv.setUint32(20, 0x00010100, false);
-  dv.setUint32(24, 0x82000000, false);
+  dv.setUint32(12, 0, false);          // reserved
+  dv.setUint32(16, securityOffset, false);
+  dv.setUint32(20, 1, false);          // headerCount
+  dv.setUint32(24, 0x00010100, false); // opt key ENTRY_POINT
+  dv.setUint32(28, 0x82000000, false); // opt value
   dv.setUint32(securityOffset, 0x104, false);
   dv.setUint32(securityOffset + 4, imageSize, false);
-  const secInfo = securityOffset + 8 + 0x100;
-  dv.setUint32(secInfo, 0x18, false);
-  dv.setUint32(secInfo + 4, 0x00000400, false);
-  dv.setUint32(secInfo + 8, 0x82000000, false);
-  dv.setUint32(secInfo + 12, 1, false);
-  dv.setUint32(secInfo + 16, (1 << 28) | 4, false);
+  const infoOff = securityOffset + 0x108;
+  dv.setUint32(infoOff, 0x198, false);
+  dv.setUint32(infoOff + 4, 0x10000000, false); // XEX_IMAGE_PAGE_SIZE_4KB
+  dv.setUint32(infoOff + 8, 0x82000000, false); // load_address
+  dv.setUint32(securityOffset + 0x180, 1, false); // page_descriptor_count
+  // flags word: low nibble = section type (1 = code), 28 high bits = page count
+  dv.setUint32(securityOffset + 0x184, (4 << 4) | 1, false);
 
   const { parseXex2, parseElf } = await import('../../public/js/inspect.js');
   const info = parseXex2(buf);
   assert.equal(info.format, 'XEX2');
   assert.equal(info.entryPoint, 0x82000000);
   assert.equal(info.imageSize, imageSize);
+  assert.equal(info.loadAddress, 0x82000000);
   assert.equal(info.pageDescriptors.length, 1);
+  assert.equal(info.pageDescriptors[0].type, 1);
+  assert.equal(info.pageDescriptors[0].pageCount, 4);
+  assert.equal(info.pageDescriptors[0].bytes, 4 * 0x1000);
   assert.ok(info.moduleFlagNames.includes('USER_MODE'));
 
   const elf = new Uint8Array(64);
