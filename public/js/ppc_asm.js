@@ -127,8 +127,10 @@ const BCOND = {
 };
 
 function parseImm16(value) {
-  // Already resolved to a number by the operand pass.
-  return value | 0;
+  // Already resolved to a number by the operand pass. May be negative
+  // (sign-extended 16-bit immediates); clamp via modulo instead of |0
+  // so large unsigned values survive.
+  return Number(value) & 0xffff;
 }
 
 export function assemble(source) {
@@ -164,9 +166,10 @@ export function assemble(source) {
     // string can't misalign the code that follows it.
     const isInstr = rest && !rest.startsWith('.');
     const dir0 = isInstr ? null : (rest.slice(1).split(/\s+/)[0] || '').toLowerCase();
-    if (isInstr || dir0 === 'word') addr = (addr + 3) & ~3;
-    else if (dir0 === 'dword') addr = (addr + 7) & ~7;
-    else if (labelNames.length) addr = (addr + 3) & ~3;
+    const alignUp = (a, m) => Math.ceil(a / m) * m; // double-safe: guest bases exceed 2^31
+    if (isInstr || dir0 === 'word') addr = alignUp(addr, 4);
+    else if (dir0 === 'dword') addr = alignUp(addr, 8);
+    else if (labelNames.length) addr = alignUp(addr, 4);
 
     for (const name of labelNames) {
       if (name in symbols) throw new Error(`line ${lineno + 1}: duplicate label '${name}'`);
@@ -180,7 +183,7 @@ export function assemble(source) {
       const dir = parts[0].toLowerCase();
       const argStr = parts.slice(1).join(' ');
       if (dir === 'org') { const a = parseImmediate(argStr.trim(), symbols); if (origin === null) origin = a; addr = a; continue; }
-      if (dir === 'space') { items.push({ type: 'data', dir, args: argStr, addr, size: parseInt(argStr, 10) || 0, lineno }); addr += parseInt(argStr, 10) || 0; continue; }
+      if (dir === 'space') { const n = parseImmediate(argStr.trim(), symbols) || 0; items.push({ type: 'data', dir, args: argStr, addr, size: n, lineno }); addr += n; continue; }
       if (dir === 'byte') { const n = splitOperands(argStr).length; items.push({ type: 'data', dir, args: argStr, addr, size: n, lineno }); addr += n; continue; }
       if (dir === 'word') { const n = splitOperands(argStr).length * 4; items.push({ type: 'data', dir, args: argStr, addr, size: n, lineno }); addr += n; continue; }
       if (dir === 'dword') { const n = splitOperands(argStr).length * 8; items.push({ type: 'data', dir, args: argStr, addr, size: n, lineno }); addr += n; continue; }

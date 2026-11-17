@@ -19,14 +19,20 @@
  */
 import { decodeInstruction } from './ppc_decode.js';
 import { WasmBuilder, Ops, sleb, uleb } from './wasm_emitter.js';
+import { loadXex2, XexLoadError } from './xex_loader.js';
+import './hle.js'; // UMD side effect: sets globalThis.XenonHLE (the HLE host)
+import './hle_tables.js'; // UMD side effect: sets globalThis.XenonHLETables (ordinal → name)
 
 export const GUEST_MEM_MASK = 0x03ffffff; // 64 MiB flat arena
 export const GUEST_MEM_SIZE = 64 * 1024 * 1024;
 export const MMIO_BASE = 0x00f00000;
 export const MMIO_END = 0x00f01000;
 
+const HLE_CTX_ADDR = 0x00F11000; // scratch area: r0..r31 as 32 × u64 BE (read by the HLE host)
+
 const G = {
   R0: 0,           // r0..r31 → globals 0..31
+  R3: 3,           // r3 — holds HLE/indirect-call return values
   F0: 32,          // f0..f31 → globals 32..63
   CR: 64,          // i32
   XER: 65,         // i32
@@ -42,11 +48,12 @@ export class RecompError extends Error {}
 /** Load/segment helpers ------------------------------------------------ */
 
 /** Build the flat guest arena image from parsed file info. */
-export function buildImage(kind, parsed, bytes) {
+export function buildImage(kind, parsed, bytes, opts = {}) {
   const arena = new Uint8Array(GUEST_MEM_SIZE);
   let entry = 0;
   let base = IMAGE_BASE_DEFAULT;
   const segments = [];
+  let hleCalls; // Map<addr, {addr, type, ordinal, moduleId, moduleName, name}> — XEX2 imports only
   if (kind === 'bin') {
     const n = Math.min(bytes.length, GUEST_MEM_SIZE);
     arena.set(bytes.subarray(0, n), IMAGE_BASE_DEFAULT);
@@ -65,24 +72,30 @@ export function buildImage(kind, parsed, bytes) {
     entry = Number(parsed.entry) & GUEST_MEM_MASK;
     base = entry;
   } else if (kind === 'xex2') {
-    // XEX2: image lives at image base (from security info loadAddress when
-    // present, else the original base header). Pages are copied verbatim; if
-    // the XEX is encrypted/compressed this fails loudly below.
-    let loadBase = parsed.loadAddress ?? parsed.originalBaseAddress ?? parsed.imageBaseAddress ?? 0x82000000;
-    loadBase = Number(loadBase) & GUEST_MEM_MASK;
-    const headerSize = parsed.headerSize ?? 0;
-    const imgSize = parsed.imageSize ?? (bytes.length - headerSize);
-    const n = Math.min(Math.max(0, imgSize), bytes.length - headerSize, GUEST_MEM_SIZE - loadBase);
-    if (n <= 0) throw new RecompError('XEX2: no image data found (encrypted XEX2 is not supported — see docs/KERNELS.md)');
-    arena.set(bytes.subarray(headerSize, headerSize + n), loadBase);
-    segments.push({ addr: loadBase, data: bytes.subarray(headerSize, headerSize + n).slice() });
-    // Entry point from opt header 0x00010100
-    entry = parsed.entryPoint != null ? Number(parsed.entryPoint) & GUEST_MEM_MASK : loadBase;
-    base = loadBase;
+    // XEX2: retail images are decrypted with the public retail XEX2 key
+    // (the same constant xenia ships) — no console, no NAND, no CPU key.
+    // Devkit images fall back automatically (xenia's own fallback). BASIC
+    // decompression is supported; LZX/delta fail loudly. See docs/HLE.md.
+    let loaded;
+    try {
+      loaded = loadXex2(bytes, opts);
+    } catch (e) {
+      if (e instanceof XexLoadError) throw new RecompError(e.message);
+      throw e;
+    }
+    const loadBase = loaded.base & GUEST_MEM_MASK;
+    if (loaded.image.length > GUEST_MEM_SIZE - loadBase) {
+      throw new RecompError('XEX2 image is larger than the 64 MiB guest arena');
+    }
+    arena.set(loaded.image, loadBase);
+    segments.push({ addr: loadBase, data: loaded.image.slice() });
+    entry = loaded.entry & GUEST_MEM_MASK;
+    base = entry;
+    hleCalls = new Map(loaded.imports.filter((i) => i.type === 1).map((i) => [i.addr, i]));
   } else {
     throw new RecompError('unsupported image kind: ' + kind);
   }
-  return { arena, entry, base, segments };
+  return { arena, entry, base, segments, hleCalls };
 }
 
 /** Discovery -------------------------------------------------------------- */
@@ -110,7 +123,7 @@ function branchFallsThrough(insn) {
  * start, so every direct branch becomes a wasm call or block jump with no
  * exponential re-scanning.
  */
-export function discoverFragments(arena, entry) {
+export function discoverFragments(arena, entry, hleCalls) {
   const starts = new Set([entry]);
   const queue = [entry];
   const inImage = (a) => a >= 0 && a + 4 <= GUEST_MEM_SIZE;
@@ -124,7 +137,7 @@ export function discoverFragments(arena, entry) {
       const insn = decodeInstruction(word, addr);
       if (insn.branchTarget != null) {
         const t = insn.branchTarget & GUEST_MEM_MASK;
-        if (inImage(t) && !starts.has(t)) {
+        if (inImage(t) && !(hleCalls && hleCalls.has(t)) && !starts.has(t)) {
           starts.add(t);
           queue.push(t);
         }
@@ -132,7 +145,7 @@ export function discoverFragments(arena, entry) {
       if (insn.isBranch || insn.ends) {
         if (branchFallsThrough(insn)) {
           const f = addr + 4;
-          if (inImage(f) && !starts.has(f)) {
+          if (inImage(f) && !(hleCalls && hleCalls.has(f)) && !starts.has(f)) {
             starts.add(f);
             queue.push(f);
           }
@@ -181,9 +194,10 @@ const T_VOID = 0x40;
 const T_FUNC_NONE = 0, T_I32_VOID = 1, T_I64_VOID = 2, T_I64I32_VOID = 3, T_I64_I64 = 4;
 
 class Lifter {
-  constructor(fragments, opts) {
+  constructor(fragments, opts, hleCalls) {
     this.fragments = fragments;               // Map start -> {start, insns}
     this.starts = new Set(fragments.keys());
+    this.hleCalls = hleCalls ?? null;        // Map<addr, import descriptor> — XEX2 imports only
     this.b = new WasmBuilder();
     // Types
     this.tyNone = this.b.addType([], []);
@@ -199,6 +213,9 @@ class Lifter {
     this.imMMIO_STORE = this.b.addImport('xenorecomp', 'mmio_store', this.tyI64I64I32);
     this.imMMIO_LOAD = this.b.addImport('xenorecomp', 'mmio_load', this.b.addType([0x7e, 0x7f], [0x7e]));
     this.imSC = this.b.addImport('xenorecomp', 'sc', this.tyI64);
+    // Local helper (function index 7, right after the imports): writes r0..r31
+    // big-endian into HLE_CTX_ADDR for the HLE host. Body is spliced in at build time.
+    this.storeCtxIndex = this.b.addFunction(this.tyNone, [[1, 0x7e], [1, 0x7f]], []);
     // Memory: 64 MiB flat arena, fixed (no growth, no OOM).
     this.b.addMemory(1024, 1024);
     // Guest state globals
@@ -269,6 +286,35 @@ class Lifter {
   }
 }
 
+/**
+ * Build the body of the local `store_ctx` helper: copies all 32 GPRs
+ * (wasm globals 0..31) into memory at HLE_CTX_ADDR as big-endian u64s.
+ * Emitted once per module and called before every indirect call so the
+ * HLE host can read the guest context (xenia's ppc_context save).
+ * Locals: 0 = t64 (i64), 1 = t32 (i32).
+ */
+function buildStoreCtxOps() {
+  const O2 = Ops;
+  const bswapToL1 = () => [ // consume stack i32 → bswapped value in local 1
+    O2.local_set(1),
+    O2.local_get(1), O2.i32_const(8), O2.i32_shr_u, O2.i32_const(0x00ff00ff), O2.i32_and,
+    O2.local_get(1), O2.i32_const(8), O2.i32_shl, O2.i32_const(0xff00ff00), O2.i32_and, O2.i32_or, O2.local_set(1),
+    O2.local_get(1), O2.i32_const(16), O2.i32_shr_u,
+    O2.local_get(1), O2.i32_const(16), O2.i32_shl, O2.i32_or, O2.local_set(1),
+  ];
+  const ops = [];
+  for (let i = 0; i < 32; i++) {
+    const addr = HLE_CTX_ADDR + i * 8;
+    // high 32 bits, big-endian at addr
+    ops.push(...O2.global_get(i), ...O2.local_tee(0), ...O2.i64_const(32n), O2.i64_shr_u, O2.i32_wrap_i64, ...bswapToL1(),
+      ...O2.i32_const(addr), ...O2.local_get(1), ...O2.i32_store(2, 0));
+    // low 32 bits, big-endian at addr+4
+    ops.push(O2.local_get(0), O2.i32_wrap_i64, ...bswapToL1(),
+      ...O2.i32_const(addr + 4), ...O2.local_get(1), ...O2.i32_store(2, 0));
+  }
+  return flattenOps(ops);
+}
+
 // ---------- fragments / basic blocks ----------
 
 class FragmentCompiler {
@@ -326,17 +372,27 @@ class FragmentCompiler {
 
   /** Jump (tail call) to another fragment: call + return. */
   tailCall(addr) {
-    const idx = this.fnIdxOf(addr);
+    const a = addr & GUEST_MEM_MASK;
+    if (this.lifter.hleCalls?.has(a)) {
+      // Tail-call into an import thunk: snapshot the context and go through icall.
+      return [...O.call(this.lifter.storeCtxIndex), ...O.i64_const(BigInt(a)), ...O.call(this.lifter.imICALL), O.return];
+    }
+    const idx = this.fnIdxOf(a);
     if (idx >= 0) return [...O.call(idx), O.return];
     // Unknown fragment: trap loudly via unimpl.
-    return [...O.i64_const(BigInt(addr)), ...O.i32_const(-1), ...O.call(this.lifter.imUNIMPL), O.unreachable];
+    return [...O.i64_const(BigInt(a)), ...O.i32_const(-1), ...O.call(this.lifter.imUNIMPL), O.unreachable];
   }
 
   /** Call another fragment inline (for bl). */
   callFragment(addr) {
-    const idx = this.fnIdxOf(addr);
+    const a = addr & GUEST_MEM_MASK;
+    if (this.lifter.hleCalls?.has(a)) {
+      // bl to an import thunk: snapshot the context and go through icall.
+      return [...O.call(this.lifter.storeCtxIndex), ...O.i64_const(BigInt(a)), ...O.call(this.lifter.imICALL)];
+    }
+    const idx = this.fnIdxOf(a);
     if (idx >= 0) return [...O.call(idx)];
-    return [...O.i64_const(BigInt(addr)), ...O.i32_const(-2), ...O.call(this.lifter.imUNIMPL)];
+    return [...O.i64_const(BigInt(a)), ...O.i32_const(-2), ...O.call(this.lifter.imUNIMPL)];
   }
 
   emitBranchCommon(insn, enclosing) {
@@ -571,7 +627,7 @@ Object.assign(FragmentCompiler.prototype, {
       const ops = this.emitBranchCommon(insn, blockIdx);
       ops.push(...O.local_get(L_T32), ...O.if_(T_VOID));
       if (insn.LK) ops.push(...O.i64_const(BigInt(insn.address + 4)), ...O.global_set(G.LR));
-      ops.push(...O.global_get(G.CTR), ...O.call(L.imICALL));
+      ops.push(...O.call(L.storeCtxIndex), ...O.global_get(G.CTR), ...O.i64_const(BigInt(GUEST_MEM_MASK)), O.i64_and, ...O.call(L.imICALL));
       if (!insn.LK) ops.push(O.return);
       else if (this.cutTo != null) ops.push(...this.callFragment(this.cutTo), O.return);
       else ops.push(O.return);
@@ -1082,13 +1138,13 @@ Object.assign(FragmentCompiler.prototype, {
 
 // ---------- module assembly & host harness ----------
 
-export function recompileImage(arena, entry) {
-  const lifter = new Lifter(discoverFragments(arena, entry), {});
+export function recompileImage(arena, entry, opts = {}) {
+  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls), {}, opts.hleCalls);
   const L = lifter;
-  // Pre-assign wasm function indices: imports 0..7, then one per fragment (sorted).
+  // Pre-assign wasm function indices: imports 0..6, store_ctx at 7, then one per fragment (sorted).
   const sorted = [...L.fragments.keys()].sort((a, b) => a - b);
   const fnIndex = new Map();
-  const localBase = L.b.imports.length; // imports are created in the Lifter constructor
+  const localBase = L.b.imports.length + 1; // store_ctx helper occupies the first local slot
   sorted.forEach((addr, i) => fnIndex.set(addr, localBase + i));
 
   // Cut addresses: next fragment's start (or null) for fallthrough calls.
@@ -1107,13 +1163,16 @@ export function recompileImage(arena, entry) {
     L.stats.fragments = sorted.length;
     codeBodies.push({ addr, ops: fc.emit(L.b) });
   }
-  // Splice bodies in creation order (functions were created in sorted order)
+  // Splice bodies in creation order (functions were created in sorted order),
+  // with the store_ctx helper body first (it was registered as the first local function).
   codeBodies.sort((a, b) => fnIndex.get(a.addr) - fnIndex.get(b.addr));
-  L.b.funcBodies = codeBodies.map(({ ops }) => flattenOps(ops));
-  L.b.funcBodies = L.b.funcBodies.map((body) => [...body, O.end]);
+  L.b.funcBodies = [[...buildStoreCtxOps(), O.end]];
+  for (const { ops } of codeBodies) L.b.funcBodies.push([...flattenOps(ops), O.end]);
 
-  // Exports: memory + one fn per fragment
+  // Exports: memory + one fn per fragment + the r3 GPR (the HLE host writes
+  // return values back into it — JS cannot otherwise reach wasm globals).
   L.b.addExport('memory', 2, 0);
+  L.b.addExport('r3', 3, 3); // export kind 3 = global, index 3 = r3
   for (const addr of sorted) {
     L.b.addExport('fn_' + addr.toString(16), 0, fnIndex.get(addr));
   }
@@ -1129,8 +1188,14 @@ export class RecompUnimpl extends Error {
   constructor(addr, word) { super(`unimplemented instruction 0x${word.toString(16).padStart(8, '0')} at 0x${addr.toString(16)}`); this.addr = addr; }
 }
 
-export function makeImports({ onConsoleByte, onSc } = {}) {
+export function makeImports({ onConsoleByte, onSc, onLog } = {}) {
   let consoleBuf = '';
+  const createHleHost = () => globalThis.XenonHLE.createHleHost({
+    onConsoleByte: onConsoleByte ?? ((ch) => {
+      consoleBuf += String.fromCharCode(typeof ch === 'string' ? ch.charCodeAt(0) : ch);
+    }),
+    onLog,
+  });
   const imports = {
     xenorecomp: {
       putc(ch) {
@@ -1138,16 +1203,28 @@ export function makeImports({ onConsoleByte, onSc } = {}) {
         else consoleBuf += String.fromCharCode(ch);
       },
       exit(code) { throw new RecompExit(code | 0); },
-      unimpl(addr, word) { throw new RecompUnimpl(Number(addr), word | 0); },
+      unimpl(addr, word) { throw new RecompUnimpl(Number(BigInt(addr) & 0x03ffffffn), word | 0); },
       icall(addr) {
-        const target = Number(addr) & GUEST_MEM_MASK;
+        const target = Number(BigInt(addr) & 0x03ffffffn);
+        const hle = imports.__hleCalls && imports.__hleCalls.get(target);
+        if (hle) return imports.xenorecomp.hcall(hle.moduleId, hle.ordinal);
         const fn = imports.__exports && imports.__exports['fn_' + target.toString(16)];
         if (!fn) throw new RecompUnimpl(target, -2);
         fn();
+        return imports.__exports && imports.__exports.r3 ? imports.__exports.r3.value : 0n;
+      },
+      hcall(moduleId, ordinal) {
+        const host = (imports.__hleHost ??= createHleHost());
+        const result = host.call(String(moduleId), Number(ordinal) & 0xffffffff);
+        // propagate the return value into the guest's r3 (wasm globals are not
+        // otherwise reachable from JS — the module exports r3)
+        const exp = imports.__exports;
+        if (exp && exp.r3) exp.r3.value = result;
+        return result;
       },
       mmio_store(addr, value, size) {
         // Echo big-endian bytes before the exit door; the exit door halts the guest.
-        const a = Number(addr);
+        const a = Number(BigInt(addr) & 0x03ffffffn);
         const sizeBytes = size | 0;
         const v = BigInt(value);
         const bytes = [];
@@ -1158,19 +1235,27 @@ export function makeImports({ onConsoleByte, onSc } = {}) {
         if (a <= 0x00f00ffc && 0x00f00ffc < a + sizeBytes) throw new RecompExit(0);
       },
       mmio_load(addr, size) { return 0n; },
-      sc(addr) { if (onSc) onSc(Number(addr)); },
+      sc(addr) { if (onSc) onSc(Number(BigInt(addr) & 0x03ffffffn)); },
     },
   };
   imports.__consoleBuf = () => consoleBuf;
+  imports.__attachMemory = (memory) => {
+    // attach before any call happens; the HLE host snapshots GPRs per call
+    const host = (imports.__hleHost ??= createHleHost());
+    host.attachMemory(memory);
+  };
+  imports.__setHleCalls = (m) => { imports.__hleCalls = m; };
   return imports;
 }
 
-export async function runImage({ arena, entry }, { onConsole, onSc } = {}) {
+export async function runImage({ arena, entry, hleCalls }, { onConsole, onSc, onLog } = {}) {
   entry = entry & GUEST_MEM_MASK;
-  const { wasm, stats, functionStarts } = recompileImage(arena, entry);
-  const imports = makeImports({ onConsoleByte: onConsole ? (b) => onConsole(String.fromCharCode(b)) : undefined, onSc });
+  const { wasm, stats, functionStarts } = recompileImage(arena, entry, { hleCalls });
+  const imports = makeImports({ onConsoleByte: onConsole ? (b) => onConsole(String.fromCharCode(typeof b === 'string' ? b.charCodeAt(0) : b)) : undefined, onSc, onLog });
+  if (hleCalls) imports.__setHleCalls(hleCalls);
   const { instance } = await WebAssembly.instantiate(wasm, imports);
   imports.__exports = instance.exports;
+  imports.__attachMemory(instance.exports.memory);
   // Load the arena into wasm memory
   new Uint8Array(instance.exports.memory.buffer).set(arena);
   const t0 = performance.now();

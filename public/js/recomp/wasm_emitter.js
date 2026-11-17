@@ -178,8 +178,11 @@ export const Ops = {
   f64_store: (a = 0, o = 0) => [0x39, ...uleb(a), ...uleb(o)],
   i32_store8: (a = 0, o = 0) => [0x3a, ...uleb(a), ...uleb(o)],
   i32_store16: (a = 0, o = 0) => [0x3b, ...uleb(a), ...uleb(o)],
-  i32_const: (v) => [0x41, ...sleb(BigInt(v))],
-  i64_const: (v) => [0x42, ...sleb(BigInt(v))],
+  // i32/i64 constants are reduced mod 2^32 / 2^64 and reinterpreted as signed
+  // before encoding — raw uint32 bit patterns (e.g. 0xFF00FF00) would otherwise
+  // produce varints that overflow the signed range ("extra bits in varint").
+  i32_const: (v) => { let x = BigInt(v) & 0xffffffffn; if (x >= 0x80000000n) x -= 0x100000000n; return [0x41, ...sleb(x)]; },
+  i64_const: (v) => { let x = BigInt(v) & 0xffffffffffffffffn; if (x >= 0x8000000000000000n) x -= 0x10000000000000000n; return [0x42, ...sleb(x)]; },
   f64_const: (v) => Const.f64(v).slice(1),
   drop: 0x1a, select: 0x1b,
   i32_eq: 0x46, i32_ne: 0x47, i32_lt_s: 0x48, i32_gt_s: 0x4a, i32_le_s: 0x4c, i32_ge_s: 0x4e,
