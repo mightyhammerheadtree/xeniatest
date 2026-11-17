@@ -48,6 +48,7 @@ public/js/recomp/hle_tables.js   2918 xboxkrnl/xam/xbdm export ordinals → name
 public/js/recomp/hle_bundle.js   generated embed of hle.js/hle_tables.js/docs/HLE.md for the zip (npm run build:hle-bundle)
 public/js/recomp/zip.js          dependency-free ZIP writer (store method)
 public/js/recomp/templates.js    the project scaffold that ships inside the exported .zip
+public/js/gpu/                 Xenos GPU port: PM4 command processor, register file, WebGPU backend (M4, in progress)
 public/js/inspect.js             XEX2 / ELF parsers (shared by UI and tests)
 public/js/recompiler-ui.js       browser wiring for the three-step page
 public/js/ppc_asm.js             two-pass PPC assembler for the built-in samples
@@ -55,7 +56,9 @@ server/server.js                 static server with crossOriginIsolated + CSP + 
 docs/HLE.md                      the HLE kernel: model, ABI, implemented exports, porting backlog
 docs/KERNELS.md                  research: how the emulators/recompilers handle the kernel (background)
 docs/PORTING_ROADMAP.md          milestones from this PPC subset to booted homebrew/retail
+docs/XENOS_GPU.md                the Xenos→WebGPU port: what works, what doesn't, bring-up order
 tools/generate_hle_tables.py     regenerates hle_tables.js from the xenia export tables
+tools/gen_gpu_registers.mjs      regenerates public/js/gpu/xenos_registers.js from xenia's register_table.inc
 tools/xenorecomp/                Python reference pieces (disassembler, lifter sketches)
 ```
 
