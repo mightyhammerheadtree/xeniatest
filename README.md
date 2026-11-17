@@ -32,7 +32,7 @@ Then open the printed URL, pick a sample (or drop your own `.xex`/`.elf`/`.bin`)
 ## Development
 
 ```bash
-npm test        # recompiler end-to-end, ELF loader, web app (jsdom), HLE/XEX2 suites — 25 tests
+npm test        # recompiler end-to-end, ELF loader, web app (jsdom), HLE/XEX2 suites — 26 tests
 ```
 
 Layout:
