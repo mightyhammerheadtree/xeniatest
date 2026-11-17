@@ -4,7 +4,13 @@ This is the honest plan for growing the **static recompiler** from "recompiles s
 
 Reality constraints:
 
-- **Retail boot is out of scope without your console.** Every Xbox 360 title is encrypted; xenia-canary needs your NAND flash dump and CPU key. The web build will never ship those, and neither should you.
+- **Retail keys are not the blocker.** Retail XEX2 images decrypt with the
+  public retail container key (the same constant xenia ships); devkit images
+  fall back to the devkit key automatically. BASIC decompression is in,
+  LZX/DELTA fail loudly with an actionable message. What stands between a
+  retail executable and running is the Xenos GPU and the HLE surface —
+  both are porting work, not legal/key issues. (See [HLE.md](HLE.md) and
+  [LEGAL.md](LEGAL.md).)
 - **The Xenos GPU is the hard part.** It is a unified-shader Xenon-era design; the practical path is a WebGPU compute reimplementation seeded from xenia's shader translator.
 - **Static recompilation changes the calculus.** No interpreter fallback exists in shipping builds; unknown instructions must stay loud (trap with a PC), and the trap surface is the porting backlog.
 
@@ -14,15 +20,20 @@ Reality constraints:
 - Entry-point discovery → fragment lifter (64-bit integer ALU, rotate/mask/shift, load/store, branches incl. CTR loops and `bl`/`blr`) → validated WebAssembly emission.
 - 64 MiB flat guest arena with the 0x03ffffff mask, MMIO console at 0x00F00000, exit door at 0x00F00FFC.
 - Built-in samples (Hello / Fibonacci / Countdown) recompile and run in-page and under `node --test`.
-- Project export: `guest.wasm` + segments + `file://` runner + manifest + kernel docs as one `.zip`.
+- Project export: `guest.wasm` + segments + `file://` runner + manifest + HLE host (`hle.js`/`hle_tables.js`) + `docs/HLE.md` as one `.zip`; `node run.js` in the archive prints DbgPrint output end-to-end.
 
 ### M1 — Coverage (next)
 - FP arithmetic (fadd/fsub/fmul/fdiv/fmadd/fmsub/fnmadd/fnmsub), fcmp wired and runtime-tested against xenia semantics.
 - Mulhd/mulhdu, `ldx`/`stwx` family audit, `endsWithControl` fall-through fix, more rotate/mask forms.
 - Count traps by opcode across a corpus of homebrew; each closed trap class is a commit.
 
-### M2 — Kernel HLE (xboxkrnl)
-- Syscall/`sc` dispatch and XEX import-by-ordinal resolution; reimplement incrementally: thread create/suspend/resume, heap, TLS, synchronization objects, file I/O against browser storage.
+### M2 — Kernel HLE (xboxkrnl) — **in progress**
+- ✅ XEX2 `IMPORT_LIBRARIES` parsing; import thunks resolved to `{ module, ordinal, name }` via xenia's export tables (2918 known exports) at image load.
+- ✅ Retail-key decrypt + BASIC decompress; devkit fallback; loud LZX/DELTA rejection.
+- ✅ HLE host (`hle.js`): full PPC context snapshot (r0..r31, big-endian) before every import call; args r3..r10 then stack; return in `r3` (exported wasm global, host-writes).
+- ✅ Implemented (xboxkrnl): DbgPrint (variadic formatter), KeBugCheck(Ex), KeQuerySystemTime/PerformanceFrequency/InterruptTime, NtYieldExecution, RtlCompareMemory(Ulong), RtlFillMemoryUlong.
+- ✅ Exported-zip parity: the same host wiring runs in-page, in node `run.js`, and in the `file://` runner (synthetic retail/devkit XEX2 in CI).
+- Next increments: thread create/suspend/resume, heap (RtlAllocateHeap family), TLS, synchronization objects, file I/O against browser storage; `sc` dispatch once a guest needs it.
 - Milestone gate: a signed homebrew executable reaches its entry point and returns from `XeCrypt`/`Rtl*` stubs cleanly.
 
 ### M3 — AltiVec/VMX

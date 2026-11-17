@@ -14,7 +14,7 @@
  *   - manifest.json                         : build metadata + HLE import map.
  *
  * Everything is generated locally from YOUR dump. The archive contains code
- * derived from that dump; keep it for personal use (see docs/KERNELS.md).
+ * derived from that dump; keep it for personal use (see docs/HLE.md).
  */
 
 import { HLE_JS_SOURCE, HLE_TABLES_SOURCE, HLE_DOC_SOURCE } from './hle_bundle.js';

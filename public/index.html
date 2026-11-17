@@ -58,7 +58,7 @@
       <h2>1 · Choose a binary</h2>
       <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Choose a XEX2, ELF or raw binary file">
         <strong>Drop a .xex / .elf / .bin here, or click to browse</strong>
-        <small>parsed locally — nothing is uploaded · unencrypted XEX2 and PowerPC ELF only</small>
+        <small>parsed locally — nothing is uploaded · retail XEX2 (auto-decrypts with the public container key, BASIC or none) and PowerPC ELF</small>
       </div>
       <input type="file" id="file-picker" accept=".xex,.elf,.bin,.xbox360" hidden />
       <div class="samples">or try a sample:
@@ -84,17 +84,17 @@
       <button class="btn" id="btn-download" disabled style="width:100%;padding:12px">Download project .zip</button>
       <p class="zip-note">
         A self-contained project: <code>index.html</code> you can double-click to re-run the guest,
-        <code>guest.wasm</code>, a dependency-free <code>run.js</code> for node, build manifest, and a
-        <code>kernel/</code> folder ready for your own kernel dump. Contains code derived from your dump — personal use only.
+        <code>guest.wasm</code>, a dependency-free <code>run.js</code> for node, build manifest, and the
+        <code>hle.js</code>/<code>hle_tables.js</code> pure-HLE kernel (no firmware, ever). Contains code derived from your dump — personal use only.
       </p>
-      <p class="zip-note">Kernel: HLE stubs are built in; syscalls trap until you supply a kernel — see <a href="/docs/KERNELS.md">docs/KERNELS.md</a>.</p>
+      <p class="zip-note">Kernel: pure HLE (xenia-style) — no BIOS, no dump. Unimplemented kernel imports trap loudly naming the export — see <a href="/docs/HLE.md">docs/HLE.md</a>.</p>
     </section>
   </main>
 
   <footer>
     <div class="wrap">
       <span>client-side only · no uploads · bounded 64 MiB guest arena</span>
-      <span>personal use · bring your own kernel</span>
+      <span>personal use · no firmware required</span>
     </div>
   </footer>
 
