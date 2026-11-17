@@ -15,3 +15,7 @@ core/build/
 # Python
 __pycache__/
 *.pyc
+
+# xenia-canary reference sources used to generate hle_tables.js (BSD-3);
+# not part of the build, kept locally
+.xenia-ref/
