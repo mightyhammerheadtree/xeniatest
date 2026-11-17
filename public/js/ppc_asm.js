@@ -113,6 +113,17 @@ function buildEncoders() {
   // Calls. blr = bclr with BO=0b10100, BI=0, LK=0.
   enc.blr = () => (19 << 26) | (20 << 21) | (16 << 1);
   enc.blrl = () => (19 << 26) | (20 << 21) | (16 << 1) | 1;
+  // bcctr with BO=0b10100, BI=0, XO=528.
+  enc.bctr = () => (19 << 26) | (20 << 21) | (528 << 1);
+  enc.bctrl = () => (19 << 26) | (20 << 21) | (528 << 1) | 1;
+  // 32-bit rotate/mask: MB,ME are 5-bit fields.
+  enc.rlwinm = ([ra, rs, sh, mb, me]) => (21 << 26) | (rs << 21) | (ra << 16) | ((sh & 31) << 11) | ((mb & 31) << 6) | ((me & 31) << 1);
+  enc.slwi = ([ra, rs, sh]) => enc.rlwinm([ra, rs, sh, 0, 31 - sh]);
+  enc.srwi = ([ra, rs, sh]) => enc.rlwinm([ra, rs, sh, sh, 31]);
+  // Indexed loads X-form (XO in bits 11..15, destination RT at field0).
+  enc.lwzx = ([rt, ra, rb]) => (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (23 << 1);
+  enc.lbzx = ([rt, ra, rb]) => (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (87 << 1);
+  enc.lhzx = ([rt, ra, rb]) => (31 << 26) | (rt << 21) | (ra << 16) | (rb << 11) | (279 << 1);
   // sc with LEV=0.
   enc.sc = () => (17 << 26) | 0x02;
   return enc;

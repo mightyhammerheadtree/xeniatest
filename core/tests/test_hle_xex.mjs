@@ -10,6 +10,10 @@ import {
   buildSyntheticXexFromImage,
   buildEncryptedUncompressedXex,
   buildPdataXex,
+  buildSwitchXex,
+  SWITCH_CASE_ADDRS,
+  SWITCH_CASE_OUTPUTS,
+  SWITCH_DEFAULT_OUTPUT,
   EXPECTED_OUTPUT,
   HELLO,
   ANSWER,
@@ -22,7 +26,7 @@ import {
   PDATA_THUNK_ADDR,
 } from './hle_xex.mjs';
 import { assemble } from '../../public/js/ppc_asm.js';
-import { buildImage, recompileImage, runImage, RecompError } from '../../public/js/recomp/recompiler.js';
+import { buildImage, recompileImage, runImage, RecompError, RecompUnimpl } from '../../public/js/recomp/recompiler.js';
 import { loadXex2, XexLoadError } from '../../public/js/recomp/xex_loader.js';
 
 function maskedEntry() { return ENTRY & 0x03ffffff; }
@@ -287,4 +291,68 @@ test('control-flow-only discovery (seeds disabled) does not export the pdata-onl
   const names = WebAssembly.Module.exports(new WebAssembly.Module(wasm)).map((e) => e.name);
   assert.ok(!names.includes('fn_' + (PDATA_HELPER_ADDR & 0x03ffffff).toString(16)));
   assert.ok(names.includes('fn_' + (built.entry & 0x03ffffff).toString(16)));
+});
+
+test('jump table (absolute) is detected and dispatched statically', async () => {
+  const { xex } = buildSwitchXex({ index: 1, tableType: 'absolute' });
+  const built = buildImage('xex2', null, xex);
+  assert.equal(built.peError, null);
+  assert.equal(built.switchTables.size, 1);
+  const [table] = built.switchTables.values();
+  assert.equal(table.type, 0); // SWITCH_ABSOLUTE
+  assert.equal(table.indexReg, 4); // r4 is the bounds-check register
+  assert.deepEqual(table.labels, SWITCH_CASE_ADDRS.map((a) => a & 0x03ffffff));
+  assert.equal(table.bctr, table.bctr & 0x03ffffff);
+  // case fragments seeded: both case labels and (not) the table itself
+  for (const a of SWITCH_CASE_ADDRS) {
+    assert.ok(built.functionStarts.includes(a & 0x03ffffff), `case label 0x${a.toString(16)} seeded`);
+  }
+  assert.equal(built.stats === undefined, true); // sanity: stats live on recompileImage
+  let out = '';
+  const res = await runImage(built, { onConsole: (s) => { out += s; } });
+  assert.equal(out, 'case1\n');
+  assert.equal(res.exitCode, 0);
+  assert.equal(res.stats.switchTables, 1);
+  for (const a of SWITCH_CASE_ADDRS) {
+    assert.equal(typeof res.exports['fn_' + (a & 0x03ffffff).toString(16)], 'function');
+  }
+});
+
+for (const [tableType, typeId] of [['absolute', 0], ['computed', 1], ['byteoffset', 2], ['shortoffset', 3]]) {
+  test(`jump table (${tableType}) dispatches to the right case`, async () => {
+    for (const [index, expected] of [[0, SWITCH_CASE_OUTPUTS[0]], [2, SWITCH_CASE_OUTPUTS[2]], [7, SWITCH_DEFAULT_OUTPUT]]) {
+      const { xex } = buildSwitchXex({ index, tableType });
+      const built = buildImage('xex2', null, xex);
+      assert.equal(built.switchTables.size, 1, `${tableType}: table detected`);
+      assert.equal([...built.switchTables.values()][0].type, typeId);
+      let out = '';
+      const res = await runImage(built, { onConsole: (s) => { out += s; } });
+      assert.equal(out, expected, `${tableType} index=${index}`);
+      assert.equal(res.exitCode, 0);
+    }
+  });
+}
+
+test('without any table support the switch dispatch traps loudly', async () => {
+  // Pre-jump-table world: no detection and no seeds either — the icall at the
+  // bctr has no fn_<case> to call and must trap loudly, never misrun.
+  const { xex } = buildSwitchXex({ index: 1, tableType: 'absolute' });
+  const built = buildImage('xex2', null, xex);
+  await assert.rejects(
+    () => runImage({ arena: built.arena, entry: built.entry, hleCalls: built.hleCalls, functionStarts: [], switchTables: new Map() }, { onConsole: () => {} }),
+    (e) => e instanceof RecompUnimpl || /unimplemented/i.test(String(e && e.message)),
+  );
+});
+
+test('pdata-style seeding alone lets the icall fall through to the case fragment', async () => {
+  // Historical accident but worth pinning: with the case fragments seeded but
+  // no switchTables, the bctr's runtime icall resolves fn_<case> by name and
+  // runs it — control still reaches the case (no trap). Detection is what
+  // makes dispatch deterministic instead of dependent on that naming fallback.
+  const { xex } = buildSwitchXex({ index: 1, tableType: 'absolute' });
+  const built = buildImage('xex2', null, xex);
+  let out = '';
+  const res = await runImage({ arena: built.arena, entry: built.entry, hleCalls: built.hleCalls, functionStarts: built.functionStarts, switchTables: new Map() }, { onConsole: (s) => { out += s; } });
+  assert.equal(out, 'case1\n');
+  assert.equal(res.exitCode, 0);
 });

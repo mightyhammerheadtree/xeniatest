@@ -22,6 +22,7 @@ Reality constraints:
 - 64 MiB flat guest arena with the 0x03ffffff mask, MMIO console at 0x00F00000, exit door at 0x00F00FFC.
 - Built-in samples (Hello / Fibonacci / Countdown) recompile and run in-page and under `node --test`.
 - Project export: `guest.wasm` + segments + `file://` runner + manifest + HLE host (`hle.js`/`hle_tables.js`) + `docs/HLE.md` as one `.zip`; `node run.js` in the archive prints DbgPrint output end-to-end.
+- Jump-table (switch) detection (XenonRecomp-style): the four XenonAnalyse shapes are matched in the code sections; labels seed discovery and a detected `bctr` dispatches via a CTR compare chain into the case fragments. Tables failing validation are dropped to the runtime-`icall` path (loud on unknown targets). Along the way this surfaced and fixed a lifter bug where M-form/MD-form instructions (`rlwinm`, `slwi`, `rlwimi`, `rlwnm`, `rld*`, `sradi`) stored their result into the rS field instead of the rA field — any cross-register rotate silently miscomputed.
 
 ### M1 — Coverage (next)
 - FP arithmetic (fadd/fsub/fmul/fdiv/fmadd/fmsub/fnmadd/fnmsub), fcmp wired and runtime-tested against xenia semantics.

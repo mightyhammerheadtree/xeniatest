@@ -88,7 +88,8 @@ function loadBytes(name, kind, bytes, parsed) {
     if (built.peError) extra = `PE parse failed (${built.peError}) — discovery is control-flow only`;
     else if (built.peSections) {
       const seeded = (built.functionStarts ?? []).length;
-      extra = `${built.peSections.length} PE sections · ${seeded} .pdata function${seeded === 1 ? '' : 's'} discovered`;
+      const switches = built.switchTables?.size ?? 0;
+      extra = `${built.peSections.length} PE sections · ${seeded} seeded function${seeded === 1 ? '' : 's'}${switches ? ` · ${switches} switch table${switches === 1 ? '' : 's'}` : ''}`;
     }
   }
   setImage({ name, kind: kind === 'xex2' ? 'xex' : kind, built, extra });
@@ -145,7 +146,7 @@ async function recompileAndRun() {
   let compiled;
   const t0 = performance.now();
   try {
-    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls, functionStarts: state.built.functionStarts });
+    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls, functionStarts: state.built.functionStarts, switchTables: state.built.switchTables });
   } catch (e) {
     els.btnRecompile.disabled = false;
     showError('Recompilation failed:\n' + (e && e.message ? e.message : String(e)));

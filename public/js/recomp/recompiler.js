@@ -11,7 +11,10 @@
  *            forced to be a fragment start, so calls are always direct)
  *   bc*    → in-fragment block selection via local $blk + br_table
  *   blr    → wasm `return` (guest LR semantics fall out of direct calls)
- *   bctr   → imported host icall (runtime resolution; loud if unresolved)
+ *   bctr   → if a jump table was detected statically for this address, a
+ *            compare chain on CTR calling the case fragments (labels are
+ *            seeded as fragments); otherwise the imported host icall
+ *            (runtime resolution; loud if unresolved)
  *
  * MMIO console window [0x00F00000, 0x00F01000) and the exit door at
  * 0x00F00FFC are routed to host imports (xenorecomp.mmio_store / mmio_load),
@@ -20,6 +23,7 @@
 import { decodeInstruction } from './ppc_decode.js';
 import { WasmBuilder, Ops, sleb, uleb } from './wasm_emitter.js';
 import { loadXex2, XexLoadError } from './xex_loader.js';
+import { detectSwitchTables } from './switch_tables.js';
 import './hle.js'; // UMD side effect: sets globalThis.XenonHLE (the HLE host)
 import './hle_tables.js'; // UMD side effect: sets globalThis.XenonHLETables (ordinal → name)
 
@@ -57,6 +61,7 @@ export function buildImage(kind, parsed, bytes, opts = {}) {
   let functionStarts = []; // seed function starts (XEX2 .pdata — XenonRecomp-style discovery); empty for bin/elf
   let peSections = null;   // XEX2 PE section table (null when unparseable or not XEX2)
   let peError = null;      // XEX2 PE parse breadcrumb, if any
+  let switchTables = new Map(); // masked bctr addr → switch table descriptor (XEX2 code sections)
   if (kind === 'bin') {
     const n = Math.min(bytes.length, GUEST_MEM_SIZE);
     arena.set(bytes.subarray(0, n), IMAGE_BASE_DEFAULT);
@@ -95,17 +100,42 @@ export function buildImage(kind, parsed, bytes, opts = {}) {
     entry = loaded.entry & GUEST_MEM_MASK;
     base = entry;
     hleCalls = new Map(loaded.imports.filter((i) => i.type === 1).map((i) => [i.addr, i]));
+    peSections = loaded.peSections ?? null;
+    peError = loaded.peError ?? null;
     // Seeds: masked guest addresses, HLE import thunks excluded (those resolve
     // to host calls, never to recompiled code). discoverFragments re-filters.
     functionStarts = (loaded.pdataFunctions ?? [])
       .map((f) => f.addr & GUEST_MEM_MASK)
       .filter((a) => !hleCalls.has(a));
-    peSections = loaded.peSections ?? null;
-    peError = loaded.peError ?? null;
+    // Jump-table detection over the code sections (XenonRecomp-style). The
+    // table labels are intra-function destinations no direct branch reaches;
+    // they are seeded as fragments too so the emitted compare chain can call
+    // them. Any table that fails validation is dropped — its `bctr` keeps the
+    // runtime `icall` behavior (loud on unknown targets).
+    if (peSections) {
+      const ranges = peSections
+        .filter((s) => s.isCode)
+        .map((s) => {
+          const start = (loadBase + (s.virtualAddress & GUEST_MEM_MASK)) & GUEST_MEM_MASK;
+          const size = (s.virtualSize || s.sizeOfRawData) >>> 0;
+          return [start, Math.min(start + size, GUEST_MEM_SIZE)];
+        });
+      if (ranges.length) {
+        const detected = detectSwitchTables(arena, { ranges, mask: GUEST_MEM_MASK });
+        switchTables = detected.tables;
+        const labels = new Set(functionStarts);
+        for (const table of switchTables.values()) {
+          for (const label of table.labels) {
+            if (!hleCalls.has(label)) labels.add(label & GUEST_MEM_MASK);
+          }
+        }
+        functionStarts = [...labels].sort((a, b) => a - b);
+      }
+    }
   } else {
     throw new RecompError('unsupported image kind: ' + kind);
   }
-  return { arena, entry, base, segments, hleCalls, functionStarts, peSections, peError };
+  return { arena, entry, base, segments, hleCalls, functionStarts, peSections, peError, switchTables };
 }
 
 /** Discovery -------------------------------------------------------------- */
@@ -217,6 +247,7 @@ class Lifter {
     this.fragments = fragments;               // Map start -> {start, insns}
     this.starts = new Set(fragments.keys());
     this.hleCalls = hleCalls ?? null;        // Map<addr, import descriptor> — XEX2 imports only
+    this.switchTables = opts?.switchTables ?? null; // Map<bctr addr, descriptor> — detected jump tables
     this.b = new WasmBuilder();
     // Types
     this.tyNone = this.b.addType([], []);
@@ -244,7 +275,7 @@ class Lifter {
     this.b.addGlobal(0x7f, true, O.i32_const(0)); // XER
     this.b.addGlobal(0x7e, true, O.i64_const(0n)); // LR
     this.b.addGlobal(0x7e, true, O.i64_const(0n)); // CTR
-    this.stats = { fragments: fragments.size, insns: 0, unimpl: 0, blocks: 0 };
+    this.stats = { fragments: fragments.size, insns: 0, unimpl: 0, blocks: 0, switchTables: this.switchTables?.size ?? 0 };
   }
 
   // -- operand helpers --
@@ -645,7 +676,21 @@ Object.assign(FragmentCompiler.prototype, {
     if (name === 'bctr' || name === 'bctrl') {
       const ops = this.emitBranchCommon(insn, blockIdx);
       ops.push(...O.local_get(L_T32), ...O.if_(T_VOID));
-      if (insn.LK) ops.push(...O.i64_const(BigInt(insn.address + 4)), ...O.global_set(G.LR));
+      const LK = insn.LK ? 1 : 0;
+      if (LK) ops.push(...O.i64_const(BigInt(insn.address + 4)), ...O.global_set(G.LR));
+      // Jump tables (detected statically): compare CTR against the table's
+      // labels; on a match, tail-call that case fragment — a `bctr` never
+      // falls through. No match → fall back to the runtime icall path (loud
+      // on unknown targets), preserving today's behavior exactly.
+      const table = !LK && this.lifter.switchTables ? this.lifter.switchTables.get(insn.address & GUEST_MEM_MASK) : null;
+      if (table) {
+        for (const label of table.labels) {
+          ops.push(...O.global_get(G.CTR), ...O.i64_const(BigInt(GUEST_MEM_MASK)), O.i64_and,
+                   ...O.i64_const(BigInt(label)), O.i64_eq, O.if_(T_VOID));
+          ops.push(...this.tailCall(label));
+          ops.push(O.end);
+        }
+      }
       ops.push(...O.call(L.storeCtxIndex), ...O.global_get(G.CTR), ...O.i64_const(BigInt(GUEST_MEM_MASK)), O.i64_and, ...O.call(L.imICALL));
       if (!insn.LK) ops.push(O.return);
       else if (this.cutTo != null) ops.push(...this.callFragment(this.cutTo), O.return);
@@ -955,47 +1000,48 @@ Object.assign(FragmentCompiler.prototype, {
     const RT = insn.RT, RA = insn.RA, RB = insn.RB;
     let out;
     switch (name) {
-      case 'slwi':
-        out = [...O.global_get(RA), O.i32_wrap_i64, ...O.i32_const(insn.SH), O.i32_shl, O.i64_extend_i32_u, ...O.global_set(RT)]; break;
+      case 'slwi': // M-form: dest is the rA field (decoder RA), source the rS field
+        out = [...O.global_get(insn.RS ?? RA), O.i32_wrap_i64, ...O.i32_const(insn.SH), O.i32_shl, O.i64_extend_i32_u, ...O.global_set(RA)]; break;
       case 'slw':
         out = [...O.global_get(RA), O.i32_wrap_i64, ...O.global_get(RB), O.i32_wrap_i64, ...O.i32_const(31), O.i32_and, O.i32_shl, O.i64_extend_i32_u, ...O.global_set(RT)]; break;
       case 'sld':
         out = [...O.global_get(RA), ...O.global_get(RB), ...O.i64_const(63n), O.i64_and, O.i64_shl, ...O.global_set(RT)]; break;
-      case 'srwi':
-        out = [...O.global_get(RA), O.i32_wrap_i64, ...O.i32_const(insn.SH), O.i32_shr_u, O.i64_extend_i32_u, ...O.global_set(RT)]; break;
+      case 'srwi': // M-form: dest is the rA field, source the rS field
+        out = [...O.global_get(insn.RS ?? RA), O.i32_wrap_i64, ...O.i32_const(insn.SH), O.i32_shr_u, O.i64_extend_i32_u, ...O.global_set(RA)]; break;
       case 'srw':
         out = [...O.global_get(RA), O.i32_wrap_i64, ...O.global_get(RB), O.i32_wrap_i64, ...O.i32_const(31), O.i32_and, O.i32_shr_u, O.i64_extend_i32_u, ...O.global_set(RT)]; break;
       case 'sraw':
         out = [...O.global_get(RA), O.i32_wrap_i64, ...O.global_get(RB), O.i32_wrap_i64, ...O.i32_const(31), O.i32_and, O.i32_shr_s, O.i64_extend_i32_s, ...O.global_set(RT)]; break;
       case 'srawi':
         out = [...O.global_get(RA), O.i32_wrap_i64, ...O.i32_const(insn.RB & 31), O.i32_shr_s, O.i64_extend_i32_s, ...O.global_set(RT)]; break;
-      case 'sradi': {
-        const sh = ((insn.word & 1) ? 32 : 0) | insn.RB; // MD-form: bit 0 = sh32
-        out = [...O.global_get(RA), ...O.i64_const(BigInt(sh)), O.i64_shr_s, ...O.global_set(RT)]; break;
+      case 'sradi': { // MD-form: dest is the rA field, source the rS field
+        const sh = ((insn.word & 1) ? 32 : 0) | insn.RB; // bit 0 = sh32
+        out = [...O.global_get(insn.RS ?? RT), ...O.i64_const(BigInt(sh)), O.i64_shr_s, ...O.global_set(RA)]; break;
       }
       default: out = [];
     }
     const is64 = name === 'sld' || name === 'sradi';
-    out = [...out, ...this.cr0FromRT(insn, is64)];
+    const mForm = name === 'slwi' || name === 'srwi' || name === 'sradi';
+    out = [...out, ...this.cr0FromRT(mForm ? { ...insn, RT: insn.RA } : insn, is64)];
     return out;
   },
 
   emitRlwinm(insn) {
-    const RT = insn.RT, RS = insn.RS ?? insn.RT;
+    const RA = insn.RA, RS = insn.RS ?? insn.RT; // M-form: rA = rotate(rS) & mask
     const SH = insn.SH, MB = insn.MB, ME = insn.ME;
     let mask;
     if (MB <= ME) mask = ((((1 << (ME - MB + 1)) - 1) << MB) >>> 0);
     else mask = (~(((1 << (MB - ME - 1)) - 1) << (ME + 1))) >>> 0;
     const out = [
       ...O.global_get(RS), O.i32_wrap_i64, ...O.i32_const(SH), O.i32_rotl,
-      ...O.i32_const(mask), O.i32_and, O.i64_extend_i32_u, ...O.global_set(RT),
+      ...O.i32_const(mask), O.i32_and, O.i64_extend_i32_u, ...O.global_set(RA),
     ];
-    if (insn.Rc) out.push(...O.global_get(RT), O.i32_wrap_i64, ...O.local_set(L_T32B), ...this.lifter.cr0FromI32Local());
+    if (insn.Rc) out.push(...O.global_get(RA), O.i32_wrap_i64, ...O.local_set(L_T32B), ...this.lifter.cr0FromI32Local());
     return out;
   },
 
   emitRlwimi(insn) {
-    const RT = insn.RT, RA = insn.RA, RS = insn.RS ?? insn.RT;
+    const RA = insn.RA, RS = insn.RS ?? insn.RT; // M-form: rA = (rA & ~mask) | (rotate(rS) & mask)
     const SH = insn.SH, MB = insn.MB, ME = insn.ME;
     let mask;
     if (MB <= ME) mask = ((((1 << (ME - MB + 1)) - 1) << MB) >>> 0);
@@ -1004,14 +1050,14 @@ Object.assign(FragmentCompiler.prototype, {
     const out = [
       ...O.global_get(RA), O.i32_wrap_i64, ...O.i32_const(keep), O.i32_and,
       ...O.global_get(RS), O.i32_wrap_i64, ...O.i32_const(SH), O.i32_rotl, ...O.i32_const(mask), O.i32_and,
-      O.i32_or, O.i64_extend_i32_u, ...O.global_set(RT),
+      O.i32_or, O.i64_extend_i32_u, ...O.global_set(RA),
     ];
-    if (insn.Rc) out.push(...O.global_get(RT), O.i32_wrap_i64, ...O.local_set(L_T32B), ...this.lifter.cr0FromI32Local());
+    if (insn.Rc) out.push(...O.global_get(RA), O.i32_wrap_i64, ...O.local_set(L_T32B), ...this.lifter.cr0FromI32Local());
     return out;
   },
 
   emitRlwnm(insn) {
-    const RT = insn.RT, RS = insn.RS ?? insn.RT, RB = insn.RB;
+    const RA = insn.RA, RS = insn.RS ?? insn.RT, RB = insn.RB; // M-form: rA = rotate(rS, rB) & mask
     const MB = insn.MB, ME = insn.ME;
     let mask;
     if (MB <= ME) mask = ((((1 << (ME - MB + 1)) - 1) << MB) >>> 0);
@@ -1019,14 +1065,14 @@ Object.assign(FragmentCompiler.prototype, {
     const out = [
       ...O.global_get(RS), O.i32_wrap_i64,
       ...O.global_get(RB), O.i32_wrap_i64, ...O.i32_const(31), O.i32_and, O.i32_rotl,
-      ...O.i32_const(mask), O.i32_and, O.i64_extend_i32_u, ...O.global_set(RT),
+      ...O.i32_const(mask), O.i32_and, O.i64_extend_i32_u, ...O.global_set(RA),
     ];
-    out.push(...this.cr0FromRT(insn, false));
+    out.push(...this.cr0FromRT({ ...insn, RT: RA }, false));
     return out;
   },
 
   emitRldic(insn, name) {
-    const RT = insn.RT, RS = insn.RS ?? insn.RT;
+    const RA = insn.RA, RS = insn.RS ?? insn.RT; // MD-form: rA = rotate(rS) & mask
     const SH = BigInt(insn.SH);
     const MB = BigInt(insn.MB);
     let mask;
@@ -1034,9 +1080,9 @@ Object.assign(FragmentCompiler.prototype, {
     else mask = ((1n << (MB + 1n)) - 1n) & 0xffffffffffffffffn; // rldicr
     const out = [
       ...O.global_get(RS), ...O.i64_const(SH), O.i64_rotl,
-      ...O.i64_const(mask), O.i64_and, ...O.global_set(RT),
+      ...O.i64_const(mask), O.i64_and, ...O.global_set(RA),
     ];
-    out.push(...this.cr0FromRT(insn, true));
+    out.push(...this.cr0FromRT({ ...insn, RT: RA }, true));
     return out;
   },
 
@@ -1158,7 +1204,7 @@ Object.assign(FragmentCompiler.prototype, {
 // ---------- module assembly & host harness ----------
 
 export function recompileImage(arena, entry, opts = {}) {
-  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls, opts.functionStarts), {}, opts.hleCalls);
+  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls, opts.functionStarts), { switchTables: opts.switchTables ?? null }, opts.hleCalls);
   const L = lifter;
   // Pre-assign wasm function indices: imports 0..6, store_ctx at 7, then one per fragment (sorted).
   const sorted = [...L.fragments.keys()].sort((a, b) => a - b);
@@ -1268,11 +1314,11 @@ export function makeImports({ onConsoleByte, onSc, onLog } = {}) {
 }
 
 /**
- * @param {{arena: Uint8Array, entry: number, hleCalls?: Map, functionStarts?: number[]}} built
+ * @param {{arena: Uint8Array, entry: number, hleCalls?: Map, functionStarts?: number[], switchTables?: Map}} built
  */
-export async function runImage({ arena, entry, hleCalls, functionStarts }, { onConsole, onSc, onLog } = {}) {
+export async function runImage({ arena, entry, hleCalls, functionStarts, switchTables }, { onConsole, onSc, onLog } = {}) {
   entry = entry & GUEST_MEM_MASK;
-  const { wasm, stats } = recompileImage(arena, entry, { hleCalls, functionStarts });
+  const { wasm, stats } = recompileImage(arena, entry, { hleCalls, functionStarts, switchTables });
   const imports = makeImports({ onConsoleByte: onConsole ? (b) => onConsole(String.fromCharCode(typeof b === 'string' ? b.charCodeAt(0) : b)) : undefined, onSc, onLog });
   if (hleCalls) imports.__setHleCalls(hleCalls);
   const { instance } = await WebAssembly.instantiate(wasm, imports);
