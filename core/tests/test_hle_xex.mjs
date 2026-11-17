@@ -9,15 +9,20 @@ import {
   buildSyntheticXex,
   buildSyntheticXexFromImage,
   buildEncryptedUncompressedXex,
+  buildPdataXex,
   EXPECTED_OUTPUT,
   HELLO,
   ANSWER,
   IMAGE_BASE,
   ENTRY,
   THUNK_ADDR,
+  PDATA_HELPER_ADDR,
+  PDATA_HELPER_R3,
+  PDATA_OUTPUT,
+  PDATA_THUNK_ADDR,
 } from './hle_xex.mjs';
 import { assemble } from '../../public/js/ppc_asm.js';
-import { buildImage, runImage, RecompError } from '../../public/js/recomp/recompiler.js';
+import { buildImage, recompileImage, runImage, RecompError } from '../../public/js/recomp/recompiler.js';
 import { loadXex2, XexLoadError } from '../../public/js/recomp/xex_loader.js';
 
 function maskedEntry() { return ENTRY & 0x03ffffff; }
@@ -234,4 +239,52 @@ test('guest allocates memory through NtAllocateVirtualMemory and round-trips a b
   const res = await runImage(buildImage('xex2', null, xex), { onConsole: (s) => { out += s; } });
   assert.equal(out, '42\n');
   assert.equal(res.exitCode, 0);
+});
+
+test('.pdata is parsed: sections, function seeds, HLE thunk excluded', () => {
+  const { xex } = buildPdataXex();
+  const loaded = loadXex2(xex);
+  assert.equal(loaded.peError, null);
+  assert.ok(Array.isArray(loaded.peSections));
+  assert.deepEqual(loaded.peSections.map((s) => s.name), ['.text', '.pdata']);
+  assert.equal(loaded.peSections[0].isCode, true);
+  // Seeds are masked guest addresses, sorted; the HLE thunk record is filtered
+  // out at the buildImage layer (never at parse time).
+  assert.deepEqual(
+    loaded.pdataFunctions.map((f) => f.addr),
+    [0x82000200 & 0x03ffffff, 0x82000300 & 0x03ffffff, PDATA_THUNK_ADDR & 0x03ffffff],
+  );
+  assert.deepEqual(loaded.pdataFunctions.map((f) => f.size), [0x100, 0x10, 0x04]);
+  const built = buildImage('xex2', null, xex);
+  assert.equal(built.peError, null);
+  // buildImage masks + drops HLE thunk seeds — the two real functions remain.
+  assert.deepEqual(built.functionStarts, [0x82000200 & 0x03ffffff, 0x82000300 & 0x03ffffff]);
+});
+
+test('.pdata-seeded discovery exports a function no branch reaches', async () => {
+  const { xex } = buildPdataXex();
+  const built = buildImage('xex2', null, xex);
+  let out = '';
+  const res = await runImage(built, { onConsole: (s) => { out += s; } });
+  assert.equal(out, PDATA_OUTPUT);
+  assert.equal(res.exitCode, 0);
+  // helper_fn: only visible through .pdata. It must exist, be callable, and
+  // leave PDATA_HELPER_R3 in the exported r3 global.
+  const helperName = 'fn_' + (PDATA_HELPER_ADDR & 0x03ffffff).toString(16);
+  assert.equal(typeof res.exports[helperName], 'function', 'pdata-only function is exported');
+  res.exports[helperName]();
+  assert.equal(res.exports.r3.value, BigInt(PDATA_HELPER_R3));
+  // The HLE thunk must NOT be recompiled into an export.
+  assert.equal(res.exports['fn_' + (PDATA_THUNK_ADDR & 0x03ffffff).toString(16)], undefined);
+});
+
+test('control-flow-only discovery (seeds disabled) does not export the pdata-only function', () => {
+  // Negative control for the test above: without .pdata seeds, helper_fn is
+  // unreachable and the wasm module must not contain fn_<helper>.
+  const { xex } = buildPdataXex();
+  const built = buildImage('xex2', null, xex);
+  const { wasm } = recompileImage(built.arena, built.entry, { hleCalls: built.hleCalls, functionStarts: [] });
+  const names = WebAssembly.Module.exports(new WebAssembly.Module(wasm)).map((e) => e.name);
+  assert.ok(!names.includes('fn_' + (PDATA_HELPER_ADDR & 0x03ffffff).toString(16)));
+  assert.ok(names.includes('fn_' + (built.entry & 0x03ffffff).toString(16)));
 });

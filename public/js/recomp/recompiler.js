@@ -54,6 +54,9 @@ export function buildImage(kind, parsed, bytes, opts = {}) {
   let base = IMAGE_BASE_DEFAULT;
   const segments = [];
   let hleCalls; // Map<addr, {addr, type, ordinal, moduleId, moduleName, name}> — XEX2 imports only
+  let functionStarts = []; // seed function starts (XEX2 .pdata — XenonRecomp-style discovery); empty for bin/elf
+  let peSections = null;   // XEX2 PE section table (null when unparseable or not XEX2)
+  let peError = null;      // XEX2 PE parse breadcrumb, if any
   if (kind === 'bin') {
     const n = Math.min(bytes.length, GUEST_MEM_SIZE);
     arena.set(bytes.subarray(0, n), IMAGE_BASE_DEFAULT);
@@ -92,10 +95,17 @@ export function buildImage(kind, parsed, bytes, opts = {}) {
     entry = loaded.entry & GUEST_MEM_MASK;
     base = entry;
     hleCalls = new Map(loaded.imports.filter((i) => i.type === 1).map((i) => [i.addr, i]));
+    // Seeds: masked guest addresses, HLE import thunks excluded (those resolve
+    // to host calls, never to recompiled code). discoverFragments re-filters.
+    functionStarts = (loaded.pdataFunctions ?? [])
+      .map((f) => f.addr & GUEST_MEM_MASK)
+      .filter((a) => !hleCalls.has(a));
+    peSections = loaded.peSections ?? null;
+    peError = loaded.peError ?? null;
   } else {
     throw new RecompError('unsupported image kind: ' + kind);
   }
-  return { arena, entry, base, segments, hleCalls };
+  return { arena, entry, base, segments, hleCalls, functionStarts, peSections, peError };
 }
 
 /** Discovery -------------------------------------------------------------- */
@@ -118,14 +128,23 @@ function branchFallsThrough(insn) {
 }
 
 /**
- * Discovery, phase A: collect every direct-branch target as a fragment
- * entry. Phase B (finalizeFragments) cuts fragments at the next known
- * start, so every direct branch becomes a wasm call or block jump with no
- * exponential re-scanning.
+ * Discovery, phase A: collect entry + known function starts + every
+ * direct-branch target as a fragment entry. `seedStarts` carries function
+ * starts discovered outside the control flow — for XEX2 images these come
+ * from the PE `.pdata` (IMAGE_CE_RUNTIME_FUNCTION), like XenonRecomp's
+ * primary discovery seed. Phase B (finalizeFragments) cuts fragments at the
+ * next known start, so every direct branch becomes a wasm call or block jump
+ * with no exponential re-scanning.
  */
-export function discoverFragments(arena, entry, hleCalls) {
+export function discoverFragments(arena, entry, hleCalls, seedStarts) {
   const starts = new Set([entry]);
-  const queue = [entry];
+  if (Array.isArray(seedStarts)) {
+    for (const s of seedStarts) {
+      const a = (Number(s) >>> 0) & GUEST_MEM_MASK;
+      if (a + 4 <= GUEST_MEM_SIZE && !(hleCalls && hleCalls.has(a))) starts.add(a);
+    }
+  }
+  const queue = [...starts];
   const inImage = (a) => a >= 0 && a + 4 <= GUEST_MEM_SIZE;
   while (queue.length) {
     const f = queue.pop();
@@ -1139,7 +1158,7 @@ Object.assign(FragmentCompiler.prototype, {
 // ---------- module assembly & host harness ----------
 
 export function recompileImage(arena, entry, opts = {}) {
-  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls), {}, opts.hleCalls);
+  const lifter = new Lifter(discoverFragments(arena, entry, opts.hleCalls, opts.functionStarts), {}, opts.hleCalls);
   const L = lifter;
   // Pre-assign wasm function indices: imports 0..6, store_ctx at 7, then one per fragment (sorted).
   const sorted = [...L.fragments.keys()].sort((a, b) => a - b);
@@ -1248,9 +1267,12 @@ export function makeImports({ onConsoleByte, onSc, onLog } = {}) {
   return imports;
 }
 
-export async function runImage({ arena, entry, hleCalls }, { onConsole, onSc, onLog } = {}) {
+/**
+ * @param {{arena: Uint8Array, entry: number, hleCalls?: Map, functionStarts?: number[]}} built
+ */
+export async function runImage({ arena, entry, hleCalls, functionStarts }, { onConsole, onSc, onLog } = {}) {
   entry = entry & GUEST_MEM_MASK;
-  const { wasm, stats, functionStarts } = recompileImage(arena, entry, { hleCalls });
+  const { wasm, stats } = recompileImage(arena, entry, { hleCalls, functionStarts });
   const imports = makeImports({ onConsoleByte: onConsole ? (b) => onConsole(String.fromCharCode(typeof b === 'string' ? b.charCodeAt(0) : b)) : undefined, onSc, onLog });
   if (hleCalls) imports.__setHleCalls(hleCalls);
   const { instance } = await WebAssembly.instantiate(wasm, imports);

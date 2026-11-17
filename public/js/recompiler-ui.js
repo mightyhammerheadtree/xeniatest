@@ -69,13 +69,13 @@ function resetOutput() {
   setConsole('Pick a binary above, then recompile — the guest runs in-page via WebAssembly. Console (MMIO) output appears here.', { hint: true });
 }
 
-function setImage({ name, kind, built }) {
+function setImage({ name, kind, built, extra }) {
   state.name = sanitizeName(name);
   state.kind = kind;
   state.built = built;
   state.wasm = null;
   state.stats = null;
-  setInfo(`${state.name} — ${kind.toUpperCase()} · entry ${fmtAddr(built.entry)} · image ${fmtBytes(built.segments.reduce((n, s) => n + s.data.length, 0))}`);
+  setInfo(`${state.name} — ${kind.toUpperCase()} · entry ${fmtAddr(built.entry)} · image ${fmtBytes(built.segments.reduce((n, s) => n + s.data.length, 0))}${extra ? ' · ' + extra : ''}`);
   els.btnRecompile.disabled = false;
   els.btnDownload.disabled = true;
   resetOutput();
@@ -83,7 +83,15 @@ function setImage({ name, kind, built }) {
 
 function loadBytes(name, kind, bytes, parsed) {
   const built = buildImage(kind, parsed, bytes); // throws with a clear message on bad/encrypted images
-  setImage({ name, kind: kind === 'xex2' ? 'xex' : kind, built });
+  let extra = null;
+  if (kind === 'xex2') {
+    if (built.peError) extra = `PE parse failed (${built.peError}) — discovery is control-flow only`;
+    else if (built.peSections) {
+      const seeded = (built.functionStarts ?? []).length;
+      extra = `${built.peSections.length} PE sections · ${seeded} .pdata function${seeded === 1 ? '' : 's'} discovered`;
+    }
+  }
+  setImage({ name, kind: kind === 'xex2' ? 'xex' : kind, built, extra });
 }
 
 async function loadFile(file) {
@@ -137,7 +145,7 @@ async function recompileAndRun() {
   let compiled;
   const t0 = performance.now();
   try {
-    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls });
+    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls, functionStarts: state.built.functionStarts });
   } catch (e) {
     els.btnRecompile.disabled = false;
     showError('Recompilation failed:\n' + (e && e.message ? e.message : String(e)));

@@ -9,6 +9,7 @@ A **static recompiler** for Xbox 360 (Xenon PPC64, big-endian) executables that 
 ## What works today (tested)
 
 - **Static recompilation, end to end** — discovery of reachable code from the entry point, fragment lifting (integer ALU, rotate/mask/shift, 32/64-bit loads/stores, branches incl. CTR loops & link register, `bl`/`blr` calls, `sc`, FP fcmpo/fcmpu decode), wasm emission, instantiation, execution.
+- **`.pdata`-seeded function discovery** (XenonRecomp-style) — the decrypted image's PE section table is parsed and every `.pdata` entry (`IMAGE_CE_RUNTIME_FUNCTION`) seeds a recompiled function, so code reached only through function pointers/`bctr` is still lifted and exported. HLE import thunks are never recompiled; a missing or damaged `.pdata` falls back to control-flow-only discovery instead of failing the image.
 - **Built-in samples** — Hello, Fibonacci (`fib(25) = 75025`) and Countdown are real hand-assembled PPC binaries recompiled in-page; they print through the guest MMIO console and halt via the exit door.
 - **In-page run** — drop a `.xex`, `.elf` or raw `.bin`; it recompiles and runs with one click, output shown in the on-page console.
 - **Project export** — one click downloads a `.zip` containing the `guest.wasm`, the image segments, a `file://`-double-clickable runner, a Node runner (`run.js`), `manifest.json`, the pure-HLE kernel (`hle.js` + `hle_tables.js`, byte-exact copies) and `docs/HLE.md`. Works offline, nothing to install.
@@ -42,6 +43,7 @@ public/js/recomp/recompiler.js   discovery + fragment lifter + wasm glue (entry:
 public/js/recomp/wasm_emitter.js minimal, validated WebAssembly module builder
 public/js/recomp/ppc_decode.js   PPC instruction decoder used by the lifter
 public/js/recomp/aes.js          AES-128 (ECB/CBC, caller-managed chain) for XEX2 containers
+public/js/recomp/pe_image.js     PE section table + .pdata (IMAGE_CE_RUNTIME_FUNCTION) parser for function discovery
 public/js/recomp/xex_loader.js   XEX2 load: retail/devkit decrypt (public keys), BASIC decompress, import-thunk resolution
 public/js/recomp/hle.js          the HLE kernel host (DbgPrint & co.; unimplemented exports trap loudly)
 public/js/recomp/hle_tables.js   2918 xboxkrnl/xam/xbdm export ordinals → names (from xenia)

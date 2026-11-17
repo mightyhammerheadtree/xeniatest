@@ -11,7 +11,7 @@
   "scripts": {
     "start": "node server/server.js",
     "test": "npm run test:recomp && npm run test:elf && npm run test:web && npm run test:hle && npm run test:gpu",
-    "test:recomp": "node --test core/tests/test_recompiler.mjs",
+    "test:recomp": "node --test core/tests/test_recompiler.mjs core/tests/test_pe_image.mjs",
     "test:elf": "node --test core/tests/test_elf_loader.mjs",
     "test:web": "node --test core/tests/test_webapp.mjs",
     "build:hle-bundle": "node tools/build_hle_bundle.mjs",

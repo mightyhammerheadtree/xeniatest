@@ -36,6 +36,7 @@
  */
 
 import { aesCbcDecryptBlock, aesEcbDecrypt } from './aes.js';
+import { parsePeSections, pdataFunctionStartsFromSections } from './pe_image.js';
 import './hle_tables.js'; // UMD side effect: sets globalThis.XenonHLETables
 
 const XENIA_EXPORTS = globalThis.XenonHLETables.XENIA_EXPORTS;
@@ -291,6 +292,10 @@ function decryptImage(bytes, header, security, format, keyChoice) {
  *   pageDescriptors: Array<{type:number, pageCount:number}>,
  *   encryptionType: number, compressionType: number, usedDevkitKey: boolean,
  *   imports: Array<{addr:number, type:number, ordinal:number, moduleId:string, moduleName:string, name:string}>,
+ *   peSections: Array<{name:string, virtualAddress:number, virtualSize:number, sizeOfRawData:number, pointerToRawData:number, characteristics:number, isCode:boolean}> | null,
+ *   pdataFunctions: Array<{addr:number, size:number}> — .pdata IMAGE_CE_RUNTIME_FUNCTION
+ *     seeds for function discovery (masked guest addresses; empty when no .pdata),
+ *   peError: string | null — set when the PE headers could not be parsed (discovery falls back to control-flow only),
  * }}
  */
 export function loadXex2(bytes, opts = {}) {
@@ -374,6 +379,24 @@ export function loadXex2(bytes, opts = {}) {
     }
   }
 
+  // PE section table + .pdata function seeds (XenonRecomp-style discovery).
+  // Purely additive: if the PE headers cannot be parsed we keep the old
+  // control-flow-only discovery and surface a `peError` breadcrumb instead of
+  // failing an image that used to load fine. A *missing* .pdata is normal
+  // (some images ship none) and yields an empty seed list.
+  let peSections = null;
+  let pdataFunctions = [];
+  let peError = null;
+  try {
+    const pe = parsePeSections(image);
+    peSections = pe.sections;
+    pdataFunctions = pdataFunctionStartsFromSections(image, pe.sections, MASK);
+  } catch (e) {
+    peError = e && e.message ? e.message : String(e);
+    peSections = null;
+    pdataFunctions = [];
+  }
+
   return {
     image,
     base: baseMasked,
@@ -387,5 +410,8 @@ export function loadXex2(bytes, opts = {}) {
     compressionType: format.compressionType,
     usedDevkitKey,
     imports,
+    peSections,
+    pdataFunctions,
+    peError,
   };
 }

@@ -19,3 +19,4 @@ __pycache__/
 # xenia-canary reference sources used to generate hle_tables.js (BSD-3);
 # not part of the build, kept locally
 .xenia-ref/
+.hedge-ref/

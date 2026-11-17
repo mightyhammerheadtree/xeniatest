@@ -18,6 +18,7 @@ Reality constraints:
 
 ### M0 — Recompiler core (done)
 - Entry-point discovery → fragment lifter (64-bit integer ALU, rotate/mask/shift, load/store, branches incl. CTR loops and `bl`/`blr`) → validated WebAssembly emission.
+- XEX2 `.pdata`-seeded discovery (XenonRecomp-style): the decrypted image's PE section table is parsed, `.pdata` (`IMAGE_CE_RUNTIME_FUNCTION`, big-endian) contributes every `BeginAddress` as a function start, so functions reached only indirectly (function pointers, `bctr`) are still recompiled and exported. Seeds never include HLE import thunks; a missing/unparseable `.pdata` degrades to the previous control-flow-only discovery with a `peError` breadcrumb instead of failing the image.
 - 64 MiB flat guest arena with the 0x03ffffff mask, MMIO console at 0x00F00000, exit door at 0x00F00FFC.
 - Built-in samples (Hello / Fibonacci / Countdown) recompile and run in-page and under `node --test`.
 - Project export: `guest.wasm` + segments + `file://` runner + manifest + HLE host (`hle.js`/`hle_tables.js`) + `docs/HLE.md` as one `.zip`; `node run.js` in the archive prints DbgPrint output end-to-end.
