@@ -247,21 +247,19 @@
           return 0n;
         }],
         [0x00000101, () => 0n], // NtYieldExecution — STATUS_SUCCESS
-        [0x0000011a, (ctx) => { // RtlCompareMemory — byte-wise, count until first mismatch (MSDN contract)
-          const s1 = ctx.arg(0), s2 = ctx.arg(1), length = ctx.arg(2);
+        [0x0000011a, (ctx) => { // RtlCompareMemory — returns the number of matching bytes (xenia/MSDN contract)
+          const s1 = ctx.arg(0), s2 = ctx.arg(1), length = ctx.arg(2) & 0xffffffffn;
           let count = 0n;
-          const limit = length & 0xffffffffn;
-          for (let i = 0n; i < limit; i++) {
-            if (ctx.readU8(s1 + i) !== ctx.readU8(s2 + i)) break;
-            count++;
+          for (let i = 0n; i < length; i++) {
+            if (ctx.readU8(s1 + i) === ctx.readU8(s2 + i)) count++;
           }
           return count;
         }],
-        [0x0000011b, (ctx) => { // RtlCompareMemoryUlong — length is bytes, rounded down to ULONGs
-          const s1 = ctx.arg(0), s2 = ctx.arg(1), length = ctx.arg(2) & 0xffffffffn;
+        [0x0000011b, (ctx) => { // RtlCompareMemoryUlong(Source, Length, Pattern) — bytes compared (ULONG granularity) until first mismatch
+          const source = ctx.arg(0), length = ctx.arg(1) & 0xffffffffn, pattern = ctx.arg(2) & 0xffffffffn;
           let count = 0n;
           for (let i = 0n; i + 4n <= length; i += 4n) {
-            if (ctx.readU32BE(s1 + i) !== ctx.readU32BE(s2 + i)) break;
+            if (ctx.readU32BE(source + i) !== pattern) break;
             count += 4n;
           }
           return count;
