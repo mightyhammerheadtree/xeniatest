@@ -88,7 +88,9 @@ function loadBytes(name, kind, bytes, parsed) {
     if (built.peError) extra = `PE parse failed (${built.peError}) — discovery is control-flow only`;
     else if (built.peSections) {
       const seeded = (built.functionStarts ?? []).length;
-      extra = `${built.peSections.length} PE sections · ${seeded} .pdata function${seeded === 1 ? '' : 's'} discovered`;
+      const switches = built.switchTables?.size ?? 0;
+      const vmx = built.vmxStubs?.size ?? 0;
+      extra = `${built.peSections.length} PE sections · ${seeded} seeded function${seeded === 1 ? '' : 's'}${switches ? ` · ${switches} switch table${switches === 1 ? '' : 's'}` : ''}${vmx ? ` · ${vmx} VMX stub${vmx === 1 ? '' : 's'}` : ''}`;
     }
   }
   setImage({ name, kind: kind === 'xex2' ? 'xex' : kind, built, extra });
@@ -145,7 +147,7 @@ async function recompileAndRun() {
   let compiled;
   const t0 = performance.now();
   try {
-    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls, functionStarts: state.built.functionStarts });
+    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls, functionStarts: state.built.functionStarts, switchTables: state.built.switchTables, vmxStubs: state.built.vmxStubs });
   } catch (e) {
     els.btnRecompile.disabled = false;
     showError('Recompilation failed:\n' + (e && e.message ? e.message : String(e)));
@@ -228,6 +230,13 @@ function downloadZip() {
     segments: state.built.segments,
     stats: state.stats,
     hleCalls: state.built.hleCalls,
+    discovery: {
+      peSections: state.built.peSections?.length ?? null,
+      peError: state.built.peError ?? null,
+      seededFunctionStarts: state.built.functionStarts?.length ?? 0,
+      switchTables: state.built.switchTables?.size ?? 0,
+      vmxStubs: state.built.vmxStubs?.size ?? 0,
+    },
   });
   const zip = makeZip(files);
   const blob = new Blob([zip], { type: 'application/zip' });

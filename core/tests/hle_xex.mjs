@@ -237,6 +237,85 @@ export function buildSyntheticXexFromImage(image, { compression = 'basic', encry
   return { xex: concat(header, image), image, sessionKey };
 }
 
+
+/**
+ * pePrologue(sections) — emit the PE container bytes (DOS header, PE signature,
+ * IMAGE_FILE_HEADER, 0xE0-byte optional header, section table, zero pad to
+ * 0x200) as PPC assembler source. Little-endian PE fields, big-endian guest.
+ * `sections`: [{ name, rva, virtualSize, characteristics }] (raw data == rva).
+ */
+function pePrologue(sections) {
+  const u16le = (v) => `.byte 0x${(v & 0xff).toString(16).padStart(2, '0')}, 0x${((v >> 8) & 0xff).toString(16).padStart(2, '0')}`;
+  const u32le = (v) => `.byte ${[0, 8, 16, 24].map((sh) => '0x' + ((v >>> sh) & 0xff).toString(16).padStart(2, '0')).join(', ')}`;
+  const nameField = (name) => {
+    const bytes = [...name].map((c) => c.charCodeAt(0));
+    while (bytes.length < 8) bytes.push(0);
+    return '.byte ' + bytes.map((b) => '0x' + b.toString(16).padStart(2, '0')).join(', ');
+  };
+  const sizeOfOptionalHeader = 0xe0;
+  const fileHeader = 0x84;
+  const sectionTable = fileHeader + 20 + sizeOfOptionalHeader; // 0x178
+  const out = [
+    '.org 0x82000000',
+    '.byte 0x4D, 0x5A            # MZ',
+    '.space 0x3A',               // 0x02..0x3B
+    '.byte 0x80, 0x00, 0x00, 0x00  # e_lfanew = 0x80',
+    '.space 0x40',               // 0x40..0x7F
+    '.byte 0x50, 0x45, 0x00, 0x00  # PE\0\0',
+    u16le(0x01f2) + '   # Machine (POWERPCFP)',
+    u16le(sections.length) + '   # NumberOfSections',
+    u32le(0) + '    # TimeDateStamp',
+    u32le(0) + '    # PointerToSymbolTable',
+    u32le(0) + '    # NumberOfSymbols',
+    u16le(sizeOfOptionalHeader) + '   # SizeOfOptionalHeader',
+    u16le(0x0102) + '   # Characteristics = EXECUTABLE_IMAGE | 32BIT_MACHINE',
+    // optional header @ 0x98
+    u16le(0x010b) + '   # Magic = PE32',
+    u16le(0x0009) + '   # Linker 9.0',
+    u32le(0x00000200) + '   # SizeOfCode',
+    u32le(0) + '    # SizeOfInitializedData',
+    u32le(0) + '    # SizeOfUninitializedData',
+    u32le(sections[0].rva) + '   # AddressOfEntryPoint',
+    u32le(sections[0].rva) + '   # BaseOfCode',
+    u32le(0x00000400) + '   # BaseOfData',
+    u32le(0x82000000) + '   # ImageBase',
+    u32le(0x00000200) + '   # SectionAlignment',
+    u32le(0x00000200) + '   # FileAlignment',
+    '.byte 0x06, 0x00, 0x02, 0x00  # OS 6.2',
+    u32le(0) + '    # Image',
+    '.byte 0x06, 0x00, 0x02, 0x00  # Subsystem 6.2',
+    u32le(0) + '    # Win32VersionValue',
+    u32le(0x00002000) + '   # SizeOfImage',
+    u32le(0x00000200) + '   # SizeOfHeaders',
+    u32le(0) + '    # CheckSum',
+    u16le(0x0002) + '   # Subsystem = WINDOWS_GUI',
+    u16le(0x0000) + '   # DllCharacteristics',
+    u32le(0x00100000) + '   # SizeOfStackReserve',
+    u32le(0x00001000) + '   # SizeOfStackCommit',
+    u32le(0x00100000) + '   # SizeOfHeapReserve',
+    u32le(0x00001000) + '   # SizeOfHeapCommit',
+    u32le(0) + '    # LoaderFlags',
+    u32le(16) + '   # NumberOfRvaAndSizes',
+    '.space 128                  # DataDirectory',
+  ];
+  sections.forEach((s) => {
+    out.push(nameField(s.name));
+    out.push(u32le(s.virtualSize));
+    out.push(u32le(s.rva));
+    out.push(u32le(s.virtualSize)); // SizeOfRawData == virtualSize for the fixtures
+    out.push(u32le(s.rva));         // PointerToRawData == rva (contiguous image)
+    out.push(u32le(0));             // PointerToRelocations
+    out.push(u32le(0));             // PointerToLinenumbers
+    out.push(u16le(0));             // NumberOfRelocations
+    out.push(u16le(0));             // NumberOfLinenumbers
+    out.push(u32le(s.characteristics));
+  });
+  // Zero-pad the section table out to 0x200.
+  const used = sectionTable + sections.length * 40;
+  if (used < 0x200) out.push(`.space 0x${(0x200 - used).toString(16)}`);
+  return out.join('\n');
+}
+
 /**
  * PDATA_* — a PE-shaped guest image with a real `.pdata`
  * (IMAGE_CE_RUNTIME_FUNCTION) section, mirroring what XenonRecomp parses:
@@ -258,71 +337,10 @@ export const PDATA_THUNK_ADDR = THUNK_ADDR;  // 0x82001000
 export const PDATA_HELPER_R3 = 0x2a;         // helper_fn leaves 42 in r3
 export const PDATA_OUTPUT = 'pdata seeded run\n';
 
-const PDATA_SOURCE = `
-.org 0x82000000
-.byte 0x4D, 0x5A            # 'MZ'
-.space 0x3A                 # 0x02..0x3B
-.byte 0x80, 0x00, 0x00, 0x00  # e_lfanew = 0x80 (LE)
-.space 0x40                 # 0x40..0x7F
-.byte 0x50, 0x45, 0x00, 0x00  # 'PE\\0\\0'
-.byte 0xF2, 0x01            # Machine = POWERPCFP (0x01F2, LE)
-.byte 0x02, 0x00            # NumberOfSections = 2
-.byte 0x00, 0x00, 0x00, 0x00  # TimeDateStamp
-.byte 0x00, 0x00, 0x00, 0x00  # PointerToSymbolTable
-.byte 0x00, 0x00, 0x00, 0x00  # NumberOfSymbols
-.byte 0xE0, 0x00            # SizeOfOptionalHeader = 0xE0
-.byte 0x02, 0x01            # Characteristics = EXECUTABLE_IMAGE | 32BIT_MACHINE
-# ---- optional header @ 0x98 (0xE0 bytes, little-endian) ----
-.byte 0x0B, 0x01            # Magic = PE32
-.byte 0x09, 0x00            # Linker 9.0
-.byte 0x00, 0x02, 0x00, 0x00  # SizeOfCode = 0x200
-.byte 0x00, 0x00, 0x00, 0x00  # SizeOfInitializedData
-.byte 0x00, 0x00, 0x00, 0x00  # SizeOfUninitializedData
-.byte 0x00, 0x02, 0x00, 0x00  # AddressOfEntryPoint = 0x200
-.byte 0x00, 0x02, 0x00, 0x00  # BaseOfCode = 0x200
-.byte 0x00, 0x04, 0x00, 0x00  # BaseOfData = 0x400
-.byte 0x00, 0x00, 0x00, 0x82  # ImageBase = 0x82000000
-.byte 0x00, 0x02, 0x00, 0x00  # SectionAlignment = 0x200
-.byte 0x00, 0x02, 0x00, 0x00  # FileAlignment = 0x200
-.byte 0x06, 0x00, 0x02, 0x00  # OS 6.2
-.byte 0x00, 0x00, 0x00, 0x00  # Image 0.0
-.byte 0x06, 0x00, 0x02, 0x00  # Subsystem 6.2
-.byte 0x00, 0x00, 0x00, 0x00  # Win32VersionValue
-.byte 0x00, 0x20, 0x00, 0x00  # SizeOfImage = 0x2000
-.byte 0x00, 0x02, 0x00, 0x00  # SizeOfHeaders = 0x200
-.byte 0x00, 0x00, 0x00, 0x00  # CheckSum
-.byte 0x02, 0x00            # Subsystem = WINDOWS_GUI
-.byte 0x00, 0x00            # DllCharacteristics
-.byte 0x00, 0x00, 0x10, 0x00  # SizeOfStackReserve = 0x00100000
-.byte 0x00, 0x10, 0x00, 0x00  # SizeOfStackCommit = 0x00001000
-.byte 0x00, 0x00, 0x10, 0x00  # SizeOfHeapReserve = 0x00100000
-.byte 0x00, 0x10, 0x00, 0x00  # SizeOfHeapCommit = 0x00001000
-.byte 0x00, 0x00, 0x00, 0x00  # LoaderFlags
-.byte 0x10, 0x00, 0x00, 0x00  # NumberOfRvaAndSizes = 16
-.space 128                  # DataDirectory
-# ---- section table @ 0x178 (2 × 40 bytes) ----
-.byte 0x2E, 0x74, 0x65, 0x78, 0x74, 0x00, 0x00, 0x00  # '.text'
-.byte 0x00, 0x02, 0x00, 0x00  # VirtualSize = 0x200
-.byte 0x00, 0x02, 0x00, 0x00  # VirtualAddress = 0x200
-.byte 0x00, 0x02, 0x00, 0x00  # SizeOfRawData = 0x200
-.byte 0x00, 0x02, 0x00, 0x00  # PointerToRawData = 0x200
-.byte 0x00, 0x00, 0x00, 0x00  # PointerToRelocations
-.byte 0x00, 0x00, 0x00, 0x00  # PointerToLinenumbers
-.byte 0x00, 0x00            # NumberOfRelocations
-.byte 0x00, 0x00            # NumberOfLinenumbers
-.byte 0x20, 0x00, 0x00, 0x60  # Characteristics = CODE|EXECUTE|READ (0x60000020)
-.byte 0x2E, 0x70, 0x64, 0x61, 0x74, 0x61, 0x00, 0x00  # '.pdata'
-.byte 0x18, 0x00, 0x00, 0x00  # VirtualSize = 0x18 (3 records)
-.byte 0x00, 0x04, 0x00, 0x00  # VirtualAddress = 0x400
-.byte 0x18, 0x00, 0x00, 0x00  # SizeOfRawData = 0x18
-.byte 0x00, 0x04, 0x00, 0x00  # PointerToRawData = 0x400
-.byte 0x00, 0x00, 0x00, 0x00  # PointerToRelocations
-.byte 0x00, 0x00, 0x00, 0x00  # PointerToLinenumbers
-.byte 0x00, 0x00            # NumberOfRelocations
-.byte 0x00, 0x00            # NumberOfLinenumbers
-.byte 0x40, 0x00, 0x00, 0x40  # Characteristics = INITIALIZED_DATA|READ (0x40000040)
-.space 0x38                 # 0x1C8..0x1FF pad to 0x200
-# ---- .text @ 0x200 ----
+const PDATA_SOURCE = pePrologue([
+  { name: '.text', rva: 0x200, virtualSize: 0x200, characteristics: 0x60000020 },
+  { name: '.pdata', rva: 0x400, virtualSize: 0x18, characteristics: 0x40000040 },
+]) + `
 .org 0x82000200
 entry:
     lis   r3, fmt@ha
@@ -380,4 +398,319 @@ function concat(a, b) {
   out.set(a, 0);
   out.set(b, a.length);
   return out;
+}
+
+/**
+ * SWITCH_* — a PE-shaped image whose dispatch is an indirect jump table.
+ * Layout (base 0x82000000): entry at 0x82000200, three 16-byte case slots
+ * (case_0..2 at 0x280/0x290/0x2A0, each exactly lis/addi/b/nop), default and
+ * print path after that, table at 0x82000380, DbgPrint thunk at 0x82001000.
+ * The only references to the case bodies are the jump table; nothing in the
+ * control flow reaches them — this is what the .pdata seeding could not
+ * provide (there is no .pdata here) and jump-table detection can.
+ *
+ * tableType picks the four shapes from XenonAnalyse:
+ *   absolute    table = absolute VAs (lis/addi + rlwinm idx<<2 + lwzx)
+ *   computed    table = bytes, labels = case_base + (byte << shift)
+ *   byteoffset  table = bytes, labels = case_base + byte
+ *   shortoffset table = u16be, labels = case_base + u16
+ */
+const SWITCH_SLOTS = [0x280, 0x290, 0x2a0];
+export const SWITCH_CASE_ADDRS = SWITCH_SLOTS.map((rva) => IMAGE_BASE + rva); // guest VAs
+export const SWITCH_TABLE_ADDR = IMAGE_BASE + 0x380;
+export const SWITCH_DEFAULT_OUTPUT = 'default\n';
+export const SWITCH_CASE_OUTPUTS = ['case0\n', 'case1\n', 'case2\n'];
+
+export function buildSwitchXex({ index = 1, tableType = 'absolute' } = {}) {
+  const dispatch = {
+    absolute: [
+      '    lis   r5, switch_table@ha',
+      '    addi  r5, r5, switch_table@l',
+      '    rlwinm r6, r4, 2, 0, 29     # r6 = idx * 4',
+      '    lwzx  r7, r6, r5',
+      '    mtctr r7',
+      '    bctr',
+    ],
+    computed: [
+      '    lis   r5, switch_table@ha',
+      '    addi  r5, r5, switch_table@l',
+      '    lbzx  r7, r4, r5',
+      '    rlwinm r7, r7, 2, 0, 29     # r7 = byte offset << 2',
+      '    lis   r6, case_0@ha',
+      '    addi  r6, r6, case_0@l',
+      '    add   r7, r7, r6',
+      '    mtctr r7',
+      '    bctr',
+    ],
+    byteoffset: [
+      '    lis   r5, switch_table@ha',
+      '    addi  r5, r5, switch_table@l',
+      '    lbzx  r7, r4, r5',
+      '    lis   r6, case_0@ha',
+      '    addi  r6, r6, case_0@l',
+      '    add   r7, r7, r6',
+      '    mtctr r7',
+      '    bctr',
+    ],
+    shortoffset: [
+      '    lis   r5, switch_table@ha',
+      '    addi  r5, r5, switch_table@l',
+      '    rlwinm r6, r4, 1, 0, 30     # r6 = idx * 2',
+      '    lhzx  r7, r6, r5',
+      '    lis   r6, case_0@ha',
+      '    addi  r6, r6, case_0@l',
+      '    add   r7, r7, r6',
+      '    mtctr r7',
+      '    bctr',
+    ],
+  }[tableType];
+  if (!dispatch) throw new Error(`unknown tableType '${tableType}'`);
+  const table = {
+    absolute: 'switch_table:\n    .word case_0\n    .word case_1\n    .word case_2',
+    computed: 'switch_table:\n    .byte 0, 4, 8',
+    byteoffset: 'switch_table:\n    .byte 0, 16, 32',
+    shortoffset: 'switch_table:\n    .byte 0x00, 0x00, 0x00, 0x10, 0x00, 0x20',
+  }[tableType];
+  const src = pePrologue([
+    { name: '.text', rva: 0x200, virtualSize: 0x400, characteristics: 0x60000020 },
+  ]) + `
+.org 0x82000200
+entry:
+    li    r4, ${index}
+    cmplwi r4, 2
+    bgt   Ldefault
+${dispatch.join('\n')}
+    .org 0x82000280
+case_0:                           # each case slot is exactly 16 bytes
+    lis   r3, fmt0@ha
+    addi  r3, r3, fmt0@l
+    b     Lprint
+    nop
+    .org 0x82000290
+case_1:
+    lis   r3, fmt1@ha
+    addi  r3, r3, fmt1@l
+    b     Lprint
+    nop
+    .org 0x820002a0
+case_2:
+    lis   r3, fmt2@ha
+    addi  r3, r3, fmt2@l
+    b     Lprint
+    nop
+Ldefault:
+    lis   r3, fmtdef@ha
+    addi  r3, r3, fmtdef@l
+Lprint:
+    bl    thunk_0
+    li    r9, 0
+    lis   r10, 0x00f0
+    ori   r10, r10, 0x0ffc
+    stw   r9, 0(r10)                # exit door
+spin:
+    b     spin
+fmt0:
+    .asciiz "case0\\n"
+fmt1:
+    .asciiz "case1\\n"
+fmt2:
+    .asciiz "case2\\n"
+fmtdef:
+    .asciiz "default\\n"
+    .org 0x82000380
+${table}
+    .org 0x82001000
+thunk_0:
+    .word 0x01000003              # type=1 (thunk), ordinal 3 (DbgPrint)
+`;
+  const { bytes } = assemble(src);
+  return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
+}
+
+/**
+ * VMX_* — a PE-shaped image containing the compiler's __savevmx_64 /
+ * __restvmx_64 stubs (64 pairs of `li r11, slot; stvx|lvx128 vI, r11, r12`
+ * plus a blr). Opcode-4 words are what a real Xenon emits for the 128-bit
+ * vector loads/stores; the lifter has no VMX model yet, so the recompiler
+ * SYNTHESIZES these stubs (see save_restore.js): the save entry zero-fills
+ * its register save slots, the restore entry is a no-op.
+ *
+ * The guest stores sentinel values into the v64/v65 slots, then enters
+ * __savevmx_66 (pair k=2) INDIRECTLY via bctr. It then re-reads the slots:
+ *   v64/v65 slots → must still contain the sentinels (mid-entry must not
+ *                   touch earlier registers)
+ *   v66/v127 slots → must read back zero (the synthesized save defined them)
+ * after which it enters __restvmx_66 via bctr as well (must be a safe no-op).
+ */
+const VMX_SAVE_RVA = 0x600;
+const VMX_REST_RVA = 0x820;
+export const VMX_SAVE_BASE = IMAGE_BASE + VMX_SAVE_RVA;
+export const VMX_REST_BASE = IMAGE_BASE + VMX_REST_RVA;
+export const VMX_SAVE_66 = VMX_SAVE_BASE + (66 - 64) * 8;
+export const VMX_REST_66 = VMX_REST_BASE + (66 - 64) * 8;
+export const VMX_PASS_OUTPUT = 'vmxok\n';
+export const VMX_BAD_OUTPUT = 'vmxbad\n';
+
+// VDS128 field: split v-register across bits 2..3 (high 2 bits) and 21..25 (low 5 bits).
+const vd128 = (v) => ((v & 0x60) >> 3) | ((v & 0x1f) << 21);
+const lvx128 = (v, ra = 11, rb = 12) => (4 << 26) | vd128(v) | (ra << 16) | (rb << 11) | (195 & 0x7f3);
+const stvx128 = (v, ra = 11, rb = 12) => (4 << 26) | vd128(v) | (ra << 16) | (rb << 11) | (451 & 0x7f3);
+
+function vmxPairs(kind, midLabel, midK) {
+  const lines = [];
+  for (let k = 0; k < 64; k++) {
+    if (k === midK) lines.push(`${midLabel}:`);
+    lines.push(`    li    r11, ${-0x400 + k * 0x10}`);
+    lines.push(`    .word 0x${(kind === 'save' ? stvx128(64 + k) : lvx128(64 + k)).toString(16)}`);
+  }
+  lines.push('    blr');
+  return lines.join('\n');
+}
+
+export function buildVmxStubXex() {
+  const src = pePrologue([
+    { name: '.text', rva: 0x200, virtualSize: 0x900, characteristics: 0x60000020 },
+  ]) + `
+.org 0x82000200
+entry:
+    lis   r12, 0x8300
+    addi  r12, r12, 0x0200          # r12 = frame top 0x83000200
+    li    r3, 0x1234
+    std   r3, -1024(r12)            # v64 slot — sentinel
+    std   r3, -1008(r12)            # v65 slot — sentinel
+    bl    save66                      # mid-entry into the synthesized save stub
+    ld    r5, -1024(r12)            # v64 slot intact?
+    cmpdi r5, 0x1234
+    bne   Lbad
+    ld    r5, -1008(r12)            # v65 slot intact?
+    cmpdi r5, 0x1234
+    bne   Lbad
+    ld    r5, -992(r12)             # v66 slot lo zeroed?
+    cmpdi r5, 0
+    bne   Lbad
+    ld    r5, -984(r12)             # v66 slot hi zeroed?
+    cmpdi r5, 0
+    bne   Lbad
+    ld    r5, -16(r12)              # v127 slot lo zeroed?
+    cmpdi r5, 0
+    bne   Lbad
+    bl    rest66                      # synthesized restore: must be a safe no-op
+    lis   r3, fmtok@ha
+    addi  r3, r3, fmtok@l
+    b     Lprint
+Lbad:
+    lis   r3, fmtbad@ha
+    addi  r3, r3, fmtbad@l
+Lprint:
+    bl    thunk_0
+    li    r9, 0
+    lis   r10, 0x00f0
+    ori   r10, r10, 0x0ffc
+    stw   r9, 0(r10)                # exit door
+spin:
+    b     spin
+fmtok:
+    .asciiz "vmxok\\n"
+fmtbad:
+    .asciiz "vmxbad\\n"
+    .org 0x82000600
+__savevmx_64:
+${vmxPairs('save', 'save66', 2)}
+    .org 0x82000820
+__restvmx_64:
+${vmxPairs('rest', 'rest66', 2)}
+    .org 0x82001000
+thunk_0:
+    .word 0x01000003                # type=1 (thunk), ordinal 3 (DbgPrint)
+`;
+  const { bytes } = assemble(src);
+  return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
+}
+
+/**
+ * FPR_* — a PE-shaped image containing the compiler's __savefpr_14 stub
+ * (18 `stfd fN, slot(r12)` + blr) and __restfpr_14 (the lfd mirror). These
+ * are LIFTABLE (stfd/lfd supported) — no synthesis — so this exercises the
+ * plain lift path plus the mid-entry seeding. End-to-end: f15 <- 1.0
+ * (pins the lfd fix — lfd used to return bswap64(ea)), mid-entry save, check
+ * the slot, mid-entry restore, then stfd again and check the high word.
+ * The round trip only works if the f-register globals and FP loads/stores
+ * are consistent.
+ */
+export const FPR_SAVE_BASE = IMAGE_BASE + 0x600;
+export const FPR_REST_BASE = IMAGE_BASE + 0x660;
+export const FPR_SAVE_15 = FPR_SAVE_BASE + 4;
+export const FPR_REST_15 = FPR_REST_BASE + 4;
+export const FPR_PASS_OUTPUT = 'fprok\n';
+export const FPR_BAD_OUTPUT = 'fprbad\n';
+
+function fprStub(kind, midLabel, midK) {
+  const lines = [];
+  for (let f = 14; f <= 31; f++) {
+    if (f === 14 + midK) lines.push(`${midLabel}:`);
+    const off = -0x90 + (f - 14) * 8;
+    lines.push(`    ${kind === 'save' ? 'stfd' : 'lfd'} f${f}, ${off}(r12)`);
+  }
+  lines.push('    blr');
+  return lines.join('\n');
+}
+
+export function buildFprStubXex() {
+  const src = pePrologue([
+    // virtualSize must cover the stubs (0x600..0x6ac) — the detector scans PE code sections
+    { name: '.text', rva: 0x200, virtualSize: 0x500, characteristics: 0x60000020 },
+  ]) + `
+.org 0x82000200
+entry:
+    lis   r12, 0x8300
+    addi  r12, r12, 0x0200          # r12 = frame top 0x83000200
+    lis   r11, one@ha
+    addi  r11, r11, one@l
+    lfd   f15, 0(r11)               # f15 = 1.0 (0x3FF0000000000000)
+    bl    savefpr_15                # mid-entry: saves f15..f31 (f14 not touched)
+    lwz   r3, -136(r12)             # f15 slot = -0x88, high word = 0x3FF00000
+    lis   r6, 0x3FF0
+    cmpw  r3, r6
+    bne   Lbad
+    lwz   r4, -132(r12)             # low word = 0x00000000
+    cmpwi r4, 0
+    bne   Lbad
+    bl    restfpr_15                # f15 = restored 1.0
+    stfd  f15, -160(r12)            # scratch slot below the save area
+    lwz   r3, -160(r12)
+    lis   r6, 0x3FF0
+    cmpw  r3, r6
+    bne   Lbad
+    lis   r3, fmtok@ha
+    addi  r3, r3, fmtok@l
+    b     Lprint
+Lbad:
+    lis   r3, fmtbad@ha
+    addi  r3, r3, fmtbad@l
+Lprint:
+    bl    thunk_0
+    li    r9, 0
+    lis   r10, 0x00f0
+    ori   r10, r10, 0x0ffc
+    stw   r9, 0(r10)                # exit door
+spin:
+    b     spin
+fmtok:
+    .asciiz "fprok\\n"
+fmtbad:
+    .asciiz "fprbad\\n"
+one:
+    .dword 0x3ff0000000000000
+    .org 0x82000600
+__savefpr_14:
+${fprStub('save', 'savefpr_15', 1)}
+    .org 0x82000660
+__restfpr_14:
+${fprStub('rest', 'restfpr_15', 1)}
+    .org 0x82001000
+thunk_0:
+    .word 0x01000003                # type=1 (thunk), ordinal 3 (DbgPrint)
+`;
+  const { bytes } = assemble(src);
+  return buildSyntheticXexFromImage(bytes, { compression: 'basic', encryption: 'normal', importOrdinals: [0x0003] });
 }

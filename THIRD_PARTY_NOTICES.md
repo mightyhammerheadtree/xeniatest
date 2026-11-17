@@ -30,13 +30,27 @@ Additional files derived from xenia-canary (HLE export tables):
 
 Files derived from XenonRecomp (https://github.com/hedge-dev/XenonRecomp),
 licensed under the MIT license, Copyright (c) 2025 hedge-dev:
+  - [hedge-dev/XenonRecomp](https://github.com/hedge-dev/XenonRecomp) (MIT):
   - public/js/recomp/pe_image.js is a new implementation of the PE section-table
     and .pdata (IMAGE_CE_RUNTIME_FUNCTION) parsing used by XenonRecomp for
     function discovery; xbox.h (_IMAGE_CE_RUNTIME_FUNCTION layout), xex.cpp
     (PE section mapping) and XenonRecomp/recompiler.cpp (.pdata seeding) were
     used as references. MIT's permission notice is reproduced below.
+  - public/js/recomp/switch_tables.js is a new implementation of XenonAnalyse's
+    jump-table detection (XenonAnalyse/main.cpp — pattern scan, backward
+    bounds-check scan, table read-out) used by XenonRecomp to turn switch
+    statements into real cases; XenonRecomp/recompiler.cpp (labels as jump
+    destinations) was used as a reference. MIT's permission notice is
+    reproduced below.
+  - public/js/recomp/save_restore.js is a new implementation of the Xbox 360
+    save/restore stub convention documented in XenonRecomp's README and
+    recompiler.cpp (pattern detection + per-mid-entry function registration);
+    the opcode-4 VX128 encoding layout was taken from the bundled disassembler
+    table (thirdparty/disasm/ppc-dis.c, insert_vds128 / extract_vds128).
+    MIT's permission notice is reproduced below.
   - public/js/recomp/recompiler.js incorporates the same .pdata-seeded
-    function-discovery strategy; it is otherwise a new implementation.
+    function-discovery, jump-table and save/restore stub strategies; it is
+    otherwise a new implementation.
 
 MIT License — XenonRecomp (hedge-dev)
 
