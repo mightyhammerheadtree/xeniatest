@@ -7,6 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   buildSyntheticXex,
+  buildSyntheticXexFromImage,
   buildEncryptedUncompressedXex,
   EXPECTED_OUTPUT,
   HELLO,
@@ -15,6 +16,7 @@ import {
   ENTRY,
   THUNK_ADDR,
 } from './hle_xex.mjs';
+import { assemble } from '../../public/js/ppc_asm.js';
 import { buildImage, runImage, RecompError } from '../../public/js/recomp/recompiler.js';
 import { loadXex2, XexLoadError } from '../../public/js/recomp/xex_loader.js';
 
@@ -182,4 +184,54 @@ test('exported project zip runs standalone via `node run.js` with no firmware', 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('guest allocates memory through NtAllocateVirtualMemory and round-trips a byte through it', async () => {
+  // Hand-written guest: asks the (HLE) kernel for a page, stores 0x2a in it,
+  // reads it back, and DbgPrints it with %d. Output must be exactly "42\n".
+  const src = [
+    '.org 0x82000000',
+    "    .byte 0x4D, 0x5A            # 'MZ' PE signature",
+    '    .space 0x1FE',
+    '    lis   r31, slot@ha',
+    '    addi  r31, r31, slot@l',
+    '    li    r3, 0',
+    '    stw   r3, 0(r31)            # base_addr = 0 — kernel chooses',
+    '    li    r3, 0x1234',
+    '    stw   r3, 4(r31)            # region_size = 0x1234',
+    '    mr    r3, r31              # &base_addr',
+    '    addi  r4, r31, 4           # &region_size',
+    '    li    r5, 0x1000           # X_MEM_COMMIT',
+    '    li    r6, 0x04             # X_PAGE_READWRITE',
+    '    li    r7, 0                # debug_memory = FALSE',
+    '    bl    thunk_0              # NtAllocateVirtualMemory(...)',
+    '    lwz   r5, 0(r31)           # allocated base (written back by the kernel)',
+    '    li    r6, 0x2a             # 42',
+    '    stb   r6, 0(r5)',
+    '    lbz   r4, 0(r5)',
+    '    lis   r3, fmt@ha',
+    '    addi  r3, r3, fmt@l',
+    '    bl    thunk_1              # DbgPrint(fmt, 42)',
+    '    li    r9, 0',
+    '    lis   r10, 0x00f0',
+    '    ori   r10, r10, 0x0ffc',
+    '    stw   r9, 0(r10)            # exit door',
+    'spin:',
+    '    b     spin',
+    'fmt:',
+    '    .asciiz "%d\\n"',
+    'slot:',
+    '    .space 8',
+    '    .org 0x82001000',
+    'thunk_0:',
+    '    .word 0x010000cc            # 0x01000000 | 0x00cc NtAllocateVirtualMemory',
+    'thunk_1:',
+    '    .word 0x01000003            # 0x01000000 | 0x0003 DbgPrint',
+  ].join('\n');
+  const { bytes } = assemble(src);
+  const { xex } = buildSyntheticXexFromImage(bytes, { importOrdinals: [0x00cc, 0x0003] });
+  let out = '';
+  const res = await runImage(buildImage('xex2', null, xex), { onConsole: (s) => { out += s; } });
+  assert.equal(out, '42\n');
+  assert.equal(res.exitCode, 0);
 });

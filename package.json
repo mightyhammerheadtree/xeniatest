@@ -15,7 +15,7 @@
     "test:elf": "node --test core/tests/test_elf_loader.mjs",
     "test:web": "node --test core/tests/test_webapp.mjs",
     "build:hle-bundle": "node tools/build_hle_bundle.mjs",
-    "test:hle": "node --test core/tests/test_hle_xex.mjs core/tests/test_hle_bundle.mjs"
+    "test:hle": "node --test core/tests/test_hle_xex.mjs core/tests/test_hle_bundle.mjs core/tests/test_hle_exports.mjs"
   },
   "dependencies": {
     "compression": "^1.7.5",
