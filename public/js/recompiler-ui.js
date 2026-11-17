@@ -230,6 +230,13 @@ function downloadZip() {
     segments: state.built.segments,
     stats: state.stats,
     hleCalls: state.built.hleCalls,
+    discovery: {
+      peSections: state.built.peSections?.length ?? null,
+      peError: state.built.peError ?? null,
+      seededFunctionStarts: state.built.functionStarts?.length ?? 0,
+      switchTables: state.built.switchTables?.size ?? 0,
+      vmxStubs: state.built.vmxStubs?.size ?? 0,
+    },
   });
   const zip = makeZip(files);
   const blob = new Blob([zip], { type: 'application/zip' });

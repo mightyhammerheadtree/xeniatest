@@ -85,8 +85,9 @@ test('project zip file set is complete and self-consistent', async () => {
   const built = buildImage('bin', null, assemble(p.source).bytes);
   const { recompileImage } = await import('../../public/js/recomp/recompiler.js');
   const { wasm, stats } = recompileImage(built.arena, built.entry);
+  const discovery = { peSections: null, peError: null, seededFunctionStarts: built.functionStarts?.length ?? 0, switchTables: 0, vmxStubs: 0 };
   const files = buildProjectFiles({
-    name: 'fib', kind: 'bin', entry: built.entry, wasm, segments: built.segments, stats, now: new Date(2026, 10, 15),
+    name: 'fib', kind: 'bin', entry: built.entry, wasm, segments: built.segments, stats, now: new Date(2026, 10, 15), discovery,
   });
   const byName = new Map(files.map((f) => [f.name, f.data]));
   for (const expected of ['README.md', 'manifest.json', 'index.html', 'runtime.js', 'guest-wasm.js', 'guest.wasm',
@@ -98,6 +99,7 @@ test('project zip file set is complete and self-consistent', async () => {
   // manifest parses and carries the stats
   const manifest = JSON.parse(new TextDecoder().decode(byName.get('manifest.json')));
   assert.equal(manifest.stats.fragments, stats.fragments);
+  assert.deepEqual(manifest.discovery, discovery);
   assert.equal(manifest.entryHex, '0x10000');
   // guest-wasm.js embeds the module and the image segment(s)
   const gjs = new TextDecoder().decode(byName.get('guest-wasm.js'));

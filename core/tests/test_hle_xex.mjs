@@ -167,14 +167,17 @@ test('exported project zip runs standalone via `node run.js` with no firmware', 
   const { xex } = buildSyntheticXex({ compression: 'basic', encryption: 'normal' });
   const built = buildImage('xex2', null, xex);
   const { wasm, stats } = recompileImage(built.arena, built.entry, { hleCalls: built.hleCalls });
+  const discovery = { peSections: built.peSections?.length ?? null, peError: built.peError ?? null, seededFunctionStarts: built.functionStarts?.length ?? 0, switchTables: built.switchTables?.size ?? 0, vmxStubs: built.vmxStubs?.size ?? 0 };
   const files = buildProjectFiles({
     name: 'hello-xex', kind: 'xex2', entry: built.entry, wasm,
-    segments: built.segments, stats, now: new Date(2026, 10, 15), hleCalls: built.hleCalls,
+    segments: built.segments, stats, now: new Date(2026, 10, 15), hleCalls: built.hleCalls, discovery,
   });
   const byName = new Map(files.map((f) => [f.name, f.data]));
 
   // manifest carries the HLE import map and announces no firmware requirement
   const manifest = JSON.parse(new TextDecoder().decode(byName.get('manifest.json')));
+  // manifest carries discovery provenance (seeds / switch tables / VMX stubs / PE breadcrumb)
+  assert.deepEqual(manifest.discovery, discovery);
   assert.equal(manifest.hle.model, 'hle');
   assert.equal(manifest.hle.firmwareRequired, false);
   assert.deepEqual(manifest.hle.modules, ['xboxkrnl', 'xam', 'xbdm']);

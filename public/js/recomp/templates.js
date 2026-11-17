@@ -271,7 +271,7 @@ Prefer a terminal? \`node run.js\` does the same thing (Node >= 18, no deps).
 | \`guest.wasm\` | the recompiled module (imports come from the \`xenorecomp\` module) |
 | \`guest.bin\` | your original image bytes, split by segment, for the node runner |
 | \`run.js\` | optional node runner |
-| \`manifest.json\` | build metadata (entry, fragment/instruction counts, segment map) |
+| \`manifest.json\` | build metadata (entry, fragment/instruction counts, discovery provenance, segment map) |
 | \`hle.js\`, \`hle_tables.js\` | the pure-HLE kernel (xenia-style host calls; 2918 known exports) |
 | \`docs/HLE.md\` | how the HLE kernel works, the import-call ABI, and how to port more exports |
 
@@ -313,10 +313,11 @@ fresh archive.
  * @param {Array<{addr:number, data:Uint8Array}>} opts.segments  image segments
  * @param {{fragments:number, insns:number, blocks:number, unimpl:number}} opts.stats
  * @param {Map<number, {addr:number, moduleId:string, ordinal:number, name:string}>} [opts.hleCalls]  XEX2 import thunk map (empty for bin/elf)
+ * @param {{peSections: number|null, peError: string|null, seededFunctionStarts: number, switchTables: number, vmxStubs: number}} [opts.discovery]  image-analysis discovery provenance for the manifest
  * @param {Date} [opts.now]
  * @returns {Array<{name:string, data:Uint8Array}>}
  */
-export function buildProjectFiles({ name, kind, entry, wasm, segments, stats, now, hleCalls }) {
+export function buildProjectFiles({ name, kind, entry, wasm, segments, stats, now, hleCalls, discovery }) {
   const title = name.replace(/[^A-Za-z0-9._-]+/g, '-');
   const manifest = {
     name: title,
@@ -332,6 +333,10 @@ export function buildProjectFiles({ name, kind, entry, wasm, segments, stats, no
     consoleMMIO: '0x00f00000',
     generatedAt: (now ?? new Date()).toISOString(),
   };
+  // Discovery provenance: how the recompiled function set was found —
+  // seeds (.pdata + jump-table labels + save/restore stub entries), detected
+  // switch tables, synthesized VMX stubs, and the PE parse breadcrumb.
+  if (discovery) manifest.discovery = discovery;
   const hleCallsMap = hleCalls ?? new Map();
   const hleCallsArr = [...hleCallsMap.values()].map((c) => ({
     addr: c.addr, moduleId: c.moduleId, ordinal: c.ordinal, name: c.name,
