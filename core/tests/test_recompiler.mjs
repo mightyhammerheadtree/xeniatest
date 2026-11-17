@@ -90,7 +90,7 @@ test('project zip file set is complete and self-consistent', async () => {
   });
   const byName = new Map(files.map((f) => [f.name, f.data]));
   for (const expected of ['README.md', 'manifest.json', 'index.html', 'runtime.js', 'guest-wasm.js', 'guest.wasm',
-    'run.js', 'docs/KERNEL.md', 'kernel/.gitkeep', 'segment-0.bin', 'guest.bin']) {
+    'run.js', 'hle.js', 'hle_tables.js', 'docs/HLE.md', 'segment-0.bin', 'guest.bin']) {
     assert.ok(byName.has(expected), 'zip contains ' + expected);
   }
   // guest.wasm is a real module (magic + version)

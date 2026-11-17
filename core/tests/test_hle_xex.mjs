@@ -134,3 +134,52 @@ test('trailing-zero blocks are accounted for in the arena image', () => {
   assert.equal(loaded.image.length, aligned + 0x300);
   assert.ok([...loaded.image.subarray(aligned)].every((b) => b === 0));
 });
+
+test('exported project zip runs standalone via `node run.js` with no firmware', async () => {
+  const { mkdtempSync, writeFileSync, mkdirSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, dirname } = await import('node:path');
+  const { execFileSync } = await import('node:child_process');
+  const { buildProjectFiles } = await import('../../public/js/recomp/templates.js');
+  const { recompileImage } = await import('../../public/js/recomp/recompiler.js');
+
+  // synthetic retail-key XEX2 → recompiled wasm
+  const { xex } = buildSyntheticXex({ compression: 'basic', encryption: 'normal' });
+  const built = buildImage('xex2', null, xex);
+  const { wasm, stats } = recompileImage(built.arena, built.entry, { hleCalls: built.hleCalls });
+  const files = buildProjectFiles({
+    name: 'hello-xex', kind: 'xex2', entry: built.entry, wasm,
+    segments: built.segments, stats, now: new Date(2026, 10, 15), hleCalls: built.hleCalls,
+  });
+  const byName = new Map(files.map((f) => [f.name, f.data]));
+
+  // manifest carries the HLE import map and announces no firmware requirement
+  const manifest = JSON.parse(new TextDecoder().decode(byName.get('manifest.json')));
+  assert.equal(manifest.hle.model, 'hle');
+  assert.equal(manifest.hle.firmwareRequired, false);
+  assert.deepEqual(manifest.hle.modules, ['xboxkrnl', 'xam', 'xbdm']);
+  assert.deepEqual(
+    manifest.hle.calls.map((c) => [c.moduleId, c.ordinal, c.name]).sort(),
+    [
+      ['xboxkrnl', 3, 'DbgPrint'],
+      ['xboxkrnl', 3, 'DbgPrint'],
+    ],
+  );
+  // guest-wasm.js embeds the same map for the browser runner
+  const gjs = new TextDecoder().decode(byName.get('guest-wasm.js'));
+  assert.match(gjs, /HLE_CALLS/);
+
+  // unzip into a temp dir and run it for real
+  const dir = mkdtempSync(join(tmpdir(), 'xenon-xex-e2e-'));
+  try {
+    for (const [name, data] of byName) {
+      const dest = join(dir, name);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, data);
+    }
+    const stdout = execFileSync(process.execPath, ['run.js'], { cwd: dir, encoding: 'utf8' });
+    assert.equal(stdout, EXPECTED_OUTPUT);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

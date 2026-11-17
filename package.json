@@ -10,10 +10,12 @@
   },
   "scripts": {
     "start": "node server/server.js",
-    "test": "npm run test:recomp && npm run test:elf && npm run test:web",
+    "test": "npm run test:recomp && npm run test:elf && npm run test:web && npm run test:hle",
     "test:recomp": "node --test core/tests/test_recompiler.mjs",
     "test:elf": "node --test core/tests/test_elf_loader.mjs",
-    "test:web": "node --test core/tests/test_webapp.mjs"
+    "test:web": "node --test core/tests/test_webapp.mjs",
+    "build:hle-bundle": "node tools/build_hle_bundle.mjs",
+    "test:hle": "node --test core/tests/test_hle_xex.mjs core/tests/test_hle_bundle.mjs"
   },
   "dependencies": {
     "compression": "^1.7.5",

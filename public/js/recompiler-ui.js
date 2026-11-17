@@ -137,7 +137,7 @@ async function recompileAndRun() {
   let compiled;
   const t0 = performance.now();
   try {
-    compiled = recompileImage(state.built.arena, state.built.entry);
+    compiled = recompileImage(state.built.arena, state.built.entry, { hleCalls: state.built.hleCalls });
   } catch (e) {
     els.btnRecompile.disabled = false;
     showError('Recompilation failed:\n' + (e && e.message ? e.message : String(e)));
@@ -156,8 +156,10 @@ async function recompileAndRun() {
     onConsoleByte: (b) => appendConsole(String.fromCharCode(b)),
   });
   try {
+    if (state.built.hleCalls) imports.__setHleCalls(state.built.hleCalls);
     const { instance } = await WebAssembly.instantiate(compiled.wasm, imports);
     imports.__exports = instance.exports;
+    imports.__attachMemory(instance.exports.memory);
     new Uint8Array(instance.exports.memory.buffer).set(state.built.arena);
     const t1 = performance.now();
     try {
@@ -190,7 +192,7 @@ async function recompileAndRun() {
   els.statsStrip.hidden = false;
 
   if (trap) {
-    showError(trap + '\nThis build ships HLE stubs only — real titles need a kernel dump (docs/KERNELS.md).');
+    showError(trap + '\nThis build ships a pure HLE kernel — unimplemented kernel imports trap by name (docs/HLE.md).');
   }
   if (els.consoleOut.textContent === '' && !trap) setConsole('(guest produced no console output)', { hint: true });
   els.btnDownload.disabled = false;
@@ -206,6 +208,7 @@ function downloadZip() {
     wasm: state.wasm,
     segments: state.built.segments,
     stats: state.stats,
+    hleCalls: state.built.hleCalls,
   });
   const zip = makeZip(files);
   const blob = new Blob([zip], { type: 'application/zip' });
