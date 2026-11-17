@@ -219,3 +219,26 @@ test('inspector parses a synthetic XEX2 and a big-endian ELF64 header', async ()
 test('recompiler page boots with no unexpected console errors', () => {
   assert.deepEqual(consoleErrors, []);
 });
+
+test('dropping a retail-key XEX2 in-page recompiles it and prints through the HLE host', async () => {
+  const { buildSyntheticXex, EXPECTED_OUTPUT } = await import('./hle_xex.mjs');
+  const { xex } = buildSyntheticXex({ compression: 'basic', encryption: 'normal' });
+
+  const input = document.getElementById('file-picker');
+  const file = new dom.window.File([xex], 'hello-retail.xex', { type: 'application/octet-stream' });
+  Object.defineProperty(input, 'files', { value: [file], configurable: true });
+  input.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
+
+  await waitFor(() => document.getElementById('image-info').textContent.includes('entry'));
+  const btn = document.getElementById('btn-recompile');
+  assert.equal(btn.disabled, false);
+  btn.click();
+
+  const consoleOut = await waitFor(() => {
+    const el = document.getElementById('console-out');
+    return el.textContent.includes('answer=42') ? el : null;
+  });
+  assert.match(consoleOut.textContent, /hello from XEX HLE - no firmware, no BIOS\nanswer=42\n/);
+  const stats = document.getElementById('stats-strip');
+  assert.match(stats.textContent, /exit\s*0/);
+});
