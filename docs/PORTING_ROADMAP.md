@@ -39,10 +39,11 @@ Reality constraints:
 ### M3 — AltiVec/VMX
 - VMX decode + lift for the common forms (integer add/sub/mul, logical, permutes); FP VMX (`vaddfp` family) as the second wave.
 
-### M4 — Xenos → WebGPU
-- Shader translation: port xenia's shader peepholes to WGSL (or generate WGSL from the same HIR).
-- Command processor emulation (ring buffer, fetch/decode), render target formats, tiling.
-- Presenter: WebGPU canvas.
+### M4 — Xenos → WebGPU — **in progress**
+- ✅ Register file (reset defaults, write log) + generated register table from xenia (3435 registers).
+- ✅ PM4 command processor: packet decode, SET_CONSTANT windows, REG_RMW (incl. register operands), MEM_WRITE / REG_TO_MEM with xenia GpuSwap32 endianness, EVENT_WRITE family (counter + WRITEBACK window mapping), DRAW_INDX decode (kDMA/kAutoIndex; kImmediate traps as in xenia), loud traps for everything else.
+- ✅ WebGPU plumbing: adapter/device/canvas configuration, depth attachment, index-buffer upload (BE→swap→LE), present; bring-up triangle behind explicit `{ placeholderShader: true }` — never silently rendered.
+- ⬜ Ring buffer from guest memory + doorbell; vertex fetch (`FETCH_*`); shader HIR → WGSL (replaces the placeholder gate); render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
 
 ### M5 — Audio & input
 - XMA decoding (ffmpeg→wasm drop-in or a clean decoder).
