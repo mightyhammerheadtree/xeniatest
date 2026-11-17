@@ -637,6 +637,22 @@
           if (outPtr !== 0n) ctx.writeU32BE(outPtr, 0);
           return BigInt(X_STATUS_OBJECT_NAME_NOT_FOUND);
         }],
+        [0x000001b6, (ctx) => { // VdEnableRingBufferRPtrWriteBack(ptr, block_size_log2) — xboxkrnl 0x1B6
+          const host = globalThis.XenonGpuHost;
+          if (!host || typeof host.enableReadPointerWriteBack !== 'function') {
+            throw new HleError('xboxkrnl!VdEnableRingBufferRPtrWriteBack: GPU host not attached (set globalThis.XenonGpuHost, e.g. via public/js/gpu/gpu_host.js)');
+          }
+          host.enableReadPointerWriteBack(ctx.arg(0), ctx.arg(1));
+          return 0n;
+        }],
+        [0x000001c3, (ctx) => { // VdInitializeRingBuffer(ptr, size_log2) — xboxkrnl 0x1C3
+          const host = globalThis.XenonGpuHost;
+          if (!host || typeof host.initializeRingBuffer !== 'function') {
+            throw new HleError('xboxkrnl!VdInitializeRingBuffer: GPU host not attached (set globalThis.XenonGpuHost, e.g. via public/js/gpu/gpu_host.js)');
+          }
+          host.initializeRingBuffer(ctx.arg(0), ctx.arg(1));
+          return 0n;
+        }],
       ]),
       xam: new Map(),
       xbdm: new Map(),
