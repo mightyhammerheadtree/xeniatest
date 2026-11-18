@@ -4,9 +4,15 @@
  * hle.js (deliberately dependency-free, shipping in the exported zip) needs a
  * way to reach the GPU without importing it: it reads `globalThis.XenonGpuHost`
  * and calls initializeRingBuffer / enableReadPointerWriteBack /
- * notifyWritePointer. This module is that host for the in-page frontend.
+ * notifyWritePointer / mmioStore / mmioLoad. This module is that host for the in-page frontend.
  * (The exported zip does not ship the GPU modules yet, so Vd* exports trap
  * there — loudly, with the reason — until it does.)
+ *
+ * GPU register aperture: recompiled guests reach the GPU through a second
+ * MMIO window at [0x00F02000, 0x00F03000) (byte offset = register × 4), wired
+ * in the recompiler as xenorecomp.gpu_mmio_* → here. Only CP_RB_WPTR (0x01C5,
+ * the doorbell) and CP_RB_RPTR (0x01C4, read pointer) are modeled; every other
+ * register traps loudly, by design.
  *
  * Usage (page):
  *   const host = new XenonGpuHost({ memory });   // guest WebAssembly.Memory
@@ -49,6 +55,16 @@
     };
   }
 
+  /** GPU register aperture — byte offset = register × 4 (must match recompiler.js GPU_MMIO_BASE/END). */
+  const GPU_MMIO_BASE = 0x00F02000;
+  const GPU_MMIO_END = 0x00F03000;
+
+  function registerName(reg) {
+    const r = globalThis.XenonGpuRegisters;
+    const e = r && r.XENOS_GPU_REGISTER_BY_INDEX && r.XENOS_GPU_REGISTER_BY_INDEX.get(reg);
+    return e && e.name ? e.name : null;
+  }
+
   class XenonGpuHost {
     /**
      * @param {object} opts
@@ -88,6 +104,38 @@
       return this.backend.attach();
     }
 
+    /**
+     * Guest GPU MMIO write — recompiler aperture [0x00F02000, 0x00F03000),
+     * byte offset = register × 4. Model only what the ring needs:
+     *   CP_RB_RPTR  (0x01C4) — reads come via mmioLoad; writes trap
+     *   CP_RB_WPTR  (0x01C5) — the doorbell (ring drain, synchronous on this thread)
+     * Everything else traps with the register named (see docs/XENOS_GPU.md).
+     */
+    mmioStore(addr, value, size) {
+      const a = Number(BigInt(addr) & 0x03ffffffn) >>> 0;
+      if ((a & 3) !== 0) throw new Error(`GPU MMIO: unaligned write at 0x${a.toString(16)} — GPU registers are dword-aligned`);
+      if (size !== 4) throw new Error(`GPU MMIO: ${size}-byte write at 0x${a.toString(16)} — only 4-byte (dword) register writes are modeled`);
+      const reg = (a - GPU_MMIO_BASE) >>> 2;
+      const v32 = Number(BigInt(value) & 0xffffffffn) >>> 0;
+      if (reg === 0x01C5) return this.notifyWritePointer(v32);
+      const name = registerName(reg);
+      throw new Error(`GPU MMIO: write to register 0x${reg.toString(16).padStart(4, '0')}${name ? ` (${name})` : ''} is not modeled — only CP_RB_WPTR (0x01C5) is`);
+    }
+
+    /** Guest GPU MMIO read — only CP_RB_RPTR (0x01C4) answers (the ring's current read pointer). */
+    mmioLoad(addr, size) {
+      const a = Number(BigInt(addr) & 0x03ffffffn) >>> 0;
+      if ((a & 3) !== 0) throw new Error(`GPU MMIO: unaligned read at 0x${a.toString(16)} — GPU registers are dword-aligned`);
+      if (size !== 4) throw new Error(`GPU MMIO: ${size}-byte read at 0x${a.toString(16)} — only 4-byte (dword) register reads are modeled`);
+      const reg = (a - GPU_MMIO_BASE) >>> 2;
+      if (reg === 0x01C4) {
+        if (!this.ringBuffer.isInitialized()) throw new Error('GPU MMIO: CP_RB_RPTR read before VdInitializeRingBuffer');
+        return BigInt(this.ringBuffer.getReadIndex() >>> 0);
+      }
+      const name = registerName(reg);
+      throw new Error(`GPU MMIO: read of register 0x${reg.toString(16).padStart(4, '0')}${name ? ` (${name})` : ''} is not modeled — only CP_RB_RPTR (0x01C4) is`);
+    }
+
     initializeRingBuffer(ptr, sizeLog2) { return this.ringBuffer.initializeRingBuffer(ptr, sizeLog2); }
     enableReadPointerWriteBack(ptr, blockSizeLog2) { return this.ringBuffer.enableReadPointerWriteBack(ptr, blockSizeLog2); }
 
@@ -105,7 +153,7 @@
     }
   }
 
-  const api = { XenonGpuHost };
+  const api = { XenonGpuHost, GPU_MMIO_BASE, GPU_MMIO_END };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.XenonGpuHostFactory = XenonGpuHost;
 })(typeof self !== 'undefined' ? self : globalThis);
