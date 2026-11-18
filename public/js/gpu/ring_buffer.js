@@ -152,17 +152,33 @@
       }
 
       // Gather the [readIndex, writeIndex) range, wrapping at the ring end.
+      // Contiguous runs are read with one readGuestMemory() call each (≤2 per
+      // drain) when the returned view is long enough — implementations handing
+      // back short (e.g. 4-byte) views fall back to per-dword reads.
       const words = new Uint32Array(deltaDwords);
       let pos = ((this.readIndex >>> 0) * 4) % this.sizeBytes;
       let ringWraps = 0;
       const baseLo = (this.base & ~GPU_BUS_MASK) >>> 0;
-      for (let i = 0; i < deltaDwords; i++) {
+      let i = 0;
+      let remaining = deltaDwords;
+      while (remaining > 0) {
+        const run = Math.min(remaining, (this.sizeBytes - pos) >>> 2);
         const addr = (baseLo | ((this.base + pos) & GPU_BUS_MASK)) >>> 0;
         const view = this.readGuestMemory(addr);
         if (!view) throw new XenosRingError(`GPU ring read out of bounds at 0x${addr.toString(16)}`);
-        words[i] = view.getUint32(0, false) >>> 0;
-        pos += 4;
-        if (pos >= this.sizeBytes) { pos -= this.sizeBytes; ringWraps++; }
+        if ((view.byteLength >>> 2) >= run) {
+          for (let j = 0; j < run; j++) words[i++] = view.getUint32(j * 4, false) >>> 0;
+        } else {
+          for (let j = 0; j < run; j++) {
+            const a = (baseLo | ((this.base + pos + j * 4) & GPU_BUS_MASK)) >>> 0;
+            const v = this.readGuestMemory(a);
+            if (!v) throw new XenosRingError(`GPU ring read out of bounds at 0x${a.toString(16)}`);
+            words[i++] = v.getUint32(0, false) >>> 0;
+          }
+        }
+        remaining -= run;
+        pos = 0;
+        if (remaining > 0) ringWraps++;
       }
 
       const stats = this.commandProcessor.executeCommandBuffer(words, { hostOrderWords: true });
