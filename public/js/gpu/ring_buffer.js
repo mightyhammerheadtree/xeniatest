@@ -35,8 +35,10 @@
  *
  * The flat 64 MiB JS arena cannot address the real GPU BAR (0x7FC8_xxxx), so
  * the doorbell is driven by the HLE exports (VdInitializeRingBuffer /
- * VdEnableRingBufferRPtrWriteBack) and by gpu_host.js — not by guest MMIO
- * writes. See docs/XENOS_GPU.md.
+ * VdEnableRingBufferRPtrWriteBack), by gpu_host.js, and — for guest code —
+ * through the GPU MMIO aperture at [0x00F02000, 0x00F03000) wired in the
+ * recompiler (byte offset = register × 4; CP_RB_WPTR = register 0x01C5).
+ * See docs/XENOS_GPU.md ("GPU MMIO aperture").
  */
 (function (global) {
   'use strict';

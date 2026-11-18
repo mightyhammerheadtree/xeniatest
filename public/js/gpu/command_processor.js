@@ -508,6 +508,11 @@
       }
 
       const majorModeExplicit = di.majorMode !== pm4().MAJOR_MODE.kImplicit || di.primType >= 0x10;
+      // Vertex fetch constants live in the register file (SHADER_CONSTANT_FETCH_BASE .. +192 dwords).
+      // Hand them to the backend so it can analyze the fetch shader and upload/bind vertex buffers —
+      // the draw path is the only consumer and this is the cheapest correct place to snapshot them.
+      const vertexFetchConstants = new Uint32Array(192);
+      for (let i = 0; i < 192; i++) vertexFetchConstants[i] = this.registers.read(SHADER_CONSTANT_FETCH_BASE + i) >>> 0;
       const draw = backendOrTrap(this.backend, 'draw', opcodeName);
       draw({
         primType: di.primType,
@@ -520,6 +525,7 @@
         indexLengthWords,
         vizQueryCondition,
         majorModeExplicit,
+        vertexFetchConstants,
       });
       this.stats.draws++;
       return end;

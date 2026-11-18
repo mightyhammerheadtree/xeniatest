@@ -33,6 +33,81 @@
     return g;
   }
 
+  function vertexFetch() {
+    const g = globalThis.XenonGpuVertexFetch;
+    if (!g) throw new XenosWebGpuError('vertex_fetch.js must be loaded before webgpu_backend.js');
+    return g;
+  }
+
+  // ---- vertex-fetch-aware placeholder (NOT translated Xenos microcode) -------------------
+  // Generated per-attribute WGSL for the bring-up pipeline so the *real* WebGPU vertex
+  // layout/binding path is exercised: the declared @location(N) parameters match the
+  // descriptors produced by buildGpuVertexBufferDescriptors(). Attribute 0 is passed
+  // through as position with no Xenos-specific transform — this draw proves the fetch
+  // path works (descriptors → upload → setVertexBuffer → GPU), nothing more.
+  function wgslTypeForFormat(format) {
+    switch (format) {
+      case 'float32': return 'f32';
+      case 'float32x2': return 'vec2<f32>';
+      case 'float32x3': return 'vec3<f32>';
+      case 'float32x4': return 'vec4<f32>';
+      case 'float16x2': return 'vec2<f16>';
+      case 'float16x4': return 'vec4<f16>';
+      case 'unorm16x2': case 'snorm16x2': return 'vec2<f32>';
+      case 'unorm8x4': case 'unorm16x4': case 'snorm8x4': case 'snorm16x4': case 'unorm10-10-10-2': return 'vec4<f32>';
+      case 'uint8x4': return 'vec4<u32>';
+      case 'sint8x4': return 'vec4<i32>';
+      case 'uint16x2': return 'vec2<u32>';
+      case 'sint16x2': return 'vec2<i32>';
+      case 'uint16x4': return 'vec4<u32>';
+      case 'sint16x4': return 'vec4<i32>';
+      case 'uint32': return 'u32';
+      case 'sint32': return 'i32';
+      case 'uint32x2': return 'vec2<u32>';
+      case 'sint32x2': return 'vec2<i32>';
+      case 'uint32x4': return 'vec4<u32>';
+      case 'sint32x4': return 'vec4<i32>';
+      default:
+        throw new XenosWebGpuError(`no WGSL type for vertex format '${format}' — refusing to emit a pipeline that cannot validate`);
+    }
+  }
+
+  function componentCountOf(wgslType) {
+    if (wgslType === 'f32' || wgslType === 'u32' || wgslType === 'i32') return 1;
+    if (wgslType.startsWith('vec2')) return 2;
+    if (wgslType.startsWith('vec3')) return 3;
+    if (wgslType.startsWith('vec4')) return 4;
+    throw new XenosWebGpuError(`unhandled WGSL type '${wgslType}'`);
+  }
+
+  /** Build the WGSL source for the fetch bring-up vertex shader. Attribute 0 → position. */
+  function buildFetchPlaceholderWGSL(descriptors) {
+    const attrs = [];
+    for (const d of descriptors) for (const a of d.attributes) attrs.push(a);
+    if (!attrs.length) throw new XenosWebGpuError('vertex fetch plan has no attributes — nothing to declare');
+    const needsF16 = attrs.some((a) => a.format.startsWith('float16'));
+    const params = attrs.map((a, i) => `@location(${a.shaderLocation}) a${i}: ${wgslTypeForFormat(a.format)}`).join(', ');
+    const t0 = wgslTypeForFormat(attrs[0].format);
+    const n0 = componentCountOf(t0);
+    const f32 = (expr) => (t0.includes('u32') || t0.includes('i32') || t0.includes('f16')) ? `f32(${expr})` : expr;
+    // vec4<f32> position from attribute 0 — component conversion via scalar constructors (valid WGSL for f32/u32/i32/f16 lanes).
+    let pos;
+    if (n0 === 1) pos = `vec4<f32>(${f32('a0')}, 0.0, 0.0, 1.0)`;
+    else if (n0 === 2) pos = `vec4<f32>(${f32('a0.x')}, ${f32('a0.y')}, 0.0, 1.0)`;
+    else if (n0 === 3) pos = `vec4<f32>(${f32('a0.x')}, ${f32('a0.y')}, ${f32('a0.z')}, 1.0)`;
+    else pos = t0 === 'vec4<f32>' ? 'a0' : `vec4<f32>(${f32('a0.x')}, ${f32('a0.y')}, ${f32('a0.z')}, ${f32('a0.w')})`;
+    return `${needsF16 ? 'enable f16;\n' : ''}// Bring-up placeholder — NOT translated Xenos microcode.
+// Attribute 0 passes through as position with no transform; the rest exist to make the
+// declared interface match the vertex layout. Only reachable with placeholderShader: true.
+@vertex fn vs_main(${params}) -> @builtin(position) vec4<f32> {
+  return ${pos};
+}
+@fragment fn fs_main() -> @location(0) vec4<f32> {
+  return vec4<f32>(1.0, 0.5, 0.0, 1.0);
+}
+`;
+  }
+
   const PLACEHOLDER_WGSL = `
 // Bring-up placeholder — NOT translated Xenos microcode.
 // A single full-canvas triangle in flat magenta, used only when the caller opts in.
@@ -74,7 +149,9 @@
       this.depthFormat = 'depth24plus';
       this.pipelineCache = new Map(); // key -> GPURenderPipeline
       this.placeholderPipeline = null;
-      this.uploads = { indexBuffers: 0, indexBytes: 0, frames: 0 };
+      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0 };
+      this.lastVertexFetch = null;    // set by prepareVertexFetch() (draw path) — descriptors + constants
+      this.lastFetchConstants = null;
       this.shaders = { vertex: null, pixel: null };
       this.lastFrame = null; // set by swap()
       this.counter = 0;
@@ -147,6 +224,102 @@
     }
 
     /**
+     * Analyze the loaded vertex shader + a snapshot of the fetch constants.
+     * Pure with respect to the GPU device — returns the plan the upload/draw
+     * steps consume. Loud (XenosFetchError) on anything WebGPU cannot represent.
+     * @param {{vertexShaderCode?: Uint32Array|number[], fetchConstants?: Uint32Array|number[]|((i:number)=>number)}} opts
+     */
+    prepareVertexFetch({ vertexShaderCode = null, fetchConstants = null } = {}) {
+      const code = vertexShaderCode ?? this.shaders.vertex?.code;
+      if (!code) throw new XenosWebGpuError('prepareVertexFetch: no vertex shader loaded (IM_LOAD/IM_LOAD_IMMEDIATE with shader type 0)');
+      const consts = fetchConstants ?? this.lastFetchConstants;
+      if (!consts) throw new XenosWebGpuError('prepareVertexFetch: no fetch constants — the draw packet must carry vertexFetchConstants (the command processor attaches them automatically)');
+      const VF = vertexFetch();
+      const readDword = typeof consts === 'function' ? consts : (i) => (consts[i] >>> 0);
+      const constants = VF.decodeVertexFetchConstants(readDword);
+      const analysis = VF.analyzeVertexShader(code);
+      const descriptors = VF.buildGpuVertexBufferDescriptors(analysis);
+      const bindings = descriptors.map((d) => {
+        const fc = constants[d.fetchConstant];
+        if (!fc) throw new XenosWebGpuError(`fetch constant ${d.fetchConstant} out of range`);
+        if (fc.type !== 3 /* FETCH_CONSTANT_TYPE.vertex */) {
+          throw new XenosWebGpuError(`fetch constant ${d.fetchConstant} is type ${fc.typeName} — expected vertex; refusing to guess how to bind it`);
+        }
+        if (fc.sizeWords === 0) throw new XenosWebGpuError(`fetch constant ${d.fetchConstant} has size 0 — nothing to upload`);
+        return { ...d, constant: fc, byteSize: fc.sizeWords * 4 };
+      });
+      const plan = { descriptors: bindings, analysis, constants, buffers: null };
+      this.lastVertexFetch = plan;
+      this.lastFetchConstants = consts;
+      return plan;
+    }
+
+    /**
+     * Upload the vertex buffers of a fetch plan (default: the last one) into
+     * GPUBuffers, applying each fetch constant's GpuSwap endianness to the
+     * big-endian guest dwords (same scheme as uploadIndexBuffer; endian==kNone
+     * passes the BE words through, which is what a dword-aligned BE arena needs
+     * for integer-read data).
+     */
+    uploadVertexBuffers(plan = null) {
+      if (!this.device) throw new XenosWebGpuError('uploadVertexBuffers before attach()');
+      const p = plan ?? this.lastVertexFetch;
+      if (!p) throw new XenosWebGpuError('uploadVertexBuffers: no fetch plan — call prepareVertexFetch() first');
+      if (typeof GPUBufferUsage === 'undefined') throw new XenosWebGpuError('uploadVertexBuffers: GPUBufferUsage is not defined in this environment');
+      const gpuSwap32 = pm4().gpuSwap32;
+      const buffers = [];
+      for (const b of p.descriptors) {
+        const base = b.constant.baseAddress >>> 0;
+        const view = this.readGuestMemory(base);
+        if (!view) throw new XenosWebGpuError(`vertex buffer (fetch constant ${b.fetchConstant}) at guest physical 0x${base.toString(16)} is not mapped`);
+        const total = b.byteSize;
+        const src = view instanceof Uint8Array ? view : new Uint8Array(view.buffer, view.byteOffset ?? 0, view.byteLength ?? view.buffer.byteLength);
+        const paddedTotal = Math.ceil(total / 4) * 4;
+        const raw = new Uint8Array(paddedTotal);
+        raw.set(src.subarray(0, Math.min(total, src.length)));
+        const out = new Uint8Array(paddedTotal);
+        {
+          const dvw = new DataView(raw.buffer), dvo = new DataView(out.buffer);
+          for (let i = 0; i < paddedTotal; i += 4) dvo.setUint32(i, gpuSwap32(dvw.getUint32(i, false), b.constant.endian | 0), true);
+        }
+        const buffer = this.device.createBuffer({
+          size: paddedTotal,
+          usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+          label: `xenos-vertex-${b.fetchConstant}`,
+        });
+        this.device.queue.writeBuffer(buffer, 0, out);
+        this.uploads.vertexBuffers++;
+        this.uploads.vertexBytes += total;
+        buffers.push({ bindingIndex: b.bindingIndex, fetchConstant: b.fetchConstant, buffer, arrayStride: b.arrayStride, attributes: b.attributes });
+      }
+      p.buffers = buffers;
+      return buffers;
+    }
+
+    /** Placeholder pipeline whose vertex stage consumes the plan's attributes (fetch bring-up). */
+    _getFetchPlaceholderPipeline(descriptors) {
+      const key = 'fetch:' + JSON.stringify(descriptors.map((d) => [d.arrayStride, d.attributes])) + ':' + this.format;
+      let p = this.pipelineCache.get(key);
+      if (p) return p;
+      const wgsl = buildFetchPlaceholderWGSL(descriptors);
+      const module = this.device.createShaderModule({ code: wgsl, label: 'fetch-placeholder' });
+      const vertexBuffers = descriptors.map((d) => ({
+        arrayStride: d.arrayStride,
+        stepMode: d.stepMode ?? 'vertex',
+        attributes: d.attributes.map((a) => ({ shaderLocation: a.shaderLocation, offset: a.offset, format: a.format })),
+      }));
+      p = this.device.createRenderPipeline({
+        label: 'xenos-placeholder-fetch',
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
+        fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      this.pipelineCache.set(key, p);
+      return p;
+    }
+
+    /**
      * Upload an index buffer from guest memory into a GPUBuffer.
      * Real, tested code path — but note the guest index endianness (swap_mode)
      * must be applied by the time we get here or by the shader; Xenos indices
@@ -200,7 +373,38 @@
           'see docs/XENOS_GPU.md ("Bring-up order"). Pass { placeholderShader: true } to attach() to render the bring-up triangle instead.'
         );
       }
-      // --- clearly-labelled bring-up path: renders a full-canvas placeholder triangle -------------
+      // --- clearly-labelled bring-up path ---------------------------------------------------------
+      // When a vertex shader is loaded AND the draw carries fetch constants (the command
+      // processor attaches them), the bring-up goes through the REAL vertex fetch path:
+      // analyze → descriptors → upload → setVertexBuffer → generated placeholder pipeline.
+      // Any failure there is loud (never falls back to a fabricated frame). Without a
+      // vertex shader we cannot fetch anything — the full-canvas triangle remains.
+      const fetchReady = !!(this.shaders.vertex && params.vertexFetchConstants);
+      if (fetchReady) {
+        const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
+        const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
+        const colorView = this.context.getCurrentTexture().createView();
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+        });
+        if (plan.descriptors.length > 0) {
+          const buffers = this.uploadVertexBuffers(plan);
+          pass.setPipeline(this._getFetchPlaceholderPipeline(plan.descriptors));
+          for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
+          this._setIndexBufferAndDraw(pass, params);
+        } else {
+          // VS loaded but it fetches nothing — draw the full-canvas placeholder (documented).
+          this.log('info', 'draw: vertex shader fetches nothing — issuing the plain bring-up triangle');
+          pass.setPipeline(this._getPlaceholderPipeline());
+          pass.draw(3);
+        }
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+        return;
+      }
+      if (this.shaders.vertex) {
+        this.log('warn', 'draw: vertex shader loaded but the packet carried no fetch constants — bypassing the fetch path (full-canvas placeholder)');
+      }
       const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
       const colorView = this.context.getCurrentTexture().createView();
       const pass = encoder.beginRenderPass({
@@ -211,6 +415,22 @@
       pass.end();
       this.device.queue.submit([encoder.finish()]);
       return;
+    }
+
+    /** Bind the index buffer (if any) and issue the draw, from a fetch-planned pass. */
+    _setIndexBufferAndDraw(pass, params) {
+      if (params.isIndexed) {
+        const ib = this.uploadIndexBuffer({
+          indexGuestBase: params.indexGuestBase,
+          numIndices: params.numIndices,
+          indexFormat: params.indexFormat,
+          indexEndianness: params.indexEndianness,
+        });
+        pass.setIndexBuffer(ib, params.indexFormat === 1 ? 'uint32' : 'uint16');
+        pass.drawIndexed(params.numIndices, 1, 0, 0, 0);
+        return;
+      }
+      pass.draw(params.numIndices);
     }
 
     /** Frame boundary from PM4_XE_SWAP — xenia uses this to trigger present/swap on the host. */

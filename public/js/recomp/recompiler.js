@@ -19,6 +19,12 @@
  * MMIO console window [0x00F00000, 0x00F01000) and the exit door at
  * 0x00F00FFC are routed to host imports (xenorecomp.mmio_store / mmio_load),
  * identical in behavior to the guest's architectural semantics.
+ * A second window, the GPU register aperture [0x00F02000, 0x00F03000), routes
+ * guest loads/stores to the GPU host (xenorecomp.gpu_mmio_store / gpu_mmio_load):
+ * byte offset = register × 4 from the window base. CP_RB_WPTR (register 0x01C5)
+ * is the doorbell. The flat 64 MiB arena cannot hold the real GPU BAR
+ * (0x7FC8_xxxx), so the aperture is the same homebrew convention the console
+ * MMIO uses; a retail guest's BAR accesses need remapping onto it (HLE).
  */
 import { decodeInstruction } from './ppc_decode.js';
 import { WasmBuilder, Ops, sleb, uleb } from './wasm_emitter.js';
@@ -32,6 +38,8 @@ export const GUEST_MEM_MASK = 0x03ffffff; // 64 MiB flat arena
 export const GUEST_MEM_SIZE = 64 * 1024 * 1024;
 export const MMIO_BASE = 0x00f00000;
 export const MMIO_END = 0x00f01000;
+export const GPU_MMIO_BASE = 0x00f02000;
+export const GPU_MMIO_END = 0x00f03000;
 
 const HLE_CTX_ADDR = 0x00F11000; // scratch area: r0..r31 as 32 × u64 BE (read by the HLE host)
 
@@ -279,6 +287,8 @@ class Lifter {
     this.imICALL = this.b.addImport('xenorecomp', 'icall', this.tyI64);
     this.imMMIO_STORE = this.b.addImport('xenorecomp', 'mmio_store', this.tyI64I64I32);
     this.imMMIO_LOAD = this.b.addImport('xenorecomp', 'mmio_load', this.b.addType([0x7e, 0x7f], [0x7e]));
+    this.imGPU_MMIO_STORE = this.b.addImport('xenorecomp', 'gpu_mmio_store', this.tyI64I64I32);
+    this.imGPU_MMIO_LOAD = this.b.addImport('xenorecomp', 'gpu_mmio_load', this.b.addType([0x7e, 0x7f], [0x7e]));
     this.imSC = this.b.addImport('xenorecomp', 'sc', this.tyI64);
     // Local helper (function index 7, right after the imports): writes r0..r31
     // big-endian into HLE_CTX_ADDR for the HLE host. Body is spliced in at build time.
@@ -599,6 +609,12 @@ Object.assign(FragmentCompiler.prototype, {
       O.local_get(L_T64), O.i64_const(BigInt(MMIO_END)), O.i64_lt_u, O.i32_and,
     ];
   },
+  gpuMmioAddrCheck() { // stack i32 (1 if addr in the GPU register aperture) — uses L_T64
+    return [
+      O.local_get(L_T64), O.i64_const(BigInt(GPU_MMIO_BASE)), O.i64_ge_u,
+      O.local_get(L_T64), O.i64_const(BigInt(GPU_MMIO_END)), O.i64_lt_u, O.i32_and,
+    ];
+  },
   emitLoad(insn, signed, size, dest) {
     const L = this.lifter;
     const ea = (insn.RB !== undefined ? this.eaX(insn) : this.eaD(insn));
@@ -610,12 +626,16 @@ Object.assign(FragmentCompiler.prototype, {
     out.push(...this.mmioAddrCheck(), ...O.if_(0x7e));
     out.push(...O.local_get(L_T64), ...O.i32_const(size), ...O.call(L.imMMIO_LOAD));
     out.push(O.else);
+    out.push(...this.gpuMmioAddrCheck(), ...O.if_(0x7e));
+    out.push(...O.local_get(L_T64), ...O.i32_const(size), ...O.call(L.imGPU_MMIO_LOAD));
+    out.push(O.else);
     out.push(...O.local_get(L_T64), ...L.addrMem());
     if (size === 1) out.push(...O.i32_load8_u(0, 0), O.i64_extend_i32_u);
     else if (size === 2) out.push(...O.i32_load16_u(0, 0), ...O.local_set(L_T32), ...this.bswap16Seq(), O.local_get(L_T32), O.i64_extend_i32_u);
     else if (size === 4) out.push(...O.i32_load(0, 0), ...O.local_set(L_T32), ...this.bswap32Seq(), O.local_get(L_T32), O.i64_extend_i32_u);
     else out.push(...O.i64_load(0, 0), ...O.local_set(L_T64), ...this.bswap64Seq(), O.local_get(L_T64)); // value must land in L_T64 for bswap64Seq — bswap64(ea) is never a load result
-    out.push(O.end);
+    out.push(O.end); // flat-memory else
+    out.push(O.end); // gpu-aperture else
     // single, uniform extension
     if (size === 2 && signed === 's16') out.push(O.i32_wrap_i64, O.i32_extend16_s, O.i64_extend_i32_s);
     else if (size === 2) out.push(O.i32_wrap_i64, O.i32_const(0xffff), O.i32_and, O.i64_extend_i32_u);
@@ -641,6 +661,10 @@ Object.assign(FragmentCompiler.prototype, {
     out.push(...O.if_(T_VOID));
     out.push(...O.local_get(L_T64), ...O.local_get(L_T64B), ...O.i32_const(size), ...O.call(L.imMMIO_STORE));
     out.push(O.else);
+    out.push(...this.gpuMmioAddrCheck());
+    out.push(...O.if_(T_VOID));
+    out.push(...O.local_get(L_T64), ...O.local_get(L_T64B), ...O.i32_const(size), ...O.call(L.imGPU_MMIO_STORE));
+    out.push(O.else);
     out.push(...O.local_get(L_T64), ...L.addrMem());
     if (size === 1) {
       out.push(...O.local_get(L_T64B), O.i32_wrap_i64, ...O.i32_store8(0, 0));
@@ -651,7 +675,8 @@ Object.assign(FragmentCompiler.prototype, {
     } else {
       out.push(...O.local_get(L_T64B), O.local_set(L_T64), ...this.bswap64Seq(), O.local_get(L_T64), ...O.i64_store(0, 0));
     }
-    out.push(O.end);
+    out.push(O.end); // flat-memory else
+    out.push(O.end); // gpu-aperture else
     return out;
   },
 });
@@ -1182,13 +1207,17 @@ Object.assign(FragmentCompiler.prototype, {
     out.push(...this.mmioAddrCheck(), ...O.if_(0x7e));
     out.push(...O.local_get(L_T64), ...O.i32_const(size), ...O.call(this.lifter.imMMIO_LOAD));
     out.push(O.else);
+    out.push(...this.gpuMmioAddrCheck(), ...O.if_(0x7e));
+    out.push(...O.local_get(L_T64), ...O.i32_const(size), ...O.call(this.lifter.imGPU_MMIO_LOAD));
+    out.push(O.else);
     out.push(...O.local_get(L_T64), ...this.lifter.addrMem());
     if (size === 8) {
       out.push(...O.i64_load(0, 0), ...O.local_set(L_T64), ...this.bswap64Seq(), O.local_get(L_T64)); // value in L_T64 for bswap64Seq
     } else {
       out.push(...O.i32_load(0, 0), ...O.local_set(L_T32), ...this.bswap32Seq(), O.local_get(L_T32), O.i64_extend_i32_u);
     }
-    out.push(O.end);
+    out.push(O.end); // flat-memory else
+    out.push(O.end); // gpu-aperture else
     if (size === 8) out.push(O.f64_reinterpret_i64);
     else { out.push(O.i32_wrap_i64, O.f32_reinterpret_i32, O.f64_promote_f32); }
     out.push(...O.global_set(32 + FRET));
@@ -1207,13 +1236,17 @@ Object.assign(FragmentCompiler.prototype, {
     out.push(...this.mmioAddrCheck(), ...O.if_(T_VOID));
     out.push(...O.local_get(L_T64), ...O.local_get(L_T64B), ...O.i32_const(size), ...O.call(this.lifter.imMMIO_STORE));
     out.push(O.else);
+    out.push(...this.gpuMmioAddrCheck(), ...O.if_(T_VOID));
+    out.push(...O.local_get(L_T64), ...O.local_get(L_T64B), ...O.i32_const(size), ...O.call(this.lifter.imGPU_MMIO_STORE));
+    out.push(O.else);
     out.push(...O.local_get(L_T64), ...this.lifter.addrMem());
     if (size === 8) {
       out.push(...O.local_get(L_T64B), ...O.local_set(L_T64), ...this.bswap64Seq(), O.local_get(L_T64), ...O.i64_store(0, 0));
     } else {
       out.push(...O.local_get(L_T64B), O.i32_wrap_i64, ...O.i32_store(0, 0));
     }
-    out.push(O.end);
+    out.push(O.end); // flat-memory else
+    out.push(O.end); // gpu-aperture else
     return out;
   },
 });
@@ -1323,6 +1356,18 @@ export function makeImports({ onConsoleByte, onSc, onLog } = {}) {
         if (a <= 0x00f00ffc && 0x00f00ffc < a + sizeBytes) throw new RecompExit(0);
       },
       mmio_load(addr, size) { return 0n; },
+      gpu_mmio_store(addr, value, size) {
+        const a = Number(BigInt(addr) & 0x03ffffffn);
+        const host = globalThis.XenonGpuHost;
+        if (host && typeof host.mmioStore === 'function') return host.mmioStore(a, BigInt(value ?? 0n), size | 0);
+        throw new Error(`GPU MMIO store at 0x${a.toString(16)} (register 0x${(((a - 0x00f02000) >>> 0) / 4).toString(16).padStart(4, '0')}) but no GPU host is attached — attach public/js/gpu/gpu_host.js (it sets globalThis.XenonGpuHost)`);
+      },
+      gpu_mmio_load(addr, size) {
+        const a = Number(BigInt(addr) & 0x03ffffffn);
+        const host = globalThis.XenonGpuHost;
+        if (host && typeof host.mmioLoad === 'function') return BigInt(host.mmioLoad(a, size | 0));
+        throw new Error(`GPU MMIO load at 0x${a.toString(16)} (register 0x${(((a - 0x00f02000) >>> 0) / 4).toString(16).padStart(4, '0')}) but no GPU host is attached — attach public/js/gpu/gpu_host.js (it sets globalThis.XenonGpuHost)`);
+      },
       sc(addr) { if (onSc) onSc(Number(BigInt(addr) & 0x03ffffffn)); },
     },
   };

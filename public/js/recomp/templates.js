@@ -135,6 +135,18 @@ const RUNTIME_JS = `/* Generated host for the recompiled guest. Classic script �
         if (a <= DOOR && DOOR < a + n) throw new RecompExit(0);
       },
       mmio_load: function () { return 0n; },
+      gpu_mmio_store: function (addr, value, size) {
+        var a = Number(addr), host = (typeof window !== 'undefined' ? window.XenonGpuHost : undefined);
+        var reg = ((a - 0x00f02000) >>> 2).toString(16);
+        if (host && typeof host.mmioStore === 'function') return host.mmioStore(a, BigInt(value), size | 0);
+        throw new Error('GPU MMIO store at 0x' + a.toString(16) + ' (register 0x' + reg + ') but no GPU host is attached — this export does not ship the GPU modules yet (see docs/XENOS_GPU.md)');
+      },
+      gpu_mmio_load: function (addr, size) {
+        var a = Number(addr), host = (typeof window !== 'undefined' ? window.XenonGpuHost : undefined);
+        var reg = ((a - 0x00f02000) >>> 2).toString(16);
+        if (host && typeof host.mmioLoad === 'function') return BigInt(host.mmioLoad(a, size | 0));
+        throw new Error('GPU MMIO load at 0x' + a.toString(16) + ' (register 0x' + reg + ') but no GPU host is attached — this export does not ship the GPU modules yet (see docs/XENOS_GPU.md)');
+      },
       sc: function (addr) { throw new Error('system call (sc) reached — the HLE runtime does not model raw sc yet; unimplemented kernel imports trap by name, see docs/HLE.md'); }
     }
   };
@@ -224,6 +236,18 @@ const imports = {
       if (a <= DOOR && DOOR < a + n) throw new RecompExit(0);
     },
     mmio_load: () => 0n,
+    gpu_mmio_store: (addr, value, size) => {
+      const a = Number(addr), host = globalThis.XenonGpuHost;
+      const reg = ((a - 0x00f02000) >>> 2).toString(16);
+      if (host && typeof host.mmioStore === 'function') return host.mmioStore(a, BigInt(value), size | 0);
+      throw new Error('GPU MMIO store at 0x' + a.toString(16) + ' (register 0x' + reg + ') but no GPU host is attached — this export does not ship the GPU modules yet (see docs/XENOS_GPU.md)');
+    },
+    gpu_mmio_load: (addr, size) => {
+      const a = Number(addr), host = globalThis.XenonGpuHost;
+      const reg = ((a - 0x00f02000) >>> 2).toString(16);
+      if (host && typeof host.mmioLoad === 'function') return BigInt(host.mmioLoad(a, size | 0));
+      throw new Error('GPU MMIO load at 0x' + a.toString(16) + ' (register 0x' + reg + ') but no GPU host is attached — this export does not ship the GPU modules yet (see docs/XENOS_GPU.md)');
+    },
     sc: () => { throw new Error('system call (sc) reached — the HLE runtime does not model raw sc yet; unimplemented kernel imports trap by name, see docs/HLE.md'); },
   },
 };
