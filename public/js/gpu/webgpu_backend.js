@@ -80,6 +80,19 @@
     throw new XenosWebGpuError(`unhandled WGSL type '${wgslType}'`);
   }
 
+  /** FNV-1a 32-bit over decoded u32 words — cheap identity check for fetch-constant snapshots. */
+  function fnv1a32Words(words) {
+    let h = 0x811c9dc5 >>> 0;
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i] >>> 0;
+      h ^= w & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+      h ^= (w >>> 8) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+      h ^= (w >>> 16) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+      h ^= (w >>> 24) & 0xff; h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h >>> 0;
+  }
+
   /** FNV-1a 32-bit content hash — identifies uploaded buffer contents (guest memory rewrites same address). */
   function fnv1a32(bytes) {
     let h = 0x811c9dc5 >>> 0;
@@ -167,6 +180,10 @@
       this.gpuBufferCacheLimit = 32;
       this.gpuBufferCacheBytesLimit = 128 * 1024 * 1024;
       this.gpuBufferCacheBytes = 0;
+      // Per-shader single-entry plan memo: WeakMap<code, { hash, plan }> — the analysis
+      // (ucode walk + descriptor build) and constant decode are deterministic in
+      // (code, fetch-constant snapshot); re-running them per draw is waste.
+      this.planMemo = new WeakMap();
       this.shaders = { vertex: null, pixel: null };
       this.lastFrame = null; // set by swap()
       this.counter = 0;
@@ -236,6 +253,7 @@
       if (vertex) this.shaders.vertex = vertex;
       if (pixel) this.shaders.pixel = pixel;
       this.pipelineCache.clear(); // microcode changed — pipelines are keyed on shader content, so drop everything
+      this.planMemo = new WeakMap();
     }
 
     /**
@@ -291,6 +309,15 @@
       if (!code) throw new XenosWebGpuError('prepareVertexFetch: no vertex shader loaded (IM_LOAD/IM_LOAD_IMMEDIATE with shader type 0)');
       const consts = fetchConstants ?? this.lastFetchConstants;
       if (!consts) throw new XenosWebGpuError('prepareVertexFetch: no fetch constants — the draw packet must carry vertexFetchConstants (the command processor attaches them automatically)');
+      const memoizable = typeof consts !== 'function' && consts.length === 192;
+      const constHash = memoizable ? fnv1a32Words(consts) : -1;
+      if (memoizable) {
+        const memo = this.planMemo.get(code);
+        if (memo && memo.hash === constHash) {
+          this.lastFetchConstants = consts;
+          return memo.plan; // descriptors/analysis unchanged — refresh the constants reference only
+        }
+      }
       const VF = vertexFetch();
       const readDword = typeof consts === 'function' ? consts : (i) => (consts[i] >>> 0);
       const constants = VF.decodeVertexFetchConstants(readDword);
@@ -305,7 +332,8 @@
         if (fc.sizeWords === 0) throw new XenosWebGpuError(`fetch constant ${d.fetchConstant} has size 0 — nothing to upload`);
         return { ...d, constant: fc, byteSize: fc.sizeWords * 4 };
       });
-      const plan = { descriptors: bindings, analysis, constants, buffers: null };
+      const plan = { descriptors: bindings, analysis, constants, buffers: null, _pipeline: null };
+      if (memoizable) this.planMemo.set(code, { hash: constHash, plan });
       this.lastVertexFetch = plan;
       this.lastFetchConstants = consts;
       return plan;
@@ -453,7 +481,7 @@
         });
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
-          pass.setPipeline(this._getFetchPlaceholderPipeline(plan.descriptors));
+          pass.setPipeline((plan._pipeline ??= this._getFetchPlaceholderPipeline(plan.descriptors)));
           for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
           this._setIndexBufferAndDraw(pass, params);
         } else {

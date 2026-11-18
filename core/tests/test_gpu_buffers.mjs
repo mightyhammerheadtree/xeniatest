@@ -188,3 +188,29 @@ test('ring drain executes wraparound splits across two readGuestMemory runs', ()
   assert.equal(result.ringWraps, 1);
   assert.equal(ring.getReadIndex(), 33);
 });
+
+test('prepareVertexFetch memoizes on (code, fetch-constant snapshot); constant change recomputes', () => {
+  const guest = makeGuest();
+  const { backend } = makeBackend(guest);
+  const p1 = backend.prepareVertexFetch({ fetchConstants: FETCH_CONSTS });
+  const p2 = backend.prepareVertexFetch({ fetchConstants: FETCH_CONSTS });
+  assert.equal(p1, p2, 'same inputs → same plan object (memoized)');
+  const consts = new Uint32Array(192);
+  consts[0] = (VB_BASE & 0x1FFFFFFC) | 3;
+  consts[1] = (8 << 2); // one dword smaller
+  const p3 = backend.prepareVertexFetch({ fetchConstants: consts });
+  assert.notEqual(p3, p1, 'fetch constants changed → fresh plan');
+});
+
+test('plan memo is per shader code object; setShaders drops the memo', () => {
+  const guest = makeGuest();
+  const { backend } = makeBackend(guest);
+  const p1 = backend.prepareVertexFetch({ fetchConstants: FETCH_CONSTS });
+  const code2 = Uint32Array.from(FETCH_VS); // identical content, different object
+  backend.shaders.vertex = { kind: 'vertex', code: code2, dwords: code2.length };
+  const p2 = backend.prepareVertexFetch({ vertexShaderCode: code2 });
+  assert.notEqual(p1, p2, 'new code object → fresh analysis');
+  backend.setShaders({ vertex: { kind: 'vertex', code: code2, dwords: code2.length } });
+  const p3 = backend.prepareVertexFetch({ vertexShaderCode: code2 });
+  assert.notEqual(p2, p3, 'setShaders dropped the memo');
+});
