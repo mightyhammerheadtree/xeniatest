@@ -46,7 +46,7 @@
     return {
       readGuestMemory(addr) {
         const a = Number(BigInt(addr) & 0x03ffffffn) >>> 0;
-        return new DataView(memory.buffer, a, Math.min(4, memory.buffer.byteLength - a));
+        return new DataView(memory.buffer, a, memory.buffer.byteLength - a); // full-length view — callers bulk-read, no per-dword allocation
       },
       writeGuestMemory(addr, arr) {
         const a = Number(BigInt(addr) & 0x03ffffffn) >>> 0;

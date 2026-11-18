@@ -49,6 +49,7 @@ Reality constraints:
 - ✅ Ring buffer: host-side ring (`VdInitializeRingBuffer` / writeback / CP_RB_WPTR doorbell, wraparound + overrun trap) wired to the HLE Vd* exports and an in-page `XenonGpuHost`; end-to-end tested.
 - ✅ Vertex fetch decode: `FETCH_*` constants, ucode walker, `GPUVertexFormat` mapping, `GPUVertexBufferLayout` descriptors — formats WebGPU can't represent trap.
 - ✅ Vertex buffer binding on the fetch bring-up path (behind `{ placeholderShader: true }`, per draw, no caching): CP snapshots 192 fetch constants → `prepareVertexFetch()` (decode → analyze → descriptors) → `uploadVertexBuffers()` (GpuSwap32 BE→LE, VERTEX|COPY_DST) → fetch placeholder pipeline + `setVertexBuffer` + indexed-draw support.
+- ✅ Performance pass on the bring-up paths (content-addressed vertex/index buffer cache with LRU + byte cap; contiguous-run ring drain — ~3–4× faster on micro-benchmarks; allocation-free register writes by default). See `tools/bench_gpu_hot_paths.mjs`.
 - ✅ GPU MMIO aperture in the recompiler (`[0x00F02000, 0x00F03000)`, byte offset = register × 4; CP_RB_WPTR drains the ring, CP_RB_RPTR reads back the read pointer, everything else traps) — recompiled guests can ring the doorbell end-to-end. Still needed for real titles: remap the retail GPU BAR onto the aperture (HLE), shader HIR → WGSL (replaces the placeholder gate); render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
 
 ### M5 — Audio & input

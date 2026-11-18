@@ -40,7 +40,7 @@
         this.values[info.index] = value >>> 0;
       }
       this.resetDefaults = new Map(Object.entries(g.XENOS_GPU_RESET_DEFAULTS).map(([n, v]) => [registers().XENOS_GPU_REGISTER_BY_NAME.get(n).index, v >>> 0]));
-      this.writeLog = []; // { index, value } — appended in order; consumers drain via takeWriteLog()
+      this.writeLog = null; // null = not recording (hot path is allocation-free); enableWriteLog() turns it on
       this.writeCount = 0;
     }
 
@@ -73,14 +73,21 @@
         throw new RangeError(`register index 0x${idx.toString(16)} out of the 0x${this.values.length.toString(16)}-entry file`);
       }
       this.values[idx] = value >>> 0;
-      this.writeLog.push({ index: idx, value: value >>> 0 });
       this.writeCount++;
+      if (this.writeLog !== null) this.writeLog.push({ index: idx, value: value >>> 0 });
     }
 
-    /** Drain and return the write log (register writes since the last drain). */
+    /** Start recording register writes (allocates the log). Recording stays on until takeWriteLog()/resetWriteLog() clear it or enableWriteLog(false). */
+    enableWriteLog(on = true) {
+      if (on) { if (this.writeLog === null) this.writeLog = []; return true; }
+      this.writeLog = null;
+      return false;
+    }
+
+    /** Drain and return the recorded writes since the last drain (empty array when recording was never enabled). */
     takeWriteLog() {
-      const log = this.writeLog;
-      this.writeLog = [];
+      const log = this.writeLog ?? [];
+      if (this.writeLog !== null) this.writeLog = [];
       return log;
     }
 
