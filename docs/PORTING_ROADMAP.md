@@ -48,7 +48,8 @@ Reality constraints:
 - ✅ WebGPU plumbing: adapter/device/canvas configuration, depth attachment, index-buffer upload (BE→swap→LE), present; bring-up triangle behind explicit `{ placeholderShader: true }` — never silently rendered.
 - ✅ Ring buffer: host-side ring (`VdInitializeRingBuffer` / writeback / CP_RB_WPTR doorbell, wraparound + overrun trap) wired to the HLE Vd* exports and an in-page `XenonGpuHost`; end-to-end tested.
 - ✅ Vertex fetch decode: `FETCH_*` constants, ucode walker, `GPUVertexFormat` mapping, `GPUVertexBufferLayout` descriptors — formats WebGPU can't represent trap.
-- ⬜ GPU MMIO aperture in the recompiler so real guests can ring the doorbell; shader HIR → WGSL (replaces the placeholder gate) + vertex buffer binding; render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
+- ✅ Vertex buffer binding on the fetch bring-up path (behind `{ placeholderShader: true }`, per draw, no caching): CP snapshots 192 fetch constants → `prepareVertexFetch()` (decode → analyze → descriptors) → `uploadVertexBuffers()` (GpuSwap32 BE→LE, VERTEX|COPY_DST) → fetch placeholder pipeline + `setVertexBuffer` + indexed-draw support.
+- ⬜ GPU MMIO aperture in the recompiler so real guests can ring the doorbell; shader HIR → WGSL (replaces the placeholder gate); render targets/tiling; textures. See [XENOS_GPU.md](XENOS_GPU.md) for the bring-up order.
 
 ### M5 — Audio & input
 - XMA decoding (ffmpeg→wasm drop-in or a clean decoder).
