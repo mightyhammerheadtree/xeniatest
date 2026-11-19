@@ -320,6 +320,18 @@ test('temp registers are allocated across written GPRs only', () => {
 
 // ---------------------------------------------------------------- scalar operators
 const scalarOpCases = [
+  [14, 'exp', /exp2\(r\[1\]\.w\)/],
+  [15, 'logc', /xenosLogc\(r\[1\]\.w\)/],
+  [16, 'log', /log2\(r\[1\]\.w\)/],
+  [17, 'rcpc', /xenosRcpc\(r\[1\]\.w\)/],
+  [18, 'rcpf', /xenosRcpf\(r\[1\]\.w\)/],
+  [19, 'rcp', /\(1\.0 \/ r\[1\]\.w\)/],
+  [20, 'rsqc', /xenosRsqc\(r\[1\]\.w\)/],
+  [21, 'rsqf', /xenosRsqf\(r\[1\]\.w\)/],
+  [22, 'rsq', /inverseSqrt\(r\[1\]\.w\)/],
+  [40, 'sqrt', /sqrt\(r\[1\]\.w\)/],
+  [48, 'sin', /sin\(r\[1\]\.w\)/],
+  [49, 'cos', /cos\(r\[1\]\.w\)/],
   [0, 'adds', /\(r\[1\]\.w \+ r\[1\]\.x\)/],
   [1, 'adds_prev', /\(r\[1\]\.w \+ ps\)/],
   [2, 'muls', /\(r\[1\]\.w \* r\[1\]\.x\)/],
@@ -598,8 +610,8 @@ test('trap: maxas/maxasf scalar ops (a0 write) are rejected loudly', () => {
   }
 });
 
-test('trap: transcendental math (rcp/sin/cos/exp/log/sqrt/rsq) is rejected loudly', () => {
-  for (const opcode of [14, 15, 16, 17, 18, 19, 20, 21, 22, 40, 48, 49]) {
+test('trap: still-unsupported scalar ops (muls_prev2, maxas/maxasf, mulsc/addsc/subsc) are rejected loudly', () => {
+  for (const opcode of [4, 23, 24, 42, 43, 44, 45, 46, 47]) {
     assert.throws(
       () => T.translateVertexShader(shader(
         cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
@@ -994,9 +1006,9 @@ test('pixel shader: unsupported opcodes trap exactly as in the VS (cube, transce
   )), /cube/);
   assert.throws(() => T.translatePixelShader(shader(
     cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
-    aluWords({ scalarOpcode: 40 /* sqrt */, vectorWriteMask: 0, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ scalarOpcode: 23 /* maxas */, vectorWriteMask: 0, src: [temp(1), temp(1), temp(1)] }),
     aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
-  )), /sqrt/);
+  )), /maxas/);
 });
 
 test('translateShaderProgram: no pixel shader → fragment is null, bindings match the plain VS', () => {
@@ -1070,4 +1082,308 @@ test('checkProgramLinks reports the exact diagnostic when the FS declares an unl
     attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }],
   }]);
   assert.match(err, /fragment input at location 9|corresponding vertex output/i);
+});
+
+// ================================================================ alpha test
+// RB_COLORCONTROL.alpha_test_enable + alpha_func (CompareFunction, same 3-bit
+// numbering as zfunc). The reference is NOT baked into the shader — it arrives
+// as a small uniform (IEEE-754 bits at bindings.alphaTest) the backend binds.
+
+test('pixel shader: alpha test emits the discard + uniform, and Dawn accepts it', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { alphaTest: { compare: 3 } }); // kLessEqual, PS also reads fc
+  assert.equal(out.type, 'pixel');
+  assert.match(out.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.match(out.wgsl, /@group\(0\) @binding\(1\) var<uniform> alphaTest: vec4f;/, 'fc occupies 0 — the alpha test takes the next free binding');
+  assert.match(out.wgsl, /fn alphaTestPass\(x: f32\) -> bool \{ return x <= alphaTest\.x; \}/);
+  assert.match(out.wgsl, /if \(!alphaTestPass\(out\.color0\.w\)\) \{ discard; \}\n  return out;/);
+  assert.deepEqual(out.alphaTest, { compare: 3, binding: 1 });
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: alpha test reuses the merged layout — fc + bools + alphaTest get distinct bindings', async () => {
+  // VS uses fc+bools; PS uses fc; alpha test for the pair → alphaTest takes binding 2.
+  const VS_FC_BOOL = shader(
+    cfPair(condExecCf(1, 2, seq(SEQ_FETCH, SEQ_ALU), 3, 1), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ isExport: 1, vectorDest: 7, vectorOpcode: 0, src: [temp(1), konst(0), temp(1)] }),
+  );
+  const program = T.translateShaderProgram(VS_FC_BOOL, PS_CONST(), { alphaTest: { compare: 1 } }); // kLess
+  assert.match(program.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.match(program.fragment.wgsl, /@group\(0\) @binding\(2\) var<uniform> alphaTest/);
+  assert.doesNotMatch(program.fragment.wgsl, /var<uniform> bools/);
+  assert.equal(program.alphaTest.compare, 1);
+  assert.equal(program.alphaTest.binding, 2);
+  await assertValidWgsl(program.fragment.wgsl);
+  const ok = await checkProgramLinks(program.vertex.wgsl, program.fragment.wgsl,
+    [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] }]);
+  assert.equal(ok, null);
+});
+
+test('pixel shader: alpha test without fc/bools binds alphaTest at 0; bools present → at 1', async () => {
+  const p1 = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { alphaTest: { compare: 6 } }); // kGreaterEqual
+  assert.match(p1.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> alphaTest/);
+  assert.equal(p1.alphaTest.binding, 0);
+  await assertValidWgsl(p1.fragment.wgsl);
+
+  const PS_BOOL = shader( // PS uses bools only (fresh binding 0) + alphaTest (binding 1)
+    cfPair(condExecCf(1, 1, seq(SEQ_ALU), 5, 1), NOP_CF),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const p2 = T.translateShaderProgram(VS_EXPORT_7(), PS_BOOL, { alphaTest: { compare: 5 } }); // kNotEqual
+  assert.match(p2.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> bools/);
+  assert.match(p2.fragment.wgsl, /@group\(0\) @binding\(1\) var<uniform> alphaTest/);
+  assert.equal(p2.alphaTest.binding, 1);
+  await assertValidWgsl(p2.fragment.wgsl);
+});
+
+test('pixel shader: alpha test ignored when the PS does not statically export oC0 (xenia applies it only then)', () => {
+  const PS_DEAD = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }), // dead write, no exports
+  );
+  const out = T.translatePixelShader(PS_DEAD, { alphaTest: { compare: 2 } });
+  assert.equal(out.alphaTest, null);
+  assert.doesNotMatch(out.wgsl, /alphaTest|discard/);
+});
+
+test('pixel shader: kAlways (7) is treated as no test at the program level', () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { alphaTest: { compare: 7 } });
+  assert.equal(program.alphaTest, null);
+  assert.doesNotMatch(program.fragment.wgsl, /alphaTest|discard/);
+});
+
+test('pixel shader: compare 8 is rejected loudly', () => {
+  assert.throws(() => T.translateShaderProgram(VS_EXPORT_7(), PS_CONST(), { alphaTest: { compare: 8 } }), /CompareFunction/);
+});
+
+test('pixel shader: every Xenos CompareFunction maps to the operator with matching NaN semantics', async () => {
+  const expected = [
+    [0, 'return false;'],
+    [1, 'return x < alphaTest.x;'],
+    [2, 'return x == alphaTest.x;'],
+    [3, 'return x <= alphaTest.x;'],
+    [4, 'return x > alphaTest.x;'],
+    [5, 'return x != alphaTest.x;'],
+    [6, 'return x >= alphaTest.x;'],
+  ];
+  for (const [compare, expr] of expected) {
+    const out = T.translatePixelShader(PS_CONST(), { alphaTest: { compare } });
+    assert.ok(out.wgsl.includes(`fn alphaTestPass(x: f32) -> bool { ${expr} }`), `compare ${compare}`);
+    await assertValidWgsl(out.wgsl);
+  }
+});
+
+// ================================================================ gamma (PWL) encode
+// Xbox 360 RT format k_8_8_8_8_GAMMA: xenia gamma-encodes oC0's RGB lanes in
+// the pixel shader (PreSaturatedLinearToPWLGamma) — saturate, 3-piece
+// piecewise, trunc(x*scale)/255 + offset. Alpha untouched. Pure ALU.
+
+test('pixel shader: convertColor0ToGamma emits the PWL helper + rewritten export, Dawn-valid', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { convertColor0ToGamma: true });
+  assert.match(out.wgsl, /fn xenosGamma\(x: f32\) -> f32/);
+  assert.match(out.wgsl, /if \(x >= \(128\.0 \/ 1023\.0\)\)/);
+  assert.match(out.wgsl, /trunc\(x \* scale\) \* \(1\.0 \/ 255\.0\) \+ offset/);
+  assert.match(out.wgsl, /out\.color0 = vec4f\(xenosGamma\(clamp\(out\.color0\.x, 0\.0, 1\.0\)\), xenosGamma\(clamp\(out\.color0\.y, 0\.0, 1\.0\)\), xenosGamma\(clamp\(out\.color0\.z, 0\.0, 1\.0\)\), out\.color0\.w\);\n  return out;/);
+  assert.equal(out.convertColor0ToGamma, true);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: gamma encode leaves the alpha lane alone and still exports oC0', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { convertColor0ToGamma: true });
+  // alpha (w lane) is passed through, not encoded
+  assert.match(out.wgsl, /, out\.color0\.w\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: no gamma encode without the option; no encode without an oC0 export', async () => {
+  const plain = T.translatePixelShader(PS_CONST());
+  assert.equal(plain.convertColor0ToGamma, false);
+  assert.doesNotMatch(plain.wgsl, /xenosGamma/);
+  // dead-write PS: never exports oC0 → the option is ignored (nothing to encode)
+  const DEAD = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const dead = T.translatePixelShader(DEAD, { convertColor0ToGamma: true });
+  assert.equal(dead.convertColor0ToGamma, false);
+  assert.doesNotMatch(dead.wgsl, /xenosGamma/);
+});
+
+test('pixel shader: gamma encode composes with the alpha test (discard before encode)', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { convertColor0ToGamma: true, alphaTest: { compare: 1 } });
+  const discardIdx = out.wgsl.indexOf('discard');
+  const gammaIdx = out.wgsl.indexOf('out.color0 = vec4f(xenosGamma');
+  assert.ok(discardIdx >= 0 && gammaIdx > discardIdx, 'the alpha-test discard is emitted before the gamma encode');
+  await assertValidWgsl(out.wgsl);
+});
+
+test('translateShaderProgram: convertColor0ToGamma is part of the fragment output, VS untouched', async () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { convertColor0ToGamma: true });
+  assert.equal(program.convertColor0ToGamma, true);
+  assert.equal(program.fragment.convertColor0ToGamma, true);
+  assert.doesNotMatch(program.vertex.wgsl, /xenosGamma/);
+  await assertValidWgsl(program.vertex.wgsl);
+  await assertValidWgsl(program.fragment.wgsl);
+});
+
+// The 3 PWL segments, checked against xenia's formula at representative points:
+//   x < 64/1023            -> trunc(x * 1023)/255
+//   64/1023..128/1023      -> trunc(x * 1023/2)/255 + 32/255
+//   128/1023..512/1023     -> trunc(x * 1023/4)/255 + 64/255
+//   >= 512/1023            -> trunc(x * 1023/8)/255 + 128/255
+test('pixel shader: PWL segment math (validated as WGSL, values checked by hand)', () => {
+  // reference encode, mirrored from xenia's PreSaturatedLinearToPWLGamma
+  const pwl = (x) => {
+    let scale, offset;
+    if (x >= 128 / 1023) {
+      if (x >= 512 / 1023) { scale = 1023 / 8; offset = 128 / 255; } else { scale = 1023 / 4; offset = 64 / 255; }
+    } else {
+      if (x >= 64 / 1023) { scale = 1023 / 2; offset = 32 / 255; } else { scale = 1023; offset = 0; }
+    }
+    return (Math.trunc(x * scale) * (1 / 255)) + offset;
+  };
+  // boundary sanity: 0 → 0, 1 → 1 (255 untouched lanes), mid-segment exact truncations
+  assert.equal(pwl(0), 0);
+  assert.equal(pwl(1), 1);
+  assert.equal(pwl(64 / 1023), Math.trunc((64 / 1023) * (1023 / 2)) / 255 + 32 / 255);
+  assert.equal(pwl(512 / 1023), Math.trunc((512 / 1023) * (1023 / 8)) / 255 + 128 / 255);
+  assert.equal(pwl(0.5), Math.trunc(0.5 * (1023 / 4)) / 255 + 64 / 255);
+});
+
+// ================================================================ color_exp_bias (RB_COLOR_INFO bits 20-25, signed 6-bit)
+test('pixel shader: colorExpBias emits a full-register 2^bias multiply, after the discard, Dawn-valid', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { colorExpBias: 3 });
+  assert.match(out.wgsl, /out\.color0 = out\.color0 \* vec4f\(8\.0000000000e\+0\);/);
+  assert.equal(out.colorExpBias, 3);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: negative exponent produces 1/2^|bias|', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { colorExpBias: -2 });
+  assert.match(out.wgsl, /out\.color0 = out\.color0 \* vec4f\(2\.5000000000e\-1\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: bias 0 (default) emits nothing; |bias| is clamped to [-32, 31]', async () => {
+  const plain = T.translatePixelShader(PS_CONST());
+  assert.match(plain.wgsl, /vec4f\(/); // sanity that the module built
+  assert.doesNotMatch(plain.wgsl, /out\.color0 = out\.color0 \* vec4f\(/);
+  assert.equal(plain.colorExpBias, 0);
+  const clamped = T.translatePixelShader(PS_CONST(), { colorExpBias: 77 });
+  assert.equal(clamped.colorExpBias, 31);
+  await assertValidWgsl(clamped.wgsl);
+});
+
+test('pixel shader: bias runs AFTER the alpha-test discard (xenia order) and BEFORE gamma', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { colorExpBias: 2, alphaTest: { compare: 2 }, convertColor0ToGamma: true });
+  const discardIdx = out.wgsl.indexOf('discard');
+  const biasIdx = out.wgsl.indexOf('out.color0 = out.color0 * vec4f(');
+  const gammaIdx = out.wgsl.indexOf('vec4f(xenosGamma');
+  assert.ok(discardIdx >= 0 && biasIdx > discardIdx, 'bias multiply after discard');
+  assert.ok(gammaIdx > biasIdx, 'gamma encode after bias multiply');
+  // alpha is scaled too (xenia OpMul covers all lanes — the alpha test already used the unbiased alpha)
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: PS without an oC0 export ignores colorExpBias entirely', async () => {
+  const DEAD = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const out = T.translatePixelShader(DEAD, { colorExpBias: 4 });
+  assert.equal(out.colorExpBias, 0);
+  assert.doesNotMatch(out.wgsl, /vec4f\(1\.6000000000e\+1\)/);
+});
+
+test('translateShaderProgram: colorExpBias surfaces in the program result', async () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { colorExpBias: -5 });
+  assert.equal(program.colorExpBias, -5);
+  assert.equal(program.fragment.colorExpBias, -5);
+  await assertValidWgsl(program.vertex.wgsl);
+  await assertValidWgsl(program.fragment.wgsl);
+});
+
+// ================================================================ transcendentals (xenia SPIR-V semantics)
+test('clamped transcendentals emit the xenia helpers with the +/-INF clamps and Dawn-validate', async () => {
+  const cases = [
+    [15, /fn xenosLogc\(a: f32\) -> f32/],
+    [17, /fn xenosRcpc\(a: f32\) -> f32/],
+    [18, /fn xenosRcpf\(a: f32\) -> f32/],
+    [20, /fn xenosRsqc\(a: f32\) -> f32/],
+    [21, /fn xenosRsqf\(a: f32\) -> f32/],
+  ];
+  for (const [opcode, pattern] of cases) {
+    const out = T.translateVertexShader(shader(
+      cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+      vfetchWords({ dstReg: 1, format: 57 }),
+      aluWords({ vectorOpcode: 2, scalarOpcode: opcode, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+    ));
+    assert.match(out.wgsl, pattern, `helper missing for opcode ${opcode}`);
+    await assertValidWgsl(out.wgsl);
+  }
+  // no helper emitted when unused
+  const plain = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 0, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  assert.doesNotMatch(plain.wgsl, /fn xenosLogc/);
+});
+
+test('transcendental helpers implement the documented INF/FLT_MAX clamps (source-level check)', async () => {
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 15, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  const w = out.wgsl;
+  assert.match(w, /let t = log2\(a\);/);
+  assert.match(w, /let inf = abs\(a\) \/ 0\.0;/);
+  assert.match(w, /if \(t == -inf\) \{ return -3\.402823466e\+38; \}/);
+  const build = (op) => T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: op, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  )).wgsl;
+  assert.match(build(17), /let t = 1\.0 \/ a;/);
+  assert.match(build(17), /if \(t == -inf\) \{ return -3\.402823466e\+38; \}/);
+  assert.match(build(17), /if \(t == inf\) \{ return 3\.402823466e\+38; \}/);
+  assert.match(build(18), /if \(t == inf\) \{ return 0\.0; \}/);
+  assert.match(build(18), /if \(t == -inf\) \{ return -0\.0; \}/);
+  assert.match(build(20), /let t = inverseSqrt\(a\);/);
+  assert.match(build(21), /if \(t == inf\) \{ return 0\.0; \}/);
+  assert.match(build(21), /if \(t == -inf\) \{ return -0\.0; \}/);
+});
+
+test('scalar transcendental with clamp writes clamped via the standard scalar-clamp path', async () => {
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 14, scalarClamp: 1, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  assert.match(out.wgsl, /clamp\(exp2\(r\[1\]\.w\), 0\.0, 1\.0\)/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('transcendentals compose in exp/log back-to-back chains and pass Dawn', async () => {
+  // r4.w = log2(pow2(r1.w)) via rcp/rsq/sin/cos pairs — two transcendentals in one program.
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 3, seq(SEQ_FETCH, SEQ_ALU, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 14, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 16, scalarWriteMask: 0xF, scalarDest: 5, src: [temp(4), temp(4), temp(4)] }),
+  ));
+  assert.match(out.wgsl, /r\[4\] = vec4f\(exp2\(r\[1\]\.w\)\);/);
+  assert.match(out.wgsl, /r\[5\] = vec4f\(log2\(r\[4\]\.w\)\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('transcendental in a pixel shader (sin) runs in the fragment stage', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 48, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(4), temp(4), temp(4)] }),
+  ));
+  assert.match(out.wgsl, /sin\(r\[1\]\.w\)/);
+  await assertValidWgsl(out.wgsl);
 });

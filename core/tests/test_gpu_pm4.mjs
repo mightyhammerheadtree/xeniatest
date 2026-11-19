@@ -342,7 +342,14 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   // RB_DEPTHCONTROL (0x2200): z_enable|z_write|zfunc GreaterEqual(6)<<4|stencil off.
   // RB_COLORCONTROL (0x2202): 0 (no alpha test).
   // RB_BLENDCONTROL0 (0x2201): src=src-alpha(6), one-minus-src-alpha(7) — 0x07000506.
+  // PA_SC_WINDOW_SCISSOR_TL/BR (0x2081/0x2082): (8,8)-(40,40); WINDOW_OFFSET (0x2080): (+2,+3);
+  // PA_SC_SCREEN_SCISSOR_TL/BR (0x200e/0x200f): (4,4)-(52,52).
   const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+  setReg(0x2080, (3 << 16) | 2);
+  setReg(0x2081, (8 << 16) | 8);
+  setReg(0x2082, (40 << 16) | 40);
+  setReg(0x200e, (4 << 16) | 4);
+  setReg(0x200f, (52 << 16) | 52);
   setReg(0x2001, (5 << 16) | 0x42);
   setReg(0x2002, 0); // kD24S8
   setReg(0x2104, 0xA5A5A5A5);
@@ -353,6 +360,8 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   setReg(0x210d, 0x0000427F); // RB_STENCILREFMASK: ref 0x7F, mask 0x42
   setReg(0x2200, 0x2 | 0x4 | (0x6 << 4));
   setReg(0x2201, (7 << 8) | (0 << 5) | 6);
+  setReg(0x210e, 0x3F000000); // RB_ALPHA_REF: 0.5f
+  setReg(0x2000, (1 << 16) | 0x0123); // RB_SURFACE_INFO: 2x MSAA, surface_pitch 0x0123 (snapshot is raw; the backend traps on MSAA)
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
   const draw = backend.calls.find((c) => c.kind === 'draw');
@@ -368,4 +377,45 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   assert.equal(draw.renderTargets.depthControl, 0x2 | 0x4 | (0x6 << 4));
   assert.equal(draw.renderTargets.blendControl0, (7 << 8) | 6);
   assert.equal(draw.renderTargets.colorControl, 0);
+  assert.equal(draw.renderTargets.alphaRef, 0x3F000000);
+  assert.equal(draw.renderTargets.surfaceInfo, (1 << 16) | 0x0123);
+  assert.ok(draw.scissor, 'scissor snapshot is attached');
+  assert.equal(draw.scissor.windowScissorTl, (8 << 16) | 8);
+  assert.equal(draw.scissor.windowScissorBr, (40 << 16) | 40);
+  assert.equal(draw.scissor.windowOffset, (3 << 16) | 2);
+  assert.equal(draw.scissor.screenScissorTl, (4 << 16) | 4);
+  assert.equal(draw.scissor.screenScissorBr, (52 << 16) | 52);
+});
+
+test('draw with PA_SC_VIZ_QUERY ena+kill (0x81) is dropped — occlusion hint, not an RT write (xenia rule)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+  setReg(0x2293, 0x81); // viz_query_ena | kill_pix_post_hi_z
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'no draw issued — xenia skips it');
+});
+
+test('PA_SC_VIZ_QUERY ena without kill (or kill without ena) still draws (xenia rule)', () => {
+  for (const viz of [0x01, 0x80, 0x00]) {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = makeCP(guest, backend);
+    const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+    setReg(0x2293, viz);
+    const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 1, `PA_SC_VIZ_QUERY=0x${viz.toString(16)} must still draw`);
+  }
+});
+
+test('PM4_VIZ_QUERY traps loudly (occlusion queries unimplemented — step 9)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_VIZ_QUERY, 1), 0])),
+    (e) => e instanceof XenosGpuError && /VIZ_QUERY/.test(e.message));
 });

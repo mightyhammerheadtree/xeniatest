@@ -99,6 +99,14 @@
     for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193) >>> 0; }
     return h >>> 0;
   }
+  /** Cache-key fragment: alpha test compare function (translation-time decision). */
+  function alphaTestKey(program) { return program && program.alphaTest ? String(program.alphaTest.compare) : '0'; }
+  /** Cache-key fragment: color_exp_bias exponent (baked as a literal into the WGSL). */
+  function expBiasKey(program) { return program && Number.isFinite(program.colorExpBias) ? String(program.colorExpBias | 0) : '0'; }
+  /** Cache-key fragment: gamma encode presence. */
+  function convertKey(program) { return program && program.convertColor0ToGamma ? '1' : '0'; }
+  /** Cache-key fragment: the PS statically exports oC0 (pipeline write mask depends on it). */
+  function colorExportKey(program) { return program && program.fragment && program.fragment.exportsColor0 === false ? '0' : '1'; }
 
   /** Build the WGSL source for the fetch bring-up vertex shader. Attribute 0 → position. */
   function buildFetchPlaceholderWGSL(descriptors) {
@@ -200,8 +208,15 @@
       this.device = null;
       this.context = null;
       this.format = null;
+      // Per-frame clear state for the color/depth attachments: the guest is
+      // responsible for clearing RT contents — the host clears only the FIRST
+      // pass of a frame (defined image), never a draw mid-frame (which would
+      // erase earlier draws' output and break depth sequencing). swap() marks
+      // the frame boundary; attach()/resize() reset both targets.
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
       this.depthTexture = null;
-      this.depthFormat = 'depth24plus';
+      this.depthFormat = 'depth24plus-stencil8'; // must match pipeline depth-stencil format
       this.pipelineCache = new Map(); // key -> GPURenderPipeline
       // Translated-program path: WeakMap<vs ucode object, Map<pairKey, program pair>>
       // and a per-VS-shader Map<layoutKey, { pipeline, bindGroup }>. Pipelines/bind groups
@@ -264,6 +279,8 @@
       const width = Math.max(1, this.canvas.width | 0);
       const height = Math.max(1, this.canvas.height | 0);
       if (this.depthTexture) this.depthTexture.destroy();
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
       this.depthTexture = this.device.createTexture({
         size: [width, height, 1],
         format: this.depthFormat,
@@ -293,7 +310,11 @@
 
     setShaderBases(vsBase, psBase) { this.log('debug', `setShaderBases vs=0x${vsBase.toString(16)} ps=0x${psBase.toString(16)}`); }
 
-    vizQuery(state) { this.log('debug', `vizQuery ${state}`); }
+    vizQuery(state) {
+      // Occlusion queries need a querySet + resolve + guest-memory writeback — none of which exists yet (step 9).
+      // xenia issues real D3D queries here; silently no-op'ing would leave the guest polling a status that never lands.
+      throw new XenosWebGpuError(`PM4_VIZ_QUERY '${state}' is not supported yet — the occlusion-query path (querySet, resolve, guest-memory writeback) is step 9; refusing to silently no-op`);
+    }
 
     setShaders({ vertex, pixel }) {
       if (vertex) this.shaders.vertex = vertex;
@@ -448,8 +469,11 @@
      * stage is null when no pixel shader is loaded (the caller binds the
      * bring-up FS then). Loud on any unsupported construct.
      */
-    _translateProgram(vsCode, psCode) {
-      const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
+    _translateProgram(vsCode, psCode, alphaTest, convertColor0ToGamma = false, colorExpBias = 0) {
+      const atKey = alphaTest ? `at${alphaTest.compare}` : 'at-';
+      const gKey = convertColor0ToGamma ? 'g1' : 'g0';
+      const bKey = `eb${Math.max(-32, Math.min(31, colorExpBias | 0))}`;
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + '|' + atKey + '|' + gKey + '|' + bKey;
       let perVs = this.programMemo.get(vsCode);
       if (!perVs) {
         perVs = new Map();
@@ -460,7 +484,7 @@
       const TX = globalThis.XenonGpuTranslate;
       if (!TX) throw new XenosWebGpuError('XenonGpuTranslate is not loaded — public/js/gpu/wgsl_translate.js must be loaded before the backend builds a draw pipeline');
       try {
-        pair = TX.translateShaderProgram(vsCode, psCode);
+        pair = TX.translateShaderProgram(vsCode, psCode, { alphaTest: alphaTest ?? undefined, convertColor0ToGamma, colorExpBias });
       } catch (e) {
         const name = e && e.constructor && e.constructor.name ? e.constructor.name : 'Error';
         const detail = e && e.message ? e.message : String(e);
@@ -510,10 +534,34 @@
       }
     }
 
+    /**
+     * Upload RB_ALPHA_REF (IEEE-754 bitcast) into a persistent 16-byte uniform
+     * for the translated guest pixel shader's alpha test. Content-hashed: the
+     * write happens only when the reference dword changes. Loud when the
+     * translated program declares the alpha test but the snapshot carried no
+     * reference — never fabricate one.
+     */
+    _uploadAlphaTest(params, program) {
+      if (!program.alphaTest) return;
+      const dword = params.renderTargets?.alphaRef;
+      if (dword === undefined) {
+        throw new XenosWebGpuError('draw: the translated guest pixel shader has an alpha test enabled but the render-target snapshot carries no alpha reference (params.renderTargets.alphaRef) — refusing to draw with a fabricated reference');
+      }
+      if (dword === this.alphaRefHash && this.alphaTestBuffer) return;
+      if (!this.alphaTestBuffer) {
+        this.alphaTestBuffer = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'xenos-alpha-test' });
+      }
+      const bytes = new Uint8Array(16);
+      new DataView(bytes.buffer).setUint32(0, dword >>> 0, true);
+      this.device.queue.writeBuffer(this.alphaTestBuffer, 0, bytes);
+      this.alphaRefHash = dword >>> 0;
+      this.uploads.constantUploads++;
+    }
+
     /** The color target descriptor for the canvas attachment (format + write mask + blend). */
-    _colorTargetDesc(rtState) {
-      const target = { format: this.format, writeMask: rtState ? rtState.writeMask : 0xF };
-      if (rtState && rtState.blend) target.blend = rtState.blend;
+    _colorTargetDesc(rtState, writesColor = true) {
+      const target = { format: this.format, writeMask: writesColor ? (rtState ? rtState.writeMask : 0xF) : 0x0 };
+      if (writesColor && rtState && rtState.blend) target.blend = rtState.blend;
       return target;
     }
 
@@ -550,25 +598,64 @@
       return rtState;
     }
 
+    /**
+     * Decode the PA_SC_* scissor snapshot (xenia GetScissor semantics, see
+     * render_state.js) into a canvas-clamped rect. Missing snapshot traps — a
+     * host that does not attach it must not draw with the guest's scissor
+     * silently ignored.
+     */
+    _resolveScissor(params) {
+      const rs = globalThis.XenonGpuRenderState;
+      if (!rs) {
+        throw new XenosWebGpuError('XenonGpuRenderState is not loaded — public/js/gpu/render_state.js must be loaded before the backend builds a draw');
+      }
+      try {
+        return rs.buildScissorState(params.scissor, {
+          width: this.canvas?.width ?? 0,
+          height: this.canvas?.height ?? 0,
+        });
+      } catch (e) {
+        if (e && e.constructor && e.constructor.name === 'XenosRenderStateError') {
+          throw new XenosWebGpuError(`draw: ${e.message}`);
+        }
+        throw e;
+      }
+    }
+
     /** Begin the render pass for a frame segment: canvas color attachment + depth/stencil attachment. */
-    _beginPass(encoder, colorView, rtState) {
-      const colorAttachments = [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }];
-      const desc = { colorAttachments };
+    _beginPass(encoder, colorView, rtState, scissor) {
+      const colorAttachment = this._frameClearColor
+        ? { view: colorView, loadOp: 'load', storeOp: 'store' }
+        : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' };
+      this._frameClearColor = true;
+      const desc = { colorAttachments: [colorAttachment] };
       if (this.depthView) {
-        desc.depthStencilAttachment = {
-          view: this.depthView,
-          depthLoadOp: 'clear',
-          depthClearValue: 1.0,
-          depthStoreOp: 'store',
-          stencilLoadOp: 'clear',
-          stencilClearValue: 0,
-          stencilStoreOp: 'store',
-        };
+        desc.depthStencilAttachment = this._frameClearDepth
+          ? {
+            view: this.depthView,
+            depthLoadOp: 'load',
+            depthStoreOp: 'store',
+            stencilLoadOp: 'load',
+            stencilStoreOp: 'store',
+          }
+          : {
+            view: this.depthView,
+            depthLoadOp: 'clear',
+            depthClearValue: 1.0,
+            depthStoreOp: 'store',
+            stencilLoadOp: 'clear',
+            stencilClearValue: 0,
+            stencilStoreOp: 'store',
+          };
+        this._frameClearDepth = true;
       }
       const pass = encoder.beginRenderPass(desc);
       if (rtState) {
         pass.setBlendConstant(rtState.blendConstant);
         pass.setStencilReference(rtState.stencilRef);
+      }
+      if (scissor) {
+        pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
       }
       return pass;
     }
@@ -595,7 +682,7 @@
         perShader = new Map();
         this.translatedPipelines.set(vsCode, perShader);
       }
-      const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}eb${expBiasKey(program)}`;
       const rtKey = rtState ? rtState.key : 'rt:none';
       const layoutKey = `${pairKey}|${topology}:${this.format}:${rtKey}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
@@ -616,15 +703,16 @@
         label: program.fragment ? 'xenos-translated-vs-ps' : 'xenos-translated-vs',
         layout: 'auto',
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
+        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState, colorExportKey(program) === '1')] },
         depthStencil: this._depthStencilDesc(rtState),
         primitive: { topology },
       });
       let bindGroup = null;
-      if (program.usesFloatConstants || program.usesBoolConstants) {
+      if (program.usesFloatConstants || program.usesBoolConstants || program.alphaTest) {
         const entries = [];
         if (program.usesFloatConstants) entries.push({ binding: 0, resource: { buffer: this.aluConstantBuffer } });
         if (program.usesBoolConstants) entries.push({ binding: program.usesFloatConstants ? 1 : 0, resource: { buffer: this.boolConstantBuffer } });
+        if (program.alphaTest) entries.push({ binding: program.alphaTest.binding, resource: { buffer: this.alphaTestBuffer } });
         bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
       }
       entry = { pipeline, bindGroup };
@@ -725,7 +813,14 @@
         // A pixel shader, when loaded, IS translated and run — no guessed fragment stage anywhere.
         const psCode = this.shaders.pixel?.code ?? null;
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
-        const program = this._translateProgram(code, psCode);
+        const alphaTest = globalThis.XenonGpuRenderState?.decodeAlphaTest(params.renderTargets?.colorControl ?? 0) ?? null;
+        // format nibble of RB_COLOR_INFO at bits 16-19 (1 = k_8_8_8_8_GAMMA);
+        // read the field directly — the full decode runs (memoized) right after.
+        const convertColor0ToGamma = (((params.renderTargets?.colorInfo0 ?? 0) >>> 16) & 0xF) === 1;
+        // 6-bit signed exponent at RB_COLOR_INFO bits 20-25 (xenia's int32_t :6, sign-extended)
+        let colorExpBias = ((params.renderTargets?.colorInfo0 ?? 0) >>> 20) & 0x3F;
+        if (colorExpBias & 0x20) colorExpBias -= 0x40;
+        const program = this._translateProgram(code, psCode, alphaTest, convertColor0ToGamma, colorExpBias);
 
         // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
         if (!params.vertexFetchConstants && program.vertex.inputLocations.length > 0) {
@@ -753,11 +848,13 @@
         }
         const buffers = plan ? this.uploadVertexBuffers(plan) : [];
         this._uploadShaderConstants(params, program);
+        this._uploadAlphaTest(params, program);
         const rtState = this._resolveRenderTargets(params, program);
+        const scissor = this._resolveScissor(params);
         const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginPass(encoder, colorView, rtState);
+        const pass = this._beginPass(encoder, colorView, rtState, scissor);
         pass.setPipeline(pipeline);
         if (bindGroup) pass.setBindGroup(0, bindGroup);
         for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
@@ -775,10 +872,11 @@
       const fetchReady = !!(this.shaders.vertex && params.vertexFetchConstants);
       if (fetchReady) {
         const rtState = this._resolveRenderTargets(params, null);
+        const scissor = this._resolveScissor(params);
         const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginPass(encoder, colorView, rtState);
+        const pass = this._beginPass(encoder, colorView, rtState, scissor);
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
           pass.setPipeline((plan._pipeline ??= this._getFetchPlaceholderPipeline(plan.descriptors, rtState)));
@@ -798,9 +896,10 @@
         this.log('warn', 'draw: vertex shader loaded but the packet carried no fetch constants — bypassing the fetch path (full-canvas placeholder)');
       }
       const rtState = this._resolveRenderTargets(params, null);
+      const scissor = this._resolveScissor(params);
       const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
       const colorView = this.context.getCurrentTexture().createView();
-      const pass = this._beginPass(encoder, colorView, rtState);
+      const pass = this._beginPass(encoder, colorView, rtState, scissor);
       pass.setPipeline(this._getPlaceholderPipeline(rtState));
       pass.draw(3);
       pass.end();
@@ -826,6 +925,8 @@
 
     /** Frame boundary from PM4_XE_SWAP — xenia uses this to trigger present/swap on the host. */
     swap() {
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
       this.lastFrame = { at: (typeof performance !== 'undefined' ? performance.now() : Date.now()) };
       this.log('debug', `swap (frame ${this.uploads.frames})`);
     }

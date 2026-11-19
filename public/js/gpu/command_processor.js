@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil) *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -92,7 +92,6 @@
       this.vertexShader = null;
       this.pixelShader = null;
       /** Viz query bookkeeping: number of open surveys (depth may exceed 1 across nested flushes). */
-      this.vizQueryOpen = false;
       /** GPU event counter written back by EVENT_WRITE* with the counter bit (initiator & 0x80000000). */
       this.counter = 0;
       /** WRITEBACK_START/SIZE register indices (guest physical window for event writebacks). */
@@ -331,13 +330,11 @@
           this._writeRegister(regFile().XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3f);
           return end;
         }
-        case op.PM4_VIZ_QUERY: {
-          const value = u32s[start];
-          const begin = (value & 0x1) === 0; // 0 = begin query, 1 = end query (r6xx VIZ_QUERY semantics)
-          this.vizQueryOpen = begin;
-          if (this.backend && typeof this.backend.vizQuery === 'function') this.backend.vizQuery(begin ? 'start' : 'end');
-          return end;
-        }
+        case op.PM4_VIZ_QUERY:
+          // Occlusion queries cannot be produced here (the query path — querySet, resolve,
+          // guest-visible PA_SC_VIZ_QUERY_STATUS results — is step 9). Silently swallowing the
+          // packet would leave the guest polling a status that never lands, so refuse loudly.
+          throw new XenosGpuError(`${parsed.opcodeName}: occlusion queries are not supported (step 9) — results cannot be produced; refusing to silently no-op (the draw path still honors PA_SC_VIZ_QUERY ena+kill by dropping hint draws)`);
         case op.PM4_INTERRUPT: {
           const mask = u32s[start];
           if (this.backend && typeof this.backend.interrupt === 'function') this.backend.interrupt(mask);
@@ -525,14 +522,19 @@
       // into the WebGPU pipeline/render-pass state (blend, write mask, depth/
       // stencil) and traps loudly on anything it cannot represent. xenia
       // register indices (see xenia gpu/registers.h).
+      const RB_SURFACE_INFO = 0x2000;
       const RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
       const RB_COLOR1_INFO = 0x2003, RB_COLOR2_INFO = 0x2004, RB_COLOR3_INFO = 0x2005;
-      const RB_COLOR_MASK = 0x2104;
+      const RB_COLOR_MASK = 0x2104, RB_ALPHA_REF = 0x210e;
       const RB_BLEND_RED = 0x2105, RB_BLEND_GREEN = 0x2106, RB_BLEND_BLUE = 0x2107, RB_BLEND_ALPHA = 0x2108;
       const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
       const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
+      const PA_SC_VIZ_QUERY = 0x2293;
+      const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082, PA_SC_WINDOW_OFFSET = 0x2080;
+      const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
+        surfaceInfo: this.registers.read(RB_SURFACE_INFO) >>> 0,
         colorInfo0: this.registers.read(RB_COLOR_INFO) >>> 0,
         depthInfo: this.registers.read(RB_DEPTH_INFO) >>> 0,
         colorInfo1: this.registers.read(RB_COLOR1_INFO) >>> 0,
@@ -548,9 +550,25 @@
         depthControl: this.registers.read(RB_DEPTHCONTROL) >>> 0,
         blendControl0: this.registers.read(RB_BLENDCONTROL0) >>> 0,
         colorControl: this.registers.read(RB_COLORCONTROL) >>> 0,
+        alphaRef: this.registers.read(RB_ALPHA_REF) >>> 0,
         blendControl1: this.registers.read(RB_BLENDCONTROL1) >>> 0,
         blendControl2: this.registers.read(RB_BLENDCONTROL2) >>> 0,
         blendControl3: this.registers.read(RB_BLENDCONTROL3) >>> 0,
+      };
+      // xenia: if PA_SC_VIZ_QUERY has viz_query_ena (bit 0) AND kill_pix_post_hi_z (bit 7),
+      // the draw is an occlusion-query hint and must NOT touch the render target (r6xx/r7xx
+      // VIZ_QUERY). IssueDraw is not called then; other bit combinations draw normally.
+      const vizQuery = this.registers.read(PA_SC_VIZ_QUERY) >>> 0;
+      if ((vizQuery & 0x81) === 0x81) {
+        this.log('debug', `${opcodeName}: draw skipped — PA_SC_VIZ_QUERY enables the query test with kill_pix_post_hi_z (xenia drops such draws; occlusion-vector hint, not an RT write)`);
+        return end;
+      }
+      const scissor = {
+        windowScissorTl: this.registers.read(PA_SC_WINDOW_SCISSOR_TL) >>> 0,
+        windowScissorBr: this.registers.read(PA_SC_WINDOW_SCISSOR_BR) >>> 0,
+        windowOffset: this.registers.read(PA_SC_WINDOW_OFFSET) >>> 0,
+        screenScissorTl: this.registers.read(PA_SC_SCREEN_SCISSOR_TL) >>> 0,
+        screenScissorBr: this.registers.read(PA_SC_SCREEN_SCISSOR_BR) >>> 0,
       };
       const draw = backendOrTrap(this.backend, 'draw', opcodeName);
       draw({
@@ -568,6 +586,7 @@
         aluConstants,
         boolConstants,
         renderTargets,
+        scissor,
       });
       this.stats.draws++;
       return end;

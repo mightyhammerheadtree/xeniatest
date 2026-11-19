@@ -144,12 +144,13 @@ function makeFakeDevice() {
         setBindGroup(i, bg) { log.bindGroupsSet.push([i, bg]); },
         setIndexBuffer(b, fmt) { log.indexBuffer = { buffer: b, format: fmt }; },
         setBlendConstant(c) { log.blendConstant = c; },
+        setScissorRect(x, y, w, h) { log.scissorRect = [x, y, w, h]; },
         setStencilReference(ref) { log.stencilRef = ref; },
         draw(n) { log.drawCalls.push(['draw', n]); },
         drawIndexed(n) { log.drawCalls.push(['drawIndexed', n]); },
         end() {},
       };
-      return { beginRenderPass(desc) { log.passDesc = desc; return pass; }, finish() { return { fake: true }; } };
+      return { beginRenderPass(desc) { (log.passes ??= []).push(desc); log.passDesc = desc; return pass; }, finish() { return { fake: true }; } };
     },
     destroy() {},
   };
@@ -199,6 +200,7 @@ function aluConstantArray() {
 }
 /** A sane zeroed-register render-target snapshot: 8_8_8_8 RT0, all writes enabled, no blend/depth/stencil. */
 const defaultRenderTargets = (overrides = {}) => ({
+  surfaceInfo: 0,
   colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
   depthInfo: 0,
   colorMask: 0x0000FFFF, // all components of all four RTs
@@ -209,6 +211,16 @@ const defaultRenderTargets = (overrides = {}) => ({
   // one/zero/add for both color and alpha is what actually disables blending.
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0x3F000000, // 0.5f
+  ...overrides,
+});
+/** A sane zeroed scissor snapshot: full 64x64 canvas (the test canvas size). */
+const defaultScissor = (overrides = {}) => ({
+  windowScissorTl: 0,
+  windowScissorBr: 0x00400040, // br_x=64, br_y=64 (u14 fields)
+  windowOffset: 0,
+  screenScissorTl: 0,
+  screenScissorBr: 0x20002000, // register-file reset default 8192x8192 — no effect
   ...overrides,
 });
 const drawParams = (overrides = {}) => ({
@@ -216,6 +228,7 @@ const drawParams = (overrides = {}) => ({
   isIndexed: false, indexGuestBase: 0, indexFormat: 0, indexEndianness: 0, indexLengthWords: 0,
   vertexFetchConstants: fetchConstants(),
   renderTargets: defaultRenderTargets(),
+  scissor: defaultScissor(),
   ...overrides,
 });
 
@@ -292,7 +305,7 @@ test('VS without attribute reads and without fetch constants draws (constants-fe
   const guest = makeGuest();
   const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: CONST_ONLY_VS, dwords: CONST_ONLY_VS.length };
-  backend.draw({ primType: 4, primTypeName: 'kTriangleList', numIndices: 3, isIndexed: false, vertexFetchConstants: undefined, aluConstants: aluConstantArray(), renderTargets: defaultRenderTargets() });
+  backend.draw({ primType: 4, primTypeName: 'kTriangleList', numIndices: 3, isIndexed: false, vertexFetchConstants: undefined, aluConstants: aluConstantArray(), renderTargets: defaultRenderTargets(), scissor: defaultScissor() });
   assert.equal(log.pipelines.length, 1);
   assert.deepEqual(log.pipelines[0].desc.vertex.buffers, []);
   assert.deepEqual(log.drawCalls, [['draw', 3]]);
@@ -546,25 +559,94 @@ test('different render-target states produce distinct cached pipelines; identica
   assert.equal(log.drawCalls.length, 3);
 });
 
-test('traps: alpha test enabled is refused loudly (no WGSL representation yet)', () => {
+// A pixel shader statically exporting oC0 (add r0+r0 → oC0).
+const psWithExportsColor0 = () => shader(
+  cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+  aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(0), temp(0), temp(0)] }),
+);
+
+test('alpha test: the translated PS declares the discard + uniform bound at bindings.alphaTest', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
-  assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x9 }) })), // alpha_test_enable | alpha_func 1
-    (e) => e instanceof XenosWebGpuError && /alpha test/i.test(e.message));
-  assert.equal(log.pipelines.length, 0);
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  assert.ok(globalThis.XenonGpuTranslate.translateShaderProgram(FETCH_VS, PS_BLACK, { alphaTest: { compare: 1 } }).fragment.wgsl.includes('discard'), 'translator emits the discard when exportsColor0');
+  const state = backend.draw(drawParams({
+    renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x1, alphaRef: 0x3F000000 }), // enable | kLess
+  }));
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.ok(fsModule, 'translated PS module');
+  assert.match(fsModule.code, /fn alphaTestPass/);
+  assert.match(fsModule.code, /if \(!alphaTestPass\(out\.color0\.w\)\) \{ discard; \}/);
+  assert.match(fsModule.code, /var<uniform> alphaTest: vec4f;/);
+  assert.equal(log.pipelines.length, 1, 'pipeline created with the alpha-test PS');
+  const bg = log.bindGroupsCreated.find((g) => g.entries.some((e) => e.resource.buffer === backend.alphaTestBuffer));
+  assert.ok(bg, 'bind group binds the alpha-test uniform');
+  assert.equal(bg.entries.find((e) => e.resource.buffer === backend.alphaTestBuffer).binding, 0, 'binding 0 when no fc/bools are declared by either stage');
+  assert.equal(backend.alphaRefHash, 0x3F000000 >>> 0);
+  assert.equal(backend.uploads.constantUploads, 1, 'one 16-byte upload for the ref');
 });
 
-test('traps: GAMMA color format is refused (needs the PWL gamma pass, step 7)', () => {
+test('alpha test: the reference upload is content-hashed (rewritten only when RB_ALPHA_REF changes)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
-  const { backend } = makeBackend(guest);
+  const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
-  assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })),
-    /8_8_8_8_GAMMA/);
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x4, alphaRef: 0x3F000000 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x4, alphaRef: 0x3F000000 }) }));
+  assert.equal(backend.uploads.constantUploads, 1, 'identical ref → one upload');
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x4, alphaRef: 0x40000000 }) }));
+  assert.equal(backend.uploads.constantUploads, 2, 'changed ref → re-upload');
+  assert.equal(backend.alphaRefHash, 0x40000000 >>> 0);
+});
+
+test('alpha test: different compare functions produce distinct pipelines (translation keyed)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x1 }) })); // kLess
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x3 }) })); // kLessEqual
+  assert.equal(log.pipelines.length, 2, 'alpha-test enable/func is part of the pipeline key');
+});
+
+test('alpha test: kAlways draws normally (decode treats the test as disabled, xenia skips it)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x7 }) })); // enable | kAlways
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.ok(!/discard/.test(fsModule.code), 'no discard emitted for kAlways');
+  assert.equal(backend.alphaTestBuffer, undefined, 'no alpha-test uniform allocated');
+});
+
+test('GAMMA RT0: the translated PS is gamma-encoded (xenia PWL); the draw runs, no trap', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })); // k_8_8_8_8_GAMMA
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.match(fsModule.code, /fn xenosGamma/);
+  assert.match(fsModule.code, /out\.color0 = vec4f\(xenosGamma/);
+  assert.equal(log.pipelines.length, 1, 'pipeline created for the GAMMA PS');
+
+  // same ucode with an unorm RT0: no gamma code — distinct pipelines
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  assert.equal(log.pipelines.length, 2, 'gamma conversion is part of the translation/pipeline key');
+  const fsModule2 = log.modules[log.modules.length - 1];
+  assert.doesNotMatch(fsModule2.code, /fn xenosGamma/);
 });
 
 test('traps: float color format is refused naming the format', () => {
@@ -621,4 +703,152 @@ test('traps are skipped when the PS does not write oC0 (RT0 format never observe
   backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
   const state = backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })); // GAMMA RT0
   assert.equal(log.pipelines.length, 1, 'no oC0 export → no RT0 format validation');
+});
+
+test('the pass receives setScissorRect decoded from the PA_SC_* snapshot (offset applied, clamped to canvas)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({
+    scissor: defaultScissor({ windowScissorTl: (4 << 16) | 4, windowScissorBr: (36 << 16) | 36, windowOffset: (2 << 16) | 2 }),
+  }));
+  assert.deepEqual(log.scissorRect, [6, 6, 32, 32]);
+
+  // screen scissor clips the window rect from outside
+  backend.draw(drawParams({
+    scissor: defaultScissor({ screenScissorTl: (8 << 16) | 12, screenScissorBr: (24 << 16) | 60 }),
+  }));
+  assert.deepEqual(log.scissorRect, [12, 8, 48, 16]);
+
+  // a rect fully outside the canvas clamps to a zero-sized scissor
+  backend.draw(drawParams({
+    scissor: defaultScissor({ windowScissorTl: (100 << 16) | 100, windowScissorBr: 0x00400040 }),
+  }));
+  assert.deepEqual(log.scissorRect, [64, 64, 0, 0]);
+});
+
+test('a draw without the scissor snapshot refuses (the CP always attaches it)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const params = drawParams();
+  delete params.scissor;
+  assert.throws(() => backend.draw(params), /scissor register snapshot missing/);
+});
+
+test('a PS that does not export oC0 gets writeMask 0 on the color target (no fabricated black writes)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // dead-write PS: no exports at all
+  const PS_BLACK = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }),
+  );
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams());
+  assert.equal(log.pipelines.length, 1);
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].writeMask, 0, 'no color writes when the PS does not export oC0');
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].blend, undefined, 'blend disabled with mask 0');
+  // same ucode with an oC0 export flips the mask — distinct pipeline
+  const PS_O = PS_ADD; // exports oC0
+  backend.shaders.pixel = { kind: 'pixel', code: PS_O, dwords: PS_O.length };
+  backend.draw(drawParams());
+  assert.equal(log.pipelines.length, 2, 'color-export bit is part of the pipeline key');
+  assert.equal(log.pipelines[1].desc.fragment.targets[0].writeMask, 0xF);
+});
+
+test('an oDepth-only PS writes depth but never color (writeMask 0, depth stays enabled)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // PS exports only oDepth (dest 61): r1.x + r1.x → oDepth
+  const PS_ODEPTH = shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 1, vectorOpcode: 0, src: [temp(0), temp(0), temp(0)] }),
+    aluWords({ isExport: 1, vectorDest: 61, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  backend.shaders.pixel = { kind: 'pixel', code: PS_ODEPTH, dwords: PS_ODEPTH.length };
+  backend.draw(drawParams());
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].writeMask, 0, 'color writes disabled');
+  assert.ok(log.pipelines[0].desc.fragment.module.desc.code.includes('frag_depth'), 'depth export preserved');
+  assert.ok(log.pipelines[0].desc.depthStencil, 'depth-stencil state present');
+});
+
+test('frame-clear semantics: first pass of a frame clears, later passes load (guest clears, not the host)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest); // makeBackend mirrors attach()/_recreateDepth — frame starts fresh
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const passDescs = () => log.passes;
+  backend.draw(drawParams());
+  backend.draw(drawParams());
+  backend.draw(drawParams());
+  assert.deepEqual(passDescs().map((d) => d.colorAttachments[0].loadOp), ['clear', 'load', 'load']);
+  assert.deepEqual(passDescs().map((d) => d.depthStencilAttachment.depthLoadOp), ['clear', 'load', 'load']);
+  assert.deepEqual(passDescs().map((d) => d.depthStencilAttachment.stencilLoadOp), ['clear', 'load', 'load']);
+  // PM4_XE_SWAP ends the frame — next frame starts with defined targets again
+  backend.swap();
+  backend.draw(drawParams());
+  assert.equal(log.passes[3].colorAttachments[0].loadOp, 'clear');
+  assert.equal(log.passes[3].depthStencilAttachment.depthLoadOp, 'clear');
+  // depth clear value and stencil clear are the frame-start defaults
+  assert.equal(log.passes[3].depthStencilAttachment.depthClearValue, 1.0);
+  assert.equal(log.passes[3].depthStencilAttachment.stencilClearValue, 0);
+});
+
+test('resize() forces a defined-target frame (resize of the canvas = new frame)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  backend.resize();
+  backend.draw(drawParams());
+  assert.equal(log.passes[0].colorAttachments[0].loadOp, 'clear');
+  assert.equal(log.passes[1].colorAttachments[0].loadOp, 'clear');
+});
+
+test('traps: a 4x-MSAA guest render target refuses to draw (single-sampled canvas)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
+    /4x MSAA/);
+});
+
+test('color_exp_bias: the translated PS scales oC0 by 2^bias (all lanes) and the draw runs', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS_ADD, dwords: PS_ADD.length };
+  // RB_COLOR_INFO: format 0 (k_8_8_8_8), exp_bias = 3 at bits 20+
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 3 << 20 }) }));
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.match(fsModule.code, /out\.color0 = out\.color0 \* vec4f\(8\.0000000000e\+0\);/);
+
+  // distinct pipeline for bias 0 (eb is part of the cache keys)
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  assert.equal(log.pipelines.length, 2, 'bias is part of the pipeline translation key');
+  const unbiased = log.modules[log.modules.length - 1];
+  assert.doesNotMatch(unbiased.code, /out\.color0 = out\.color0 \* vec4f\(/);
+});
+
+test('color_exp_bias: negative exponent decodes signed through the whole stack (CP-format snapshot)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS_ADD, dwords: PS_ADD.length };
+  // 0b111110 << 20 = 0x3E00000 → expBias = -2 → scale 0.25
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0x3E00000 }) }));
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.match(fsModule.code, /out\.color0 = out\.color0 \* vec4f\(2\.5000000000e\-1\);/);
 });

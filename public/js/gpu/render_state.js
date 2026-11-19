@@ -9,6 +9,7 @@
  * reference (WebGPU has one reference per pass — see the BF trap below).
  *
  * Decode contracts come from xenia (BSD-3-Clause):
+ *   - RB_SURFACE_INFO: surface_pitch +0:14, msaa_samples +16:2, hiz_pitch +18:14.
  *   - RB_COLOR_INFO (+ RB_COLOR[1-3]_INFO): color_format nibble at +16
  *     (xenos::ColorRenderTargetFormat), color_exp_bias at +20, color_base
  *     tiles at +0/+11.
@@ -32,15 +33,20 @@
  *     already applied the BE→host swap when parsing PM4 packets).
  *
  * Honest-support policy (docs/XENOS_GPU.md step 6):
- *   - Only k_8_8_8_8 is representable on the scanout target today, so any
- *     other color format the pixel shader could actually be writing to traps
- *     loudly. Gamma-encoded targets (k_8_8_8_8_GAMMA) additionally need the
- *     PWL gamma encode, which lives with the EDRAM render-target cache
- *     (step 7) — trapping beats rendering 2.2x-dark output.
+ *   - k_8_8_8_8 and k_8_8_8_8_GAMMA are representable on the scanout target;
+ *     other color formats the pixel shader could actually be writing to trap
+ *     loudly (they need the EDRAM render-target cache, step 7). k_8_8_8_8_GAMMA
+ *     is honored by gamma-encoding oC0's RGB in the translated PS (xenia's RTV
+ *     path); blending then happens on gamma-encoded values (same caveat as xenia).
  *   - kD24S8 depth maps to WebGPU depth24plus-stencil8. kD24FS8 (20e4 float
  *     depth) is not representable and traps.
- *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST) has no WGSL representation yet
- *     and traps loudly rather than silently passing rejected pixels.
+ *   - RB_SURFACE_INFO.msaa_samples must be k1X — the canvas/depth attachments are
+ *     single-sampled; 2x/4x guest MSAA traps (needs the EDRAM render-target cache, step 7).
+ *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST): xenia implements it in the
+ *     pixel shader (OpDiscard), so it is honored exactly when the translated
+ *     guest PS statically exports oC0 — discard against RB_ALPHA_REF (IEEE-754
+ *     uniform). kAlways disables it (xenia skips it). The fixed bring-up FS
+ *     never applies it (never the guest's shader).
  *   - WebGPU exposes one stencil reference per render pass; the back-face
  *     reference (RB_STENCILREFMASK_BF) cannot differ from the front-face one
  *     when back-face stencil is in effect.
@@ -126,7 +132,8 @@
       format,
       formatName: COLOR_FORMAT_NAMES[format] ?? `0x${format.toString(16)} (unrecognized)`,
       componentCount: COLOR_FORMAT_COMPONENTS[format] ?? 4,
-      expBias: (v >>> 20) & 0x3F,
+      // 6-bit signed exponent (xenia's `int32_t color_exp_bias : 6`) — sign-extend.
+      expBias: (() => { const b = (v >>> 20) & 0x3F; return b & 0x20 ? b - 0x40 : b; })(),
     };
   }
 
@@ -202,39 +209,68 @@
         'RB_STENCILREFMASK[_BF]/RB_BLEND_* at draw time; refusing to draw with fabricated render state');
     }
     const { psExportsColor0 = true, psExportsDepth = false } = opts;
+    // --- RB_SURFACE_INFO: MSAA must be off (canvas/depth targets are single-sampled) ----
+    // msaa_samples at bits +16:2 (k1X=0, k2X=1, k4X=2) — xenia's RB_SURFACE_INFO.
+    // The scanout canvas and the depth24plus-stencil8 attachment are 1x; rendering
+    // guest-4x-MSAA state into them would silently drop sample shading/resolve, so trap.
+    const surfaceInfo = raw.surfaceInfo;
+    if (surfaceInfo === undefined) {
+      throw new XenosRenderStateError(
+        'render-target snapshot carries no RB_SURFACE_INFO (params.renderTargets.surfaceInfo) — ' +
+        'the command processor snapshots it at draw time; refusing to draw without the MSAA decision');
+    }
+    const msaaSamples = (surfaceInfo >>> 16) & 0x3;
+    if (msaaSamples !== 0) {
+      throw new XenosRenderStateError(
+        `guest render target is configured for ${msaaSamples === 1 ? '2x' : '4x'} MSAA (RB_SURFACE_INFO.msaa_samples=${msaaSamples}) — ` +
+        'the canvas and the depth24plus-stencil8 attachment are single-sampled; MSAA needs the EDRAM render-target cache (step 7). Refusing to draw');
+    }
     const cacheKey = [
-      raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, raw.colorMask >>> 0, raw.depthControl >>> 0,
+      raw.surfaceInfo === undefined ? -1 : (raw.surfaceInfo >>> 0), raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, raw.colorMask >>> 0, raw.depthControl >>> 0,
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
+      raw.alphaRef === undefined ? -1 : (raw.alphaRef >>> 0),
       (psExportsColor0 ? 1 : 0) | ((psExportsDepth ? 1 : 0) << 1),
     ].join(',');
     const cached = rtDecodeCache.get(cacheKey);
     if (cached) return cached;
 
-    // --- RB_COLORCONTROL: alpha test is not representable yet ---------------
+    // --- alpha test (RB_COLORCONTROL) — applied by the translated guest PS ---
+    // xenia implements the alpha test in the pixel shader itself (OpDiscard),
+    // comparing the oC0 alpha against RB_ALPHA_REF (a bitcast float). The
+    // reference is not pipeline state: the backend uploads the raw dword as a
+    // tiny uniform the translated PS declares. Applies only when the PS
+    // exports oC0 (xenia's condition); kAlways passes trivially (xenia skips).
     const colorControl = raw.colorControl >>> 0;
-    if ((colorControl & 0x8) !== 0) {
-      const func = cmp(colorControl);
-      throw new XenosRenderStateError(
-        `alpha test is not implemented (RB_COLORCONTROL.ALPHA_TEST: alpha_func=${func}, alpha ref from RB_ALPHA_REF) — ` +
-        'no WGSL representation exists yet; refusing to render rejected pixels as visible');
+    const alphaTestEnable = (colorControl & 0x8) !== 0;
+    const alphaFunc = colorControl & 0x7;
+    const alphaRef = raw.alphaRef;
+    let alphaTest = null;
+    if (alphaTestEnable && alphaFunc !== 7) {
+      if (alphaRef === undefined) {
+        throw new XenosRenderStateError(
+          'RB_COLORCONTROL has alpha_test_enable set but the render-target snapshot carries no alpha reference ' +
+          '(params.renderTargets.alphaRef) — refusing to draw with a fabricated reference');
+      }
+      alphaTest = { compare: alphaFunc, referenceDword: alphaRef >>> 0 };
     }
 
     // --- RB_COLOR_INFO RT0: format must be representable when written ------
+    // k_8_8_8_8 (0) is the canvas format; k_8_8_8_8_GAMMA (1) is honored by
+    // gamma-encoding in the translated PS (xenia's RTV path; blending then
+    // happens on gamma-encoded values — same caveat as xenia). Everything else
+    // needs the EDRAM render-target cache (step 7) and traps.
     const colorInfo0 = decodeColorInfo(raw.colorInfo0);
     if (psExportsColor0) {
-      if (colorInfo0.format === 1) {
+      if (colorInfo0.format !== 0 && colorInfo0.format !== 1) {
         throw new XenosRenderStateError(
-          'render target 0 has format k_8_8_8_8_GAMMA — gamma-encoded output needs the PWL gamma conversion ' +
-          '(xenia converts in the pixel shader; it lives with the EDRAM render-target cache work, step 7). ' +
-          'Refusing to render linear values into a gamma-encoded target');
-      }
-      if (colorInfo0.format !== 0) {
-        throw new XenosRenderStateError(
-          `render target 0 has format ${colorInfo0.formatName} — the only format representable on the ` +
-          'scanout target today is k_8_8_8_8 (8-bit unorm); other formats need the EDRAM render-target cache (step 7). Refusing to draw');
+          `render target 0 has format ${colorInfo0.formatName} — the only formats representable on the ` +
+          'scanout target today are k_8_8_8_8 and k_8_8_8_8_GAMMA; other formats need the EDRAM render-target cache (step 7). Refusing to draw');
       }
     }
+    // The gamma encode is a no-op unless the PS statically exports oC0 (the
+    // translator enforces that itself); the flag records the RT's format.
+    const convertColor0ToGamma = colorInfo0.format === 1;
 
     // --- RB_DEPTH_INFO: D24S8 maps to depth24plus-stencil8; D24FS8 traps ----
     const depthInfo = decodeDepthInfo(raw.depthInfo);
@@ -315,12 +351,60 @@
       blendConstant,
       depthStencil,
       stencilRef: ref,
+      alphaTest,
+      surfacePitch: surfaceInfo & 0x3FFF,
+      convertColor0ToGamma,
       colorFormatName: colorInfo0.formatName,
       depthFormatName: depthInfo.formatName,
     };
     if (rtDecodeCache.size >= RT_DECODE_CACHE_LIMIT) rtDecodeCache.clear();
     rtDecodeCache.set(cacheKey, state);
     return state;
+  }
+
+  // --- PA_SC_* scissor decode (xenia draw_util.cc GetScissor) ----------------
+  // WebGPU scissor call takes (x, y, width, height) clamped to the attachment,
+  // so the decode combines WINDOW scissor + WINDOW offset + SCREEN scissor,
+  // collapses degenerate/inverted rects, and finally clamps to the surface
+  // (canvas). The RB_SURFACE_INFO surface_pitch clamp xenia applies is an
+  // EDRAM-tile-padding safety net — meaningless for the canvas target.
+  const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
+  const PA_SC_WINDOW_OFFSET = 0x2080;
+  const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
+  const u14 = (v) => v & 0x3fff;
+  const s15 = (v) => { v &= 0x7fff; return v & 0x4000 ? v - 0x8000 : v; };
+
+  function buildScissorState(raw, surface) {
+    if (!raw || typeof raw !== 'object') {
+      throw new XenosRenderStateError(
+        'scissor register snapshot missing (params.scissor) — the command processor snapshots ' +
+        'PA_SC_WINDOW_SCISSOR_TL/BR, PA_SC_WINDOW_OFFSET and PA_SC_SCREEN_SCISSOR_TL/BR at draw time; ' +
+        'refusing to draw with fabricated raster state');
+    }
+    const width = surface?.width ?? 0, height = surface?.height ?? 0;
+    if (!(width > 0) || !(height > 0)) {
+      throw new XenosRenderStateError(`scissor surface has no extent (${width}x${height})`);
+    }
+    const tl = raw.windowScissorTl >>> 0;
+    const br = raw.windowScissorBr >>> 0;
+    const off = raw.windowOffset >>> 0;
+    let tlX = u14(tl), tlY = u14(tl >>> 16);
+    let brX = u14(br), brY = u14(br >>> 16);
+    if ((tl & 0x80000000) === 0) {
+      // window_offset_disable (bit 31) clear: WINDOW offset applies.
+      const wx = s15(off), wy = s15(off >>> 16);
+      tlX += wx; tlY += wy; brX += wx; brY += wy;
+    }
+    const stl = raw.screenScissorTl >>> 0, sbr = raw.screenScissorBr >>> 0;
+    tlX = Math.max(tlX, s15(stl)); tlY = Math.max(tlY, s15(stl >>> 16));
+    brX = Math.min(brX, s15(sbr)); brY = Math.min(brY, s15(sbr >>> 16));
+    // Collapse negatives and inverted rects into a zero-sized one (xenia).
+    tlX = Math.max(tlX, 0); tlY = Math.max(tlY, 0);
+    brX = Math.max(brX, tlX); brY = Math.max(brY, tlY);
+    // Clamp to the surface — WebGPU validation requires the scissor inside the attachment.
+    const cx = Math.min(tlX, width), cy = Math.min(tlY, height);
+    const cxBr = Math.min(brX, width), cyBr = Math.min(brY, height);
+    return { x: cx, y: cy, width: Math.max(cxBr - cx, 0), height: Math.max(cyBr - cy, 0) };
   }
 
   const api = {
@@ -333,7 +417,17 @@
     RB_DEPTHCONTROL, RB_BLENDCONTROL0, RB_COLORCONTROL,
     RB_BLENDCONTROL1, RB_BLENDCONTROL2, RB_BLENDCONTROL3,
     decodeColorInfo, decodeDepthInfo, decodeBlendControl, blendEnabled, normalizeWriteMask,
+    /** The alpha-test decision from raw RB_COLORCONTROL alone: { compare } or null (xenia's rules: bit 3 enable, bits 0-2 CompareFunction, kAlways disables). */
+    decodeAlphaTest(colorControl) {
+      const c = colorControl >>> 0;
+      const enabled = (c & 0x8) !== 0;
+      const func = c & 0x7;
+      return enabled && func !== 7 ? { compare: func } : null;
+    },
     buildRenderTargetState,
+    PA_SC_WINDOW_SCISSOR_TL, PA_SC_WINDOW_SCISSOR_BR, PA_SC_WINDOW_OFFSET,
+    PA_SC_SCREEN_SCISSOR_TL, PA_SC_SCREEN_SCISSOR_BR,
+    buildScissorState,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.XenonGpuRenderState = api;

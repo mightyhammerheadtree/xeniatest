@@ -14,6 +14,7 @@ import '../../public/js/gpu/render_state.js';
 const RS = globalThis.XenonGpuRenderState;
 
 const ZERO_RT = {
+  surfaceInfo: 0,
   colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
   depthInfo: 0,
   colorMask: 0x0000FFFF,
@@ -22,6 +23,7 @@ const ZERO_RT = {
   depthControl: 0,
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0,
 };
 const rt = (overrides = {}) => ({ ...ZERO_RT, ...overrides });
 const rtState = (overrides = {}, opts = {}) => RS.buildRenderTargetState(rt(overrides), { psExportsColor0: true, psExportsDepth: false, ...opts });
@@ -55,8 +57,17 @@ test('every other color format traps with its xenia name when the PS writes oC0'
   }
 });
 
-test('k_8_8_8_8_GAMMA traps naming the PWL gamma conversion (not silently rendered linear)', () => {
-  assert.throws(() => rtState({ colorInfo0: 1 << 16 }), /8_8_8_8_GAMMA/);
+test('k_8_8_8_8_GAMMA decodes (the PWL gamma encode happens in the translated PS, not here)', () => {
+  const state = rtState({ colorInfo0: 1 << 16 });
+  assert.equal(state.convertColor0ToGamma, true);
+  assert.equal(state.colorFormatName, 'k_8_8_8_8_GAMMA');
+  // and with the PS not exporting oC0 — the attachment is never written; the flag still records the format
+  const state2 = RS.buildRenderTargetState(rt({ colorInfo0: 1 << 16 }), { psExportsColor0: false, psExportsDepth: false });
+  assert.equal(state2.convertColor0ToGamma, true);
+});
+
+test('k_8_8_8_8 (0) does not gamma-encode', () => {
+  assert.equal(rtState({ colorInfo0: 0 }).convertColor0ToGamma, false);
 });
 
 test('format traps are skipped when the pixel shader does not export oC0 (no MSAA garbage-writes)', () => {
@@ -217,10 +228,23 @@ test('kD24FS8 depth traps when the PS exports oDepth', () => {
   assert.throws(() => rtState({ depthInfo: 1 << 16 }, { psExportsDepth: true }), /kD24FS8/);
 });
 
-test('alpha test traps loudly (no WGSL representation)', () => {
-  assert.throws(() => rtState({ colorControl: 0x8 | (1 << 0) }), /alpha test/i);
+test('alpha test decodes (applied by the translated PS, not pipeline state)', () => {
+  const st = rtState({ colorControl: 0x8 | 0x1, alphaRef: 0x3F000000 }); // enable | kLess
+  assert.deepEqual(st.alphaTest, { compare: 1, referenceDword: 0x3F000000 });
+  // kAlways (7): always passes — decode treats the test as disabled (xenia skips it)
+  assert.equal(rtState({ colorControl: 0x8 | 0x7, alphaRef: 0 }).alphaTest, null);
+  // disabled (bit 3 clear): no alpha test even with function bits set
+  assert.equal(rtState({ colorControl: 0x6 }).alphaTest, null);
+  // every Xenos CompareFunction decodes 0..6 and alphaTest only appears with bit 3
+  for (let compare = 0; compare <= 7; compare++) {
+    const st = rtState({ colorControl: 0x8 | compare, alphaRef: 0x3F800000 });
+    if (compare === 7) assert.equal(st.alphaTest, null);
+    else assert.equal(st.alphaTest.compare, compare);
+  }
   // alpha-to-coverage on its own is not alpha test — it is a no-op at 1x MSAA and does not trap
-  assert.doesNotThrow(() => rtState({ colorControl: 0x10 }));
+  assert.doesNotThrow(() => rtState({ colorControl: 0x10, alphaRef: 0 }));
+  // enabled without a reference in the snapshot traps (no fabricated reference)
+  assert.throws(() => rtState({ colorControl: 0x8 | 0x1, alphaRef: undefined }), /alphaRef/);
 });
 
 test('a missing snapshot traps with a named reason (no fabricated ROP state)', () => {
@@ -236,4 +260,106 @@ test('the error class is stable and carries the message', () => {
     assert.ok(e instanceof RS.XenosRenderStateError);
     assert.match(e.message, /k_16_16_16_16_FLOAT/);
   }
+});
+
+// ------------------------------------------------------------ scissor (PA_SC_*)
+const ZERO_SCISSOR = {
+  windowScissorTl: 0,
+  windowScissorBr: 0x00400040, // 64x64 (u14 fields)
+  windowOffset: 0,
+  screenScissorTl: 0,
+  screenScissorBr: 0x20002000, // reset default: 8192x8192
+};
+const sc = (overrides = {}) => ({ ...ZERO_SCISSOR, ...overrides });
+const scState = (overrides = {}, width = 64, height = 64) => RS.buildScissorState(sc(overrides), { width, height });
+
+test('scissor decodes a full-surface rect', () => {
+  assert.deepEqual(scState(), { x: 0, y: 0, width: 64, height: 64 });
+});
+
+test('window scissor br is exclusive (extent = br - tl)', () => {
+  assert.deepEqual(
+    scState({ windowScissorTl: (10 << 16) | 8, windowScissorBr: (40 << 16) | 32 }),
+    { x: 8, y: 10, width: 24, height: 30 },
+  );
+});
+
+test('window offset is added when the TL disable bit is clear; signed 15-bit offsets', () => {
+  // offset (+3, +5): rect shifts
+  assert.deepEqual(
+    scState({ windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: (5 << 16) | 3 }),
+    { x: 3, y: 5, width: 61, height: 59 },
+  );
+  // negative offsets collapse at 0 (xenia: max(tl, 0), br = max(br, tl))
+  const r = scState({ windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: ((-10 & 0x7fff) << 16) | (-4 & 0x7fff) });
+  assert.equal(r.x, 0);
+  assert.equal(r.y, 0);
+  // disable bit (31) skips the offset entirely
+  assert.deepEqual(
+    scState({ windowScissorTl: 0x80000000, windowScissorBr: 0x00400040, windowOffset: 0x7FFF7FFF }),
+    { x: 0, y: 0, width: 64, height: 64 },
+  );
+});
+
+test('screen scissor clamps the window rect from outside (tl max, br min)', () => {
+  // screen rect (16,8)-(48,48): window rect clipped to it
+  const r = scState({ screenScissorTl: (8 << 16) | 16, screenScissorBr: (48 << 16) | 48 });
+  assert.deepEqual(r, { x: 16, y: 8, width: 32, height: 40 });
+  // screen rect strictly inside a larger window rect keeps window bounds where screen is wider
+  const r2 = scState({ windowScissorTl: (20 << 16) | 20, windowScissorBr: (30 << 16) | 30, screenScissorTl: 0, screenScissorBr: 0x20002000 });
+  assert.deepEqual(r2, { x: 20, y: 20, width: 10, height: 10 });
+});
+
+test('inverted rects collapse to a zero-sized scissor (xenia)', () => {
+  assert.deepEqual(
+    scState({ windowScissorTl: 0x00400040, windowScissorBr: 0 }),
+    { x: 64, y: 64, width: 0, height: 0 },
+  );
+});
+
+test('rect is clamped to the surface (WebGPU requires the scissor inside the attachment)', () => {
+  const r = scState({ windowScissorTl: 0, windowScissorBr: 0x1FFF1FFF }, 64, 64); // way past the canvas
+  assert.deepEqual(r, { x: 0, y: 0, width: 64, height: 64 });
+  const r2 = scState({ windowScissorTl: (100 << 16) | 100, windowScissorBr: 0x00400040 }, 64, 64);
+  assert.deepEqual(r2, { x: 64, y: 64, width: 0, height: 0 });
+});
+
+test('window_offset_disable is only bit 31 (other TL bits are the u14 coords)', () => {
+  const r = scState({ windowScissorTl: 0x80000005 | (7 << 16), windowScissorBr: 0x00400040, windowOffset: (100 << 16) | 100 });
+  assert.equal(r.x, 5);
+  assert.equal(r.y, 7);
+});
+
+test('a missing snapshot traps with a named reason (no fabricated raster state)', () => {
+  assert.throws(() => RS.buildScissorState(undefined, { width: 64, height: 64 }), /params\.scissor/);
+  assert.throws(() => RS.buildScissorState(null, { width: 64, height: 64 }), /params\.scissor/);
+  assert.throws(() => RS.buildScissorState({}, { width: 0, height: 64 }), /no extent/);
+});
+
+// ------------------------------------------------------------ MSAA (RB_SURFACE_INFO)
+test('RB_SURFACE_INFO msaa_samples 2x/4x trap loudly naming MSAA (canvas/depth are single-sampled)', () => {
+  for (const [samples, label] of [[1, '2x'], [2, '4x']]) {
+    assert.throws(() => rtState({ surfaceInfo: samples << 16 }), new RegExp(label + ' MSAA'));
+  }
+  // 3 (k3X, "this value is not supported on hardware" but must still not pass) — also traps
+  assert.throws(() => rtState({ surfaceInfo: 3 << 16 }), /MSAA/);
+});
+
+test('RB_SURFACE_INFO k1X renders (default reset state) and exposes the surface pitch', () => {
+  const state = rtState({ surfaceInfo: (0 << 16) | 0x0123 });
+  assert.equal(state.surfacePitch, 0x0123);
+});
+
+test('render-target snapshot without RB_SURFACE_INFO refuses to draw (MSAA decision required)', () => {
+  const noSurface = { ...rt() };
+  delete noSurface.surfaceInfo;
+  assert.throws(() => RS.buildRenderTargetState(noSurface, { psExportsColor0: true }), /RB_SURFACE_INFO/);
+});
+
+test('decodeColorInfo decodes color_exp_bias as a SIGNED 6-bit field (xenia int32_t :6)', () => {
+  const bias = (v) => RS.decodeColorInfo(v << 20).expBias;
+  assert.equal(bias(3), 3);
+  assert.equal(bias(-2 & 0x3F), -2, '0b111110 decodes as -2, not 62');
+  assert.equal(bias(0x20), -32, '0b100000 is -32');
+  assert.equal(bias(0x1F), 31);
 });

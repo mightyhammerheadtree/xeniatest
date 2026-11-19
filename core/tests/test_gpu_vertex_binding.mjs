@@ -99,6 +99,7 @@ function makeFakeDevice() {
       setVertexBuffer(i, b) { p.vbs[i] = b; },
       setIndexBuffer(b, f) { p.ib = { buffer: b, format: f }; },
       setBlendConstant(c) { p.blendConstant = c; },
+      setScissorRect(x, y, w, h) { p.scissorRect = [x, y, w, h]; },
       setStencilReference(ref) { p.stencilRef = ref; },
       draw(n) { p.drawN = n; },
       drawIndexed(n, inst, first, baseVertex) { p.drawIN = { n, inst, first, baseVertex }; },
@@ -146,6 +147,7 @@ function makeBackend(guest, { withShader = true, placeholderShader = true } = {}
 
 /** A sane zeroed render-target snapshot: 8_8_8_8 RT0, all writes, no blend/depth/stencil (xenia: RB_BLENDCONTROL=1 <<16|1 disables blending). */
 const DEFAULT_RT = {
+  surfaceInfo: 0,
   colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
   depthInfo: 0,
   colorMask: 0x0000FFFF,
@@ -154,12 +156,14 @@ const DEFAULT_RT = {
   depthControl: 0,
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0,
 };
 const baseParams = {
   primType: 4, primTypeName: 'triangle-list', numIndices: 3,
   isIndexed: false, indexGuestBase: 0, indexFormat: 0, indexEndianness: 0, indexLengthWords: 0,
   vertexFetchConstants: FETCH_CONSTS,
   renderTargets: DEFAULT_RT,
+  scissor: { windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0, screenScissorTl: 0, screenScissorBr: 0x20002000 },
 };
 
 test('fetch draw uploads the guest vertex buffer with BE→LE dword swap and binds it', () => {

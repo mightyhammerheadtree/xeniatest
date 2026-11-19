@@ -86,15 +86,20 @@ const ALU_VECTOR_TRAPS_PIXEL = Object.freeze({
 const ALU_SCALAR_OPS = Object.freeze({
   0: 'adds', 1: 'adds_prev', 2: 'muls', 3: 'muls_prev', 5: 'maxs', 6: 'mins',
   7: 'seqs', 8: 'sgts', 9: 'sges', 10: 'snes', 11: 'frcs', 12: 'truncs', 13: 'floors',
+  // xenia: exp/log/rcp/rsq/sin/cos map to GLSL.std.450 single-argument calls;
+  // the *c/f variants add the documented +/-INF clamps (see ALU_SCALAR_TRANSCENDENTAL_HELPERS).
+  14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
+  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 40: 'sqrt', 48: 'sin', 49: 'cos',
   25: 'subs', 26: 'subs_prev', 27: 'setp_eq', 28: 'setp_ne', 29: 'setp_gt', 30: 'setp_ge',
   31: 'setp_inv', 32: 'setp_pop', 33: 'setp_clr', 34: 'setp_rstr', 50: 'retain_prev',
 });
+// The clamped transcendentals call these module-scope helpers (emitted only when used).
+const ALU_SCALAR_TRANSCENDENTAL_HELPERS = new Set(['logc', 'rcpc', 'rcpf', 'rsqc', 'rsqf']);
 const ALU_SCALAR_TRAPS = Object.freeze({
-  4: 'muls_prev2', 14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
-  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 23: 'maxas', 24: 'maxasf', 35: 'kills_eq',
-  36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one', 40: 'sqrt',
+  4: 'muls_prev2', 23: 'maxas', 24: 'maxasf', 35: 'kills_eq',
+  36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one',
   41: 'opcode_41', 42: 'mulsc', 43: 'mulsc', 44: 'addsc', 45: 'addsc', 46: 'subsc',
-  47: 'subsc', 48: 'sin', 49: 'cos',
+  47: 'subsc',
   51: 'opcode_51', 52: 'opcode_52', 53: 'opcode_53', 54: 'opcode_54', 55: 'opcode_55',
   56: 'opcode_56', 57: 'opcode_57', 58: 'opcode_58', 59: 'opcode_59', 60: 'opcode_60',
   61: 'opcode_61', 62: 'opcode_62', 63: 'opcode_63',
@@ -107,10 +112,9 @@ const ALU_SCALAR_OPS_PIXEL = Object.freeze({
   35: 'kills_eq', 36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one',
 });
 const ALU_SCALAR_TRAPS_PIXEL = Object.freeze({
-  4: 'muls_prev2', 14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
-  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 23: 'maxas', 24: 'maxasf', 40: 'sqrt',
+  4: 'muls_prev2', 23: 'maxas', 24: 'maxasf',
   41: 'opcode_41', 42: 'mulsc', 43: 'mulsc', 44: 'addsc', 45: 'addsc', 46: 'subsc',
-  47: 'subsc', 48: 'sin', 49: 'cos',
+  47: 'subsc',
   51: 'opcode_51', 52: 'opcode_52', 53: 'opcode_53', 54: 'opcode_54', 55: 'opcode_55',
   56: 'opcode_56', 57: 'opcode_57', 58: 'opcode_58', 59: 'opcode_59', 60: 'opcode_60',
   61: 'opcode_61', 62: 'opcode_62', 63: 'opcode_63',
@@ -441,7 +445,7 @@ function assertOpcodeSupported(decoded, shaderType) {
     if (scalarTrap === 'maxas' || scalarTrap === 'maxasf') throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} (a0 write) is not supported yet`);
     if (scalarTrap.startsWith('kills_')) throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} is pixel-shader-only (kills do not exist in a vertex stage)`);
     if (scalarTrap.startsWith('opcode_')) throw new XenosTranslateError(`alu[${instructionIndex}]: scalar opcode ${scalarOpcode} (${scalarTrap}) is invalid`);
-    throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} (transcendental math with clamped IEEE semantics) is not supported yet`);
+    throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} is not supported yet`);
   }
 }
 
@@ -681,6 +685,20 @@ function computeScalarResult(instr) {
     case 'frcs': set(`(${a()} - floor(${a()}))`); break;
     case 'truncs': set(`trunc(${a()})`); break;
     case 'floors': set(`floor(${a()})`); break;
+    // xenia → GLSL.std.450 single-argument calls (kExp/kLog/kRsq/kSqrt/kSin/kCos).
+    case 'exp': set(`exp2(${a()})`); break;
+    case 'log': set(`log2(${a()})`); break;
+    case 'rcp': set(`(1.0 / ${a()})`); break;
+    case 'rsq': set(`inverseSqrt(${a()})`); break;
+    case 'sqrt': set(`sqrt(${a()})`); break;
+    case 'sin': set(`sin(${a()})`); break;
+    case 'cos': set(`cos(${a()})`); break;
+    // xenia's clamped variants: the documented +/-INF clamps (see xenos* helpers).
+    case 'logc': set(`xenosLogc(${a()})`); break;
+    case 'rcpc': set(`xenosRcpc(${a()})`); break;
+    case 'rcpf': set(`xenosRcpf(${a()})`); break;
+    case 'rsqc': set(`xenosRsqc(${a()})`); break;
+    case 'rsqf': set(`xenosRsqf(${a()})`); break;
     case 'setp_eq':
     case 'setp_ne':
     case 'setp_gt':
@@ -744,6 +762,7 @@ function collectStats(dwords, decoded, shaderType) {
   let usesFloatConstants = false;
   let usesBoolConstants = false;
   let predicateUsed = false;
+  let usesTranscendentalHelpers = false;
   let psUsed = false;
   let writesPosition = false;
   let exportsColor0 = false;
@@ -771,6 +790,7 @@ function collectStats(dwords, decoded, shaderType) {
           maxReg = Math.max(maxReg, op.index + 1);
         }
       }
+      if (alu.scalarOpName && ALU_SCALAR_TRANSCENDENTAL_HELPERS.has(alu.scalarOpName)) usesTranscendentalHelpers = true;
       if (alu.isPredicated) predicateUsed = true;
       if ((alu.vectorOpName && alu.vectorOpName.includes('push'))) predicateUsed = true;
       if ((alu.scalarOpName && alu.scalarOpName.startsWith('setp'))) predicateUsed = true;
@@ -787,7 +807,7 @@ function collectStats(dwords, decoded, shaderType) {
     }
   }
   // registerCount counts guest GPRs r0..rN-1 that the shader may touch.
-  return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition, exportsColor0, exportsDepth };
+  return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition, exportsColor0, exportsDepth, usesTranscendentalHelpers };
 }
 
 const EXPORT_TARGET_MEMBER = Object.freeze({ position: 'pos', interpolator: (i) => `v${i}`, color0: () => 'color0' });
@@ -945,9 +965,21 @@ function pixelInterpolatorLanes(stats) {
  * @param {Uint32Array} dwords
  * @param {object} decoded from decodeShader
  * @param {object} stats from collectStats
- * @param {{bindings?: {float: number, bool: number}|null, linkedInterpolators?: number[]|null}} options
+ * @param {{bindings?: {float: number, bool: number, alphaTest?: number}|null, linkedInterpolators?: number[]|null, alphaTest?: {compare: number}|null, convertColor0ToGamma?: boolean}} options
  *   bindings — global (program-wide) binding indices to use instead of the
  *   per-stage self-computation (needed so VS and PS agree on @binding);
+ *   alphaTest — pixel only: emit a discard-by-alpha (xenia's alpha test,
+ *   RB_COLORCONTROL + RB_ALPHA_REF) comparing the oC0 alpha against a
+ *   constant in `bindings.alphaTest`; the compare is a Xenos CompareFunction
+ *   number (0..6 — kAlways never reaches the translator, the decode nulls it);
+ *   convertColor0ToGamma — pixel only: gamma-encode the oC0 RGB (saturate
+ *   then the Xbox 360 PWL pieces, truncated fixed point — xenia's
+ *   PreSaturatedLinearToPWLGamma). The alpha channel is untouched.
+ *   colorExpBias — pixel only: integer exponent (-32..31) from
+ *   RB_COLOR_INFO.color_exp_bias (6-bit signed); when non-zero the oC0
+ *   register (all four lanes, xenia's OpMul in CompletePixelShader_WriteToRTVs)
+ *   is multiplied by 2^exponent before any gamma encode. Baked as an exact
+ *   power-of-two f32 literal into the WGSL (memoized per value).
  *   linkedInterpolators — pixel only: the interpolator lanes (GPRs) wired to
  *   vertex outputs; others read as zero (xenia zero-initializes registers).
  */
@@ -976,6 +1008,17 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
       : 'struct PsOut {\n  @location(0) color0: vec4f\n};';
   }
 
+  // The alpha test is meaningful only when the pixel shader exports oC0
+  // (xenia applies it exactly then) and the compare is not kAlways.
+  const alphaTest = shaderType === 'pixel' && options?.alphaTest && stats.exportsColor0 && options.alphaTest.compare >= 0 && options.alphaTest.compare < 7
+    ? options.alphaTest
+    : null;
+  // Gamma encode applies to the RGB lanes of oC0, only when the PS exports oC0
+  // (xenia applies it there) and the guest RT0 is k_8_8_8_8_GAMMA.
+  const convertColor0ToGamma = shaderType === 'pixel' && !!options?.convertColor0ToGamma && stats.exportsColor0;
+  const colorExpBias = shaderType === 'pixel' && stats.exportsColor0
+    ? Math.max(-32, Math.min(31, (options?.colorExpBias ?? 0) | 0))
+    : 0;
   const em = makeEmitter();
   em.emit(shaderType === 'vertex'
     ? '// Generated by wgsl_translate.js — Xenos vertex shader ucode → WGSL'
@@ -984,17 +1027,106 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
   em.emit('// result; p0 = the (single) hardware predicate register.');
   let floatBinding = -1;
   let boolBinding = -1;
+  let alphaTestBinding = -1;
   if (bindings) {
     floatBinding = bindings.float;
     boolBinding = bindings.bool;
+    alphaTestBinding = bindings.alphaTest ?? -1;
   } else {
     if (usesFloatConstants) floatBinding = 0;
     boolBinding = usesBoolConstants ? (floatBinding >= 0 ? 1 : 0) : -1;
+    alphaTestBinding = alphaTest ? (boolBinding >= 0 ? boolBinding + 1 : (floatBinding >= 0 ? 1 : 0)) : -1;
   }
+  if (alphaTest && alphaTestBinding < 0) alphaTestBinding = (usesBoolConstants && boolBinding >= 0 ? boolBinding + 1 : (usesFloatConstants && floatBinding >= 0 ? 1 : 0));
   if (usesFloatConstants && floatBinding >= 0) em.emit(`@group(0) @binding(${floatBinding}) var<uniform> fc: array<vec4f, 256>;`);
   if (usesBoolConstants && boolBinding >= 0) {
     em.emit(`@group(0) @binding(${boolBinding}) var<uniform> bools: array<u32, 8>;`);
     em.emit('fn bc(n: u32) -> bool { return ((bools[n >> 5u] >> (n & 31u)) & 1u) != 0u; }');
+  }
+  if (alphaTest) {
+    em.emit(`@group(0) @binding(${alphaTestBinding}) var<uniform> alphaTest: vec4f;`);
+    // xenia CompareFunction (same 3-bit numbering as zfunc); plain WGSL float
+    // operators match xenia's NaN behavior (only kNotEqual is true for NaN).
+    const expr = [
+      'false',
+      'x < alphaTest.x', 'x == alphaTest.x', 'x <= alphaTest.x',
+      'x > alphaTest.x', 'x != alphaTest.x', 'x >= alphaTest.x',
+    ][alphaTest.compare];
+    em.emit(`fn alphaTestPass(x: f32) -> bool { return ${expr}; }`);
+  }
+  if (stats.usesTranscendentalHelpers) {
+    // xenia's clamped transcendental variants (logc/rcpc/rcpf/rsqc/rsqf):
+    // single-precision ops with the documented +/-INF clamps (SPIR-V path:
+    // OpFOrdEqual selects). FLT_MAX = 3.402823466e38; ±INF via bitcast.
+    // WGSL forbids constant expressions producing infinity, so ±inf is built
+    // at runtime as abs(a) / 0.0 (+inf; IEEE runtime division by zero is not a
+    // trap). NaN inputs never satisfy == against ±inf, so NaN propagates
+    // exactly like xenia's OpFOrdEqual.
+    em.emit('fn xenosLogc(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = log2(a);');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == -inf) { return -3.402823466e+38; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRcpc(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = 1.0 / a;');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == -inf) { return -3.402823466e+38; }');
+    em.emit('if (t == inf) { return 3.402823466e+38; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRcpf(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = 1.0 / a;');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == inf) { return 0.0; }');
+    em.emit('if (t == -inf) { return -0.0; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRsqc(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = inverseSqrt(a);');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == -inf) { return -3.402823466e+38; }');
+    em.emit('if (t == inf) { return 3.402823466e+38; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRsqf(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = inverseSqrt(a);');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == inf) { return 0.0; }');
+    em.emit('if (t == -inf) { return -0.0; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+  }
+  if (convertColor0ToGamma) {
+    // PreSaturatedLinearToPWLGamma: saturate happens at the call site; this is
+    // the exact 3-piece piecewise — scale and offset per segment, then
+    // trunc(x * scale) / 255 + offset (xenia's truncated fixed-point encode).
+    em.emit('fn xenosGamma(x: f32) -> f32 {');
+    em.indentIn();
+    em.emit('var scale: f32;');
+    em.emit('var offset: f32;');
+    em.emit('if (x >= (128.0 / 1023.0)) {');
+    em.indentIn();
+    em.emit('if (x >= (512.0 / 1023.0)) { scale = 1023.0 / 8.0; offset = 128.0 / 255.0; } else { scale = 1023.0 / 4.0; offset = 64.0 / 255.0; }');
+    em.indentOut();
+    em.emit('} else {');
+    em.indentIn();
+    em.emit('if (x >= (64.0 / 1023.0)) { scale = 1023.0 / 2.0; offset = 32.0 / 255.0; } else { scale = 1023.0; offset = 0.0; }');
+    em.indentOut();
+    em.emit('}');
+    em.emit('return trunc(x * scale) * (1.0 / 255.0) + offset;');
+    em.indentOut();
+    em.emit('}');
   }
   if (inStruct) em.emit(inStruct);
   em.emit(outStruct);
@@ -1026,6 +1158,19 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
   for (const block of decoded.blocks) {
     emitBlock(em, block, shaderType);
   }
+  // xenia order (CompletePixelShader_WriteToRTVs): the alpha-test discard runs on the
+  // UNBIASED alpha (xenia's kill happens in the ALU phase); then the whole export
+  // register is scaled by 2^bias (OpMul); then the gamma encode saturates + pieces RGB.
+  if (alphaTest) {
+    em.emit('if (!alphaTestPass(out.color0.w)) { discard; }');
+  }
+  if (colorExpBias !== 0) {
+    const scale = Math.pow(2, colorExpBias).toExponential(10); // exact for powers of two
+    em.emit(`out.color0 = out.color0 * vec4f(${scale});`);
+  }
+  if (convertColor0ToGamma) {
+    em.emit('out.color0 = vec4f(xenosGamma(clamp(out.color0.x, 0.0, 1.0)), xenosGamma(clamp(out.color0.y, 0.0, 1.0)), xenosGamma(clamp(out.color0.z, 0.0, 1.0)), out.color0.w);');
+  }
   em.emit('return out;');
   em.indentOut();
   em.emit('}');
@@ -1042,6 +1187,9 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
     usesFloatConstants,
     usesBoolConstants,
     predicateUsed,
+    alphaTest: alphaTest ? { compare: alphaTest.compare, binding: alphaTestBinding } : null,
+    convertColor0ToGamma,
+    colorExpBias,
   };
 }
 
@@ -1065,7 +1213,7 @@ function translatePixelShader(ucodeWords, options) {
   const bindings = options?.bindings ?? null;
   const psLanes = pixelInterpolatorLanes(stats);
   const linked = options?.linkedInterpolators ?? psLanes;
-  return assembleStage('pixel', dwords, decoded, stats, { bindings, linkedInterpolators: linked });
+  return assembleStage('pixel', dwords, decoded, stats, { bindings, linkedInterpolators: linked, alphaTest: options?.alphaTest ?? null, convertColor0ToGamma: options?.convertColor0ToGamma ?? false, colorExpBias: options?.colorExpBias ?? 0 });
 }
 
 /**
@@ -1077,8 +1225,26 @@ function translatePixelShader(ucodeWords, options) {
  * WebGPU forbid a fragment input without a matching vertex output, so lanes
  * the VS does not export read as zeros here (xenia zero-initializes registers
  * the same way).
+ *
+ * `options.alphaTest` ({ compare: <Xenos CompareFunction 0..6> }) enables the
+ * alpha test (xenia's RB_COLORCONTROL alpha_test_enable + RB_ALPHA_REF): the
+ * fragment stage discards fragments whose oC0 alpha fails the comparison.
+ * Only applied when the pixel shader statically exports oC0 (xenia's
+ * condition); kAlways (7) is rejected — the test always passes then. The
+ * reference value is NOT baked into the shader — the backend binds the
+ * IEEE-754 RB_ALPHA_REF bits as a small uniform at bindings.alphaTest.
+ *
+ * `options.convertColor0ToGamma` gamma-encodes the oC0 RGB lanes with xenia's
+ * PWL piecewise (xenia's kSysFlag_ConvertColor0ToGamma, applied in the RTV
+ * path when RT0 is k_8_8_8_8_GAMMA — blending then happens on gamma-encoded
+ * values, same caveat as xenia). Pure ALU; no new bindings.
+ *
+ * `options.colorExpBias` (integer -32..31, from RB_COLOR_INFO.color_exp_bias
+ * bits +20:6, signed) multiplies the oC0 register by 2^exponent (all four
+ * lanes) before the gamma encode — xenia's OpMul in CompletePixelShader_WriteToRTVs.
+ * Power of two, so f32-exact; baked as a literal into the WGSL. 0 (default) emits nothing.
  */
-function translateShaderProgram(vsUcodeWords, psUcodeWords) {
+function translateShaderProgram(vsUcodeWords, psUcodeWords, options) {
   const vd = dwordsOf(vsUcodeWords);
   const decodedV = decodeShader(vd, 'vertex');
   const statsV = collectStats(vd, decodedV, 'vertex');
@@ -1087,13 +1253,20 @@ function translateShaderProgram(vsUcodeWords, psUcodeWords) {
   const statsP = pd ? collectStats(pd, decodedP, 'pixel') : null;
   const mergedFloat = statsV.usesFloatConstants || (statsP?.usesFloatConstants ?? false);
   const mergedBool = statsV.usesBoolConstants || (statsP?.usesBoolConstants ?? false);
-  const bindings = { float: mergedFloat ? 0 : -1, bool: mergedBool ? (mergedFloat ? 1 : 0) : -1 };
+  let alphaTest = null;
+  if (options?.alphaTest && statsP?.exportsColor0) {
+    const compare = options.alphaTest.compare >>> 0;
+    if (compare > 7) throw new XenosTranslateError(`alpha test compare ${compare} is not a Xenos CompareFunction (0..7)`);
+    if (compare !== 7) alphaTest = { compare };
+  }
+  const alphaTestBinding = alphaTest ? (mergedBool ? (mergedFloat ? 2 : 1) : (mergedFloat ? 1 : 0)) : -1;
+  const bindings = { float: mergedFloat ? 0 : -1, bool: mergedBool ? (mergedFloat ? 1 : 0) : -1, alphaTest: alphaTestBinding };
   const vertex = assembleStage('vertex', vd, decodedV, statsV, { bindings });
   let fragment = null;
   if (pd) {
     const vsExports = new Set(decodedV.interpolatorLocations);
     const linked = pixelInterpolatorLanes(statsP).filter((i) => vsExports.has(i));
-    fragment = assembleStage('pixel', pd, decodedP, statsP, { bindings, linkedInterpolators: linked });
+    fragment = assembleStage('pixel', pd, decodedP, statsP, { bindings, linkedInterpolators: linked, alphaTest, convertColor0ToGamma: options?.convertColor0ToGamma ?? false, colorExpBias: options?.colorExpBias ?? 0 });
   }
   return {
     type: 'program',
@@ -1104,6 +1277,9 @@ function translateShaderProgram(vsUcodeWords, psUcodeWords) {
     interpolatorLocations: vertex.interpolatorLocations,
     exportsColor0: fragment?.exportsColor0 ?? false,
     exportsDepth: fragment?.exportsDepth ?? false,
+    alphaTest: fragment?.alphaTest ?? null,
+    convertColor0ToGamma: fragment?.convertColor0ToGamma ?? false,
+    colorExpBias: fragment?.colorExpBias ?? 0,
   };
 }
 
