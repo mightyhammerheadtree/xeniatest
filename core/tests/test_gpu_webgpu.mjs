@@ -81,3 +81,25 @@ test('end-to-end: command processor + backend without a GPU — registers update
   // real device and is exercised in the browser bring-up (docs/XENOS_GPU.md).
   assert.throws(() => cp.executeCommandBuffer(buf), (e) => /draw before attach/.test(e.message));
 });
+
+test('topologyForPrimType maps the WebGPU-encodable primitive types and traps the rest', () => {
+  const { topologyForPrimType } = globalThis.XenonWebGpuBackend._internal;
+  assert.equal(topologyForPrimType(1, 'kPointList'), 'point-list');
+  assert.equal(topologyForPrimType(2, 'kLineList'), 'line-list');
+  assert.equal(topologyForPrimType(3, 'kLineStrip'), 'line-strip');
+  assert.equal(topologyForPrimType(4, 'kTriangleList'), 'triangle-list');
+  assert.equal(topologyForPrimType(6, 'kTriangleStrip'), 'triangle-strip');
+  for (const [prim, name] of [[5, 'kTriangleFan'], [7, 'kTriangleWithWFlags'], [8, 'kRectangleList'], [0x0c, 'kLineLoop'], [0x0d, 'kQuadList'], [0x0f, 'kPolygon']]) {
+    assert.throws(() => topologyForPrimType(prim, name), (e) => e instanceof XenosWebGpuError && /topology is not encodable/.test(e.message), name);
+  }
+});
+
+test('isIntegerGpuVertexFormat flags only pure uint/sint formats', () => {
+  const { isIntegerGpuVertexFormat } = globalThis.XenonWebGpuBackend._internal;
+  for (const f of ['uint32', 'uint32x2', 'uint32x4', 'uint8x4', 'uint16x2', 'sint32', 'sint8x4', 'sint16x4']) {
+    assert.equal(isIntegerGpuVertexFormat(f), true, f);
+  }
+  for (const f of ['float32', 'float32x3', 'float16x2', 'unorm8x4', 'snorm16x4', 'unorm10-10-10-2']) {
+    assert.equal(isIntegerGpuVertexFormat(f), false, f);
+  }
+});

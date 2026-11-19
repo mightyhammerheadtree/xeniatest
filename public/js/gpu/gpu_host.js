@@ -35,7 +35,7 @@
     const ring = globalThis.XenonGpuRingBuffer;
     const webgpu = globalThis.XenonWebGpuBackend;
     if (!pm4g || !reg || !cp || !ring || !webgpu) {
-      throw new Error('gpu_host.js: load xenos_registers.js, register_file.js, pm4.js, command_processor.js, ring_buffer.js and webgpu_backend.js first');
+      throw new Error('gpu_host.js: load xenos_registers.js, register_file.js, pm4.js, command_processor.js, ring_buffer.js, vertex_fetch.js, wgsl_translate.js and webgpu_backend.js first');
     }
     return { pm4g, reg, cp, ring, webgpu };
   }

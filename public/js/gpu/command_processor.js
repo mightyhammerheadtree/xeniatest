@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -513,6 +513,14 @@
       // the draw path is the only consumer and this is the cheapest correct place to snapshot them.
       const vertexFetchConstants = new Uint32Array(192);
       for (let i = 0; i < 192; i++) vertexFetchConstants[i] = this.registers.read(SHADER_CONSTANT_FETCH_BASE + i) >>> 0;
+      // ALU constants (256 vec4f = SHADER_CONSTANT_ALU_BASE .. +1024 dwords) and bool constants
+      // (8 dwords = SHADER_CONSTANT_BOOL_BASE .. +8) are what the translated vertex shader's
+      // fc[]/bools uniform bindings read — snapshot them the same way (the backend content-
+      // hashes and only re-uploads when a draw actually changed them).
+      const aluConstants = new Uint32Array(1024);
+      for (let i = 0; i < 1024; i++) aluConstants[i] = this.registers.read(SHADER_CONSTANT_ALU_BASE + i) >>> 0;
+      const boolConstants = new Uint32Array(8);
+      for (let i = 0; i < 8; i++) boolConstants[i] = this.registers.read(SHADER_CONSTANT_BOOL_BASE + i) >>> 0;
       const draw = backendOrTrap(this.backend, 'draw', opcodeName);
       draw({
         primType: di.primType,
@@ -526,6 +534,8 @@
         vizQueryCondition,
         majorModeExplicit,
         vertexFetchConstants,
+        aluConstants,
+        boolConstants,
       });
       this.stats.draws++;
       return end;

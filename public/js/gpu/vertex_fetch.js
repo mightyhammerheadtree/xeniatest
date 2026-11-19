@@ -272,9 +272,13 @@
       throw new XenosFetchError(`vertex shader ucode length ${dwords.length} dwords is not a multiple of 3`);
     }
     const instructionBound = Math.floor(dwords.length / 3);
-    // Pass 1: find the CF-section upper bound = min exec CF address.
+    // Pass 1: find the CF-section upper bound = min exec CF address. The bound
+    // SHRINKS live (xenia AnalyzeUcode does the same): instruction words beyond
+    // the CF section can alias an exec-family opcode and must never be read as
+    // control flow — with a fixed loop bound they would corrupt the bound and
+    // silently drop real fetches at the top of the blob.
     let cfPairBound = instructionBound;
-    for (let i = 0; i < instructionBound; i++) {
+    for (let i = 0; i < cfPairBound; i++) {
       const [a, b] = unpackControlFlowPair(dwords, i);
       for (const cf of [a, b]) {
         const opcode = decodeExecCf(cf).opcode;
