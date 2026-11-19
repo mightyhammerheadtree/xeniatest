@@ -150,7 +150,7 @@ function makeFakeDevice() {
         drawIndexed(n) { log.drawCalls.push(['drawIndexed', n]); },
         end() {},
       };
-      return { beginRenderPass(desc) { log.passDesc = desc; return pass; }, finish() { return { fake: true }; } };
+      return { beginRenderPass(desc) { (log.passes ??= []).push(desc); log.passDesc = desc; return pass; }, finish() { return { fake: true }; } };
     },
     destroy() {},
   };
@@ -776,4 +776,38 @@ test('an oDepth-only PS writes depth but never color (writeMask 0, depth stays e
   assert.equal(log.pipelines[0].desc.fragment.targets[0].writeMask, 0, 'color writes disabled');
   assert.ok(log.pipelines[0].desc.fragment.module.desc.code.includes('frag_depth'), 'depth export preserved');
   assert.ok(log.pipelines[0].desc.depthStencil, 'depth-stencil state present');
+});
+
+test('frame-clear semantics: first pass of a frame clears, later passes load (guest clears, not the host)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest); // makeBackend mirrors attach()/_recreateDepth — frame starts fresh
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const passDescs = () => log.passes;
+  backend.draw(drawParams());
+  backend.draw(drawParams());
+  backend.draw(drawParams());
+  assert.deepEqual(passDescs().map((d) => d.colorAttachments[0].loadOp), ['clear', 'load', 'load']);
+  assert.deepEqual(passDescs().map((d) => d.depthStencilAttachment.depthLoadOp), ['clear', 'load', 'load']);
+  assert.deepEqual(passDescs().map((d) => d.depthStencilAttachment.stencilLoadOp), ['clear', 'load', 'load']);
+  // PM4_XE_SWAP ends the frame — next frame starts with defined targets again
+  backend.swap();
+  backend.draw(drawParams());
+  assert.equal(log.passes[3].colorAttachments[0].loadOp, 'clear');
+  assert.equal(log.passes[3].depthStencilAttachment.depthLoadOp, 'clear');
+  // depth clear value and stencil clear are the frame-start defaults
+  assert.equal(log.passes[3].depthStencilAttachment.depthClearValue, 1.0);
+  assert.equal(log.passes[3].depthStencilAttachment.stencilClearValue, 0);
+});
+
+test('resize() forces a defined-target frame (resize of the canvas = new frame)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  backend.resize();
+  backend.draw(drawParams());
+  assert.equal(log.passes[0].colorAttachments[0].loadOp, 'clear');
+  assert.equal(log.passes[1].colorAttachments[0].loadOp, 'clear');
 });

@@ -206,8 +206,15 @@
       this.device = null;
       this.context = null;
       this.format = null;
+      // Per-frame clear state for the color/depth attachments: the guest is
+      // responsible for clearing RT contents — the host clears only the FIRST
+      // pass of a frame (defined image), never a draw mid-frame (which would
+      // erase earlier draws' output and break depth sequencing). swap() marks
+      // the frame boundary; attach()/resize() reset both targets.
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
       this.depthTexture = null;
-      this.depthFormat = 'depth24plus';
+      this.depthFormat = 'depth24plus-stencil8'; // must match pipeline depth-stencil format
       this.pipelineCache = new Map(); // key -> GPURenderPipeline
       // Translated-program path: WeakMap<vs ucode object, Map<pairKey, program pair>>
       // and a per-VS-shader Map<layoutKey, { pipeline, bindGroup }>. Pipelines/bind groups
@@ -270,6 +277,8 @@
       const width = Math.max(1, this.canvas.width | 0);
       const height = Math.max(1, this.canvas.height | 0);
       if (this.depthTexture) this.depthTexture.destroy();
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
       this.depthTexture = this.device.createTexture({
         size: [width, height, 1],
         format: this.depthFormat,
@@ -608,18 +617,30 @@
 
     /** Begin the render pass for a frame segment: canvas color attachment + depth/stencil attachment. */
     _beginPass(encoder, colorView, rtState, scissor) {
-      const colorAttachments = [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }];
-      const desc = { colorAttachments };
+      const colorAttachment = this._frameClearColor
+        ? { view: colorView, loadOp: 'load', storeOp: 'store' }
+        : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' };
+      this._frameClearColor = true;
+      const desc = { colorAttachments: [colorAttachment] };
       if (this.depthView) {
-        desc.depthStencilAttachment = {
-          view: this.depthView,
-          depthLoadOp: 'clear',
-          depthClearValue: 1.0,
-          depthStoreOp: 'store',
-          stencilLoadOp: 'clear',
-          stencilClearValue: 0,
-          stencilStoreOp: 'store',
-        };
+        desc.depthStencilAttachment = this._frameClearDepth
+          ? {
+            view: this.depthView,
+            depthLoadOp: 'load',
+            depthStoreOp: 'store',
+            stencilLoadOp: 'load',
+            stencilStoreOp: 'store',
+          }
+          : {
+            view: this.depthView,
+            depthLoadOp: 'clear',
+            depthClearValue: 1.0,
+            depthStoreOp: 'store',
+            stencilLoadOp: 'clear',
+            stencilClearValue: 0,
+            stencilStoreOp: 'store',
+          };
+        this._frameClearDepth = true;
       }
       const pass = encoder.beginRenderPass(desc);
       if (rtState) {
@@ -894,6 +915,8 @@
 
     /** Frame boundary from PM4_XE_SWAP — xenia uses this to trigger present/swap on the host. */
     swap() {
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
       this.lastFrame = { at: (typeof performance !== 'undefined' ? performance.now() : Date.now()) };
       this.log('debug', `swap (frame ${this.uploads.frames})`);
     }
