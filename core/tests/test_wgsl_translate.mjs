@@ -320,6 +320,18 @@ test('temp registers are allocated across written GPRs only', () => {
 
 // ---------------------------------------------------------------- scalar operators
 const scalarOpCases = [
+  [14, 'exp', /exp2\(r\[1\]\.w\)/],
+  [15, 'logc', /xenosLogc\(r\[1\]\.w\)/],
+  [16, 'log', /log2\(r\[1\]\.w\)/],
+  [17, 'rcpc', /xenosRcpc\(r\[1\]\.w\)/],
+  [18, 'rcpf', /xenosRcpf\(r\[1\]\.w\)/],
+  [19, 'rcp', /\(1\.0 \/ r\[1\]\.w\)/],
+  [20, 'rsqc', /xenosRsqc\(r\[1\]\.w\)/],
+  [21, 'rsqf', /xenosRsqf\(r\[1\]\.w\)/],
+  [22, 'rsq', /inverseSqrt\(r\[1\]\.w\)/],
+  [40, 'sqrt', /sqrt\(r\[1\]\.w\)/],
+  [48, 'sin', /sin\(r\[1\]\.w\)/],
+  [49, 'cos', /cos\(r\[1\]\.w\)/],
   [0, 'adds', /\(r\[1\]\.w \+ r\[1\]\.x\)/],
   [1, 'adds_prev', /\(r\[1\]\.w \+ ps\)/],
   [2, 'muls', /\(r\[1\]\.w \* r\[1\]\.x\)/],
@@ -598,8 +610,8 @@ test('trap: maxas/maxasf scalar ops (a0 write) are rejected loudly', () => {
   }
 });
 
-test('trap: transcendental math (rcp/sin/cos/exp/log/sqrt/rsq) is rejected loudly', () => {
-  for (const opcode of [14, 15, 16, 17, 18, 19, 20, 21, 22, 40, 48, 49]) {
+test('trap: still-unsupported scalar ops (muls_prev2, maxas/maxasf, mulsc/addsc/subsc) are rejected loudly', () => {
+  for (const opcode of [4, 23, 24, 42, 43, 44, 45, 46, 47]) {
     assert.throws(
       () => T.translateVertexShader(shader(
         cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
@@ -994,9 +1006,9 @@ test('pixel shader: unsupported opcodes trap exactly as in the VS (cube, transce
   )), /cube/);
   assert.throws(() => T.translatePixelShader(shader(
     cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
-    aluWords({ scalarOpcode: 40 /* sqrt */, vectorWriteMask: 0, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ scalarOpcode: 23 /* maxas */, vectorWriteMask: 0, src: [temp(1), temp(1), temp(1)] }),
     aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
-  )), /sqrt/);
+  )), /maxas/);
 });
 
 test('translateShaderProgram: no pixel shader → fragment is null, bindings match the plain VS', () => {
@@ -1289,4 +1301,89 @@ test('translateShaderProgram: colorExpBias surfaces in the program result', asyn
   assert.equal(program.fragment.colorExpBias, -5);
   await assertValidWgsl(program.vertex.wgsl);
   await assertValidWgsl(program.fragment.wgsl);
+});
+
+// ================================================================ transcendentals (xenia SPIR-V semantics)
+test('clamped transcendentals emit the xenia helpers with the +/-INF clamps and Dawn-validate', async () => {
+  const cases = [
+    [15, /fn xenosLogc\(a: f32\) -> f32/],
+    [17, /fn xenosRcpc\(a: f32\) -> f32/],
+    [18, /fn xenosRcpf\(a: f32\) -> f32/],
+    [20, /fn xenosRsqc\(a: f32\) -> f32/],
+    [21, /fn xenosRsqf\(a: f32\) -> f32/],
+  ];
+  for (const [opcode, pattern] of cases) {
+    const out = T.translateVertexShader(shader(
+      cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+      vfetchWords({ dstReg: 1, format: 57 }),
+      aluWords({ vectorOpcode: 2, scalarOpcode: opcode, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+    ));
+    assert.match(out.wgsl, pattern, `helper missing for opcode ${opcode}`);
+    await assertValidWgsl(out.wgsl);
+  }
+  // no helper emitted when unused
+  const plain = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 0, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  assert.doesNotMatch(plain.wgsl, /fn xenosLogc/);
+});
+
+test('transcendental helpers implement the documented INF/FLT_MAX clamps (source-level check)', async () => {
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 15, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  const w = out.wgsl;
+  assert.match(w, /let t = log2\(a\);/);
+  assert.match(w, /let inf = abs\(a\) \/ 0\.0;/);
+  assert.match(w, /if \(t == -inf\) \{ return -3\.402823466e\+38; \}/);
+  const build = (op) => T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: op, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  )).wgsl;
+  assert.match(build(17), /let t = 1\.0 \/ a;/);
+  assert.match(build(17), /if \(t == -inf\) \{ return -3\.402823466e\+38; \}/);
+  assert.match(build(17), /if \(t == inf\) \{ return 3\.402823466e\+38; \}/);
+  assert.match(build(18), /if \(t == inf\) \{ return 0\.0; \}/);
+  assert.match(build(18), /if \(t == -inf\) \{ return -0\.0; \}/);
+  assert.match(build(20), /let t = inverseSqrt\(a\);/);
+  assert.match(build(21), /if \(t == inf\) \{ return 0\.0; \}/);
+  assert.match(build(21), /if \(t == -inf\) \{ return -0\.0; \}/);
+});
+
+test('scalar transcendental with clamp writes clamped via the standard scalar-clamp path', async () => {
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 14, scalarClamp: 1, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  assert.match(out.wgsl, /clamp\(exp2\(r\[1\]\.w\), 0\.0, 1\.0\)/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('transcendentals compose in exp/log back-to-back chains and pass Dawn', async () => {
+  // r4.w = log2(pow2(r1.w)) via rcp/rsq/sin/cos pairs — two transcendentals in one program.
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 3, seq(SEQ_FETCH, SEQ_ALU, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 14, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 16, scalarWriteMask: 0xF, scalarDest: 5, src: [temp(4), temp(4), temp(4)] }),
+  ));
+  assert.match(out.wgsl, /r\[4\] = vec4f\(exp2\(r\[1\]\.w\)\);/);
+  assert.match(out.wgsl, /r\[5\] = vec4f\(log2\(r\[4\]\.w\)\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('transcendental in a pixel shader (sin) runs in the fragment stage', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorOpcode: 2, scalarOpcode: 48, scalarWriteMask: 0xF, scalarDest: 4, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(4), temp(4), temp(4)] }),
+  ));
+  assert.match(out.wgsl, /sin\(r\[1\]\.w\)/);
+  await assertValidWgsl(out.wgsl);
 });

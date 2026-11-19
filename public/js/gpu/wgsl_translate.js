@@ -86,15 +86,20 @@ const ALU_VECTOR_TRAPS_PIXEL = Object.freeze({
 const ALU_SCALAR_OPS = Object.freeze({
   0: 'adds', 1: 'adds_prev', 2: 'muls', 3: 'muls_prev', 5: 'maxs', 6: 'mins',
   7: 'seqs', 8: 'sgts', 9: 'sges', 10: 'snes', 11: 'frcs', 12: 'truncs', 13: 'floors',
+  // xenia: exp/log/rcp/rsq/sin/cos map to GLSL.std.450 single-argument calls;
+  // the *c/f variants add the documented +/-INF clamps (see ALU_SCALAR_TRANSCENDENTAL_HELPERS).
+  14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
+  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 40: 'sqrt', 48: 'sin', 49: 'cos',
   25: 'subs', 26: 'subs_prev', 27: 'setp_eq', 28: 'setp_ne', 29: 'setp_gt', 30: 'setp_ge',
   31: 'setp_inv', 32: 'setp_pop', 33: 'setp_clr', 34: 'setp_rstr', 50: 'retain_prev',
 });
+// The clamped transcendentals call these module-scope helpers (emitted only when used).
+const ALU_SCALAR_TRANSCENDENTAL_HELPERS = new Set(['logc', 'rcpc', 'rcpf', 'rsqc', 'rsqf']);
 const ALU_SCALAR_TRAPS = Object.freeze({
-  4: 'muls_prev2', 14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
-  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 23: 'maxas', 24: 'maxasf', 35: 'kills_eq',
-  36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one', 40: 'sqrt',
+  4: 'muls_prev2', 23: 'maxas', 24: 'maxasf', 35: 'kills_eq',
+  36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one',
   41: 'opcode_41', 42: 'mulsc', 43: 'mulsc', 44: 'addsc', 45: 'addsc', 46: 'subsc',
-  47: 'subsc', 48: 'sin', 49: 'cos',
+  47: 'subsc',
   51: 'opcode_51', 52: 'opcode_52', 53: 'opcode_53', 54: 'opcode_54', 55: 'opcode_55',
   56: 'opcode_56', 57: 'opcode_57', 58: 'opcode_58', 59: 'opcode_59', 60: 'opcode_60',
   61: 'opcode_61', 62: 'opcode_62', 63: 'opcode_63',
@@ -107,10 +112,9 @@ const ALU_SCALAR_OPS_PIXEL = Object.freeze({
   35: 'kills_eq', 36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one',
 });
 const ALU_SCALAR_TRAPS_PIXEL = Object.freeze({
-  4: 'muls_prev2', 14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
-  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 23: 'maxas', 24: 'maxasf', 40: 'sqrt',
+  4: 'muls_prev2', 23: 'maxas', 24: 'maxasf',
   41: 'opcode_41', 42: 'mulsc', 43: 'mulsc', 44: 'addsc', 45: 'addsc', 46: 'subsc',
-  47: 'subsc', 48: 'sin', 49: 'cos',
+  47: 'subsc',
   51: 'opcode_51', 52: 'opcode_52', 53: 'opcode_53', 54: 'opcode_54', 55: 'opcode_55',
   56: 'opcode_56', 57: 'opcode_57', 58: 'opcode_58', 59: 'opcode_59', 60: 'opcode_60',
   61: 'opcode_61', 62: 'opcode_62', 63: 'opcode_63',
@@ -441,7 +445,7 @@ function assertOpcodeSupported(decoded, shaderType) {
     if (scalarTrap === 'maxas' || scalarTrap === 'maxasf') throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} (a0 write) is not supported yet`);
     if (scalarTrap.startsWith('kills_')) throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} is pixel-shader-only (kills do not exist in a vertex stage)`);
     if (scalarTrap.startsWith('opcode_')) throw new XenosTranslateError(`alu[${instructionIndex}]: scalar opcode ${scalarOpcode} (${scalarTrap}) is invalid`);
-    throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} (transcendental math with clamped IEEE semantics) is not supported yet`);
+    throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} is not supported yet`);
   }
 }
 
@@ -681,6 +685,20 @@ function computeScalarResult(instr) {
     case 'frcs': set(`(${a()} - floor(${a()}))`); break;
     case 'truncs': set(`trunc(${a()})`); break;
     case 'floors': set(`floor(${a()})`); break;
+    // xenia → GLSL.std.450 single-argument calls (kExp/kLog/kRsq/kSqrt/kSin/kCos).
+    case 'exp': set(`exp2(${a()})`); break;
+    case 'log': set(`log2(${a()})`); break;
+    case 'rcp': set(`(1.0 / ${a()})`); break;
+    case 'rsq': set(`inverseSqrt(${a()})`); break;
+    case 'sqrt': set(`sqrt(${a()})`); break;
+    case 'sin': set(`sin(${a()})`); break;
+    case 'cos': set(`cos(${a()})`); break;
+    // xenia's clamped variants: the documented +/-INF clamps (see xenos* helpers).
+    case 'logc': set(`xenosLogc(${a()})`); break;
+    case 'rcpc': set(`xenosRcpc(${a()})`); break;
+    case 'rcpf': set(`xenosRcpf(${a()})`); break;
+    case 'rsqc': set(`xenosRsqc(${a()})`); break;
+    case 'rsqf': set(`xenosRsqf(${a()})`); break;
     case 'setp_eq':
     case 'setp_ne':
     case 'setp_gt':
@@ -744,6 +762,7 @@ function collectStats(dwords, decoded, shaderType) {
   let usesFloatConstants = false;
   let usesBoolConstants = false;
   let predicateUsed = false;
+  let usesTranscendentalHelpers = false;
   let psUsed = false;
   let writesPosition = false;
   let exportsColor0 = false;
@@ -771,6 +790,7 @@ function collectStats(dwords, decoded, shaderType) {
           maxReg = Math.max(maxReg, op.index + 1);
         }
       }
+      if (alu.scalarOpName && ALU_SCALAR_TRANSCENDENTAL_HELPERS.has(alu.scalarOpName)) usesTranscendentalHelpers = true;
       if (alu.isPredicated) predicateUsed = true;
       if ((alu.vectorOpName && alu.vectorOpName.includes('push'))) predicateUsed = true;
       if ((alu.scalarOpName && alu.scalarOpName.startsWith('setp'))) predicateUsed = true;
@@ -787,7 +807,7 @@ function collectStats(dwords, decoded, shaderType) {
     }
   }
   // registerCount counts guest GPRs r0..rN-1 that the shader may touch.
-  return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition, exportsColor0, exportsDepth };
+  return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition, exportsColor0, exportsDepth, usesTranscendentalHelpers };
 }
 
 const EXPORT_TARGET_MEMBER = Object.freeze({ position: 'pos', interpolator: (i) => `v${i}`, color0: () => 'color0' });
@@ -1033,6 +1053,59 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
       'x > alphaTest.x', 'x != alphaTest.x', 'x >= alphaTest.x',
     ][alphaTest.compare];
     em.emit(`fn alphaTestPass(x: f32) -> bool { return ${expr}; }`);
+  }
+  if (stats.usesTranscendentalHelpers) {
+    // xenia's clamped transcendental variants (logc/rcpc/rcpf/rsqc/rsqf):
+    // single-precision ops with the documented +/-INF clamps (SPIR-V path:
+    // OpFOrdEqual selects). FLT_MAX = 3.402823466e38; ±INF via bitcast.
+    // WGSL forbids constant expressions producing infinity, so ±inf is built
+    // at runtime as abs(a) / 0.0 (+inf; IEEE runtime division by zero is not a
+    // trap). NaN inputs never satisfy == against ±inf, so NaN propagates
+    // exactly like xenia's OpFOrdEqual.
+    em.emit('fn xenosLogc(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = log2(a);');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == -inf) { return -3.402823466e+38; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRcpc(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = 1.0 / a;');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == -inf) { return -3.402823466e+38; }');
+    em.emit('if (t == inf) { return 3.402823466e+38; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRcpf(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = 1.0 / a;');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == inf) { return 0.0; }');
+    em.emit('if (t == -inf) { return -0.0; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRsqc(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = inverseSqrt(a);');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == -inf) { return -3.402823466e+38; }');
+    em.emit('if (t == inf) { return 3.402823466e+38; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
+    em.emit('fn xenosRsqf(a: f32) -> f32 {');
+    em.indentIn();
+    em.emit('let t = inverseSqrt(a);');
+    em.emit('let inf = abs(a) / 0.0;');
+    em.emit('if (t == inf) { return 0.0; }');
+    em.emit('if (t == -inf) { return -0.0; }');
+    em.emit('return t;');
+    em.indentOut();
+    em.emit('}');
   }
   if (convertColor0ToGamma) {
     // PreSaturatedLinearToPWLGamma: saturate happens at the call site; this is
