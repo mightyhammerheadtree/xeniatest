@@ -67,7 +67,7 @@ function makeBackend(guest) {
     createShaderModule() { return {}; },
     createRenderPipeline() { return {}; },
     createCommandEncoder() {
-      const pass = { setPipeline() {}, setVertexBuffer() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, draw() {}, drawIndexed() {}, end() {} };
+      const pass = { setPipeline() {}, setVertexBuffer() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, setScissorRect() {}, draw() {}, drawIndexed() {}, end() {} };
       return { beginRenderPass() { return pass; }, finish() { return {}; } };
     },
     destroy() {},
@@ -92,11 +92,16 @@ const DEFAULT_RT = {
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
 };
+const DEFAULT_SCISSOR = {
+  windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0,
+  screenScissorTl: 0, screenScissorBr: 0x20002000,
+};
 const drawParams = {
   primType: 4, primTypeName: 'triangle-list', numIndices: 3,
   isIndexed: true, indexGuestBase: IB_BASE, indexFormat: 0, indexEndianness: 1, indexLengthWords: 2,
   vertexFetchConstants: FETCH_CONSTS,
   renderTargets: DEFAULT_RT,
+  scissor: DEFAULT_SCISSOR,
 };
 
 test('identical draws upload each GPU buffer exactly once (cache hit thereafter)', () => {

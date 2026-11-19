@@ -77,7 +77,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
     createShaderModule() { return {}; },
     createRenderPipeline() { return {}; },
     createCommandEncoder() {
-      const pass = { setPipeline() {}, setVertexBuffer() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, draw() {}, drawIndexed() {}, end() {} };
+      const pass = { setPipeline() {}, setVertexBuffer() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, setScissorRect() {}, draw() {}, drawIndexed() {}, end() {} };
       return { beginRenderPass() { return pass; }, finish() { return {}; } };
     },
     destroy() {},
@@ -90,7 +90,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
   backend.context = canvas.getContext('webgpu');
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   const rt = { colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0, depthInfo: 0, colorMask: 0xFFFF, blendRed: 0, blendGreen: 0, blendBlue: 0, blendAlpha: 0, stencilRefMask: 0, stencilRefMaskBf: 0, depthControl: 0, blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001, colorControl: 0 };
-  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: true, indexGuestBase: IB_BASE, indexFormat: 0, indexEndianness: 1, indexLengthWords: 2, vertexFetchConstants: consts, renderTargets: rt };
+  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: true, indexGuestBase: IB_BASE, indexFormat: 0, indexEndianness: 1, indexLengthWords: 2, vertexFetchConstants: consts, renderTargets: rt, scissor: { windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0, screenScissorTl: 0, screenScissorBr: 0x20002000 } };
   const REPS = 2000;
   const t0 = performance.now();
   for (let i = 0; i < REPS; i++) backend.draw({ ...params });
@@ -138,7 +138,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08, UNIFORM
     createRenderPipeline(desc) { ops.pipeline++; return { desc, getBindGroupLayout() { return {}; } }; },
     createBindGroup(desc) { ops.bindGroup++; return { desc }; },
     createCommandEncoder() {
-      const pass = { setPipeline() {}, setVertexBuffer() {}, setBindGroup() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, draw() {}, drawIndexed() {}, end() {} };
+      const pass = { setPipeline() {}, setVertexBuffer() {}, setBindGroup() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, setScissorRect() {}, draw() {}, drawIndexed() {}, end() {} };
       return { beginRenderPass() { return pass; }, finish() { return {}; } };
     },
     destroy() {},
@@ -151,7 +151,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08, UNIFORM
   backend.context = canvas.getContext('webgpu');
   backend.shaders.vertex = { kind: 'vertex', code: CONST_VS, dwords: CONST_VS.length };
   const rt = { colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0, depthInfo: 0, colorMask: 0xFFFF, blendRed: 0, blendGreen: 0, blendBlue: 0, blendAlpha: 0, stencilRefMask: 0, stencilRefMaskBf: 0, depthControl: 0, blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001, colorControl: 0 };
-  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: false, vertexFetchConstants: consts, aluConstants: alu, renderTargets: rt };
+  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: false, vertexFetchConstants: consts, aluConstants: alu, renderTargets: rt, scissor: { windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0, screenScissorTl: 0, screenScissorBr: 0x20002000 } };
   const REPS = 2000;
   const t0 = performance.now();
   for (let i = 0; i < REPS; i++) backend.draw({ ...params });
@@ -203,7 +203,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08, UNIFORM
     createRenderPipeline(desc) { ops.pipeline++; return { desc, getBindGroupLayout() { return {}; } }; },
     createBindGroup(desc) { ops.bindGroup++; return { desc }; },
     createCommandEncoder() {
-      const pass = { setPipeline() {}, setVertexBuffer() {}, setBindGroup() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, draw() {}, drawIndexed() {}, end() {} };
+      const pass = { setPipeline() {}, setVertexBuffer() {}, setBindGroup() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, setScissorRect() {}, draw() {}, drawIndexed() {}, end() {} };
       return { beginRenderPass() { return pass; }, finish() { return {}; } };
     },
     destroy() {},
@@ -217,7 +217,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08, UNIFORM
   backend.shaders.vertex = { kind: 'vertex', code: VS, dwords: VS.length };
   backend.shaders.pixel = { kind: 'pixel', code: PS, dwords: PS.length };
   const rt = { colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0, depthInfo: 0, colorMask: 0xFFFF, blendRed: 0, blendGreen: 0, blendBlue: 0, blendAlpha: 0, stencilRefMask: 0, stencilRefMaskBf: 0, depthControl: 0, blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001, colorControl: 0 };
-  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: false, vertexFetchConstants: consts, aluConstants: alu, renderTargets: rt };
+  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: false, vertexFetchConstants: consts, aluConstants: alu, renderTargets: rt, scissor: { windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0, screenScissorTl: 0, screenScissorBr: 0x20002000 } };
   const REPS = 2000;
   const t0 = performance.now();
   for (let i = 0; i < REPS; i++) backend.draw({ ...params });

@@ -323,6 +323,51 @@
     return state;
   }
 
+  // --- PA_SC_* scissor decode (xenia draw_util.cc GetScissor) ----------------
+  // WebGPU scissor call takes (x, y, width, height) clamped to the attachment,
+  // so the decode combines WINDOW scissor + WINDOW offset + SCREEN scissor,
+  // collapses degenerate/inverted rects, and finally clamps to the surface
+  // (canvas). The RB_SURFACE_INFO surface_pitch clamp xenia applies is an
+  // EDRAM-tile-padding safety net — meaningless for the canvas target.
+  const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082;
+  const PA_SC_WINDOW_OFFSET = 0x2080;
+  const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
+  const u14 = (v) => v & 0x3fff;
+  const s15 = (v) => { v &= 0x7fff; return v & 0x4000 ? v - 0x8000 : v; };
+
+  function buildScissorState(raw, surface) {
+    if (!raw || typeof raw !== 'object') {
+      throw new XenosRenderStateError(
+        'scissor register snapshot missing (params.scissor) — the command processor snapshots ' +
+        'PA_SC_WINDOW_SCISSOR_TL/BR, PA_SC_WINDOW_OFFSET and PA_SC_SCREEN_SCISSOR_TL/BR at draw time; ' +
+        'refusing to draw with fabricated raster state');
+    }
+    const width = surface?.width ?? 0, height = surface?.height ?? 0;
+    if (!(width > 0) || !(height > 0)) {
+      throw new XenosRenderStateError(`scissor surface has no extent (${width}x${height})`);
+    }
+    const tl = raw.windowScissorTl >>> 0;
+    const br = raw.windowScissorBr >>> 0;
+    const off = raw.windowOffset >>> 0;
+    let tlX = u14(tl), tlY = u14(tl >>> 16);
+    let brX = u14(br), brY = u14(br >>> 16);
+    if ((tl & 0x80000000) === 0) {
+      // window_offset_disable (bit 31) clear: WINDOW offset applies.
+      const wx = s15(off), wy = s15(off >>> 16);
+      tlX += wx; tlY += wy; brX += wx; brY += wy;
+    }
+    const stl = raw.screenScissorTl >>> 0, sbr = raw.screenScissorBr >>> 0;
+    tlX = Math.max(tlX, s15(stl)); tlY = Math.max(tlY, s15(stl >>> 16));
+    brX = Math.min(brX, s15(sbr)); brY = Math.min(brY, s15(sbr >>> 16));
+    // Collapse negatives and inverted rects into a zero-sized one (xenia).
+    tlX = Math.max(tlX, 0); tlY = Math.max(tlY, 0);
+    brX = Math.max(brX, tlX); brY = Math.max(brY, tlY);
+    // Clamp to the surface — WebGPU validation requires the scissor inside the attachment.
+    const cx = Math.min(tlX, width), cy = Math.min(tlY, height);
+    const cxBr = Math.min(brX, width), cyBr = Math.min(brY, height);
+    return { x: cx, y: cy, width: Math.max(cxBr - cx, 0), height: Math.max(cyBr - cy, 0) };
+  }
+
   const api = {
     XenosRenderStateError,
     RB_COLOR_INFO, RB_DEPTH_INFO,
@@ -334,6 +379,9 @@
     RB_BLENDCONTROL1, RB_BLENDCONTROL2, RB_BLENDCONTROL3,
     decodeColorInfo, decodeDepthInfo, decodeBlendControl, blendEnabled, normalizeWriteMask,
     buildRenderTargetState,
+    PA_SC_WINDOW_SCISSOR_TL, PA_SC_WINDOW_SCISSOR_BR, PA_SC_WINDOW_OFFSET,
+    PA_SC_SCREEN_SCISSOR_TL, PA_SC_SCREEN_SCISSOR_BR,
+    buildScissorState,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.XenonGpuRenderState = api;

@@ -144,6 +144,7 @@ function makeFakeDevice() {
         setBindGroup(i, bg) { log.bindGroupsSet.push([i, bg]); },
         setIndexBuffer(b, fmt) { log.indexBuffer = { buffer: b, format: fmt }; },
         setBlendConstant(c) { log.blendConstant = c; },
+        setScissorRect(x, y, w, h) { log.scissorRect = [x, y, w, h]; },
         setStencilReference(ref) { log.stencilRef = ref; },
         draw(n) { log.drawCalls.push(['draw', n]); },
         drawIndexed(n) { log.drawCalls.push(['drawIndexed', n]); },
@@ -211,11 +212,21 @@ const defaultRenderTargets = (overrides = {}) => ({
   colorControl: 0,
   ...overrides,
 });
+/** A sane zeroed scissor snapshot: full 64x64 canvas (the test canvas size). */
+const defaultScissor = (overrides = {}) => ({
+  windowScissorTl: 0,
+  windowScissorBr: 0x00400040, // br_x=64, br_y=64 (u14 fields)
+  windowOffset: 0,
+  screenScissorTl: 0,
+  screenScissorBr: 0x20002000, // register-file reset default 8192x8192 — no effect
+  ...overrides,
+});
 const drawParams = (overrides = {}) => ({
   primType: 4 /* triangle list */, primTypeName: 'kTriangleList', numIndices: 3,
   isIndexed: false, indexGuestBase: 0, indexFormat: 0, indexEndianness: 0, indexLengthWords: 0,
   vertexFetchConstants: fetchConstants(),
   renderTargets: defaultRenderTargets(),
+  scissor: defaultScissor(),
   ...overrides,
 });
 
@@ -292,7 +303,7 @@ test('VS without attribute reads and without fetch constants draws (constants-fe
   const guest = makeGuest();
   const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: CONST_ONLY_VS, dwords: CONST_ONLY_VS.length };
-  backend.draw({ primType: 4, primTypeName: 'kTriangleList', numIndices: 3, isIndexed: false, vertexFetchConstants: undefined, aluConstants: aluConstantArray(), renderTargets: defaultRenderTargets() });
+  backend.draw({ primType: 4, primTypeName: 'kTriangleList', numIndices: 3, isIndexed: false, vertexFetchConstants: undefined, aluConstants: aluConstantArray(), renderTargets: defaultRenderTargets(), scissor: defaultScissor() });
   assert.equal(log.pipelines.length, 1);
   assert.deepEqual(log.pipelines[0].desc.vertex.buffers, []);
   assert.deepEqual(log.drawCalls, [['draw', 3]]);
@@ -621,4 +632,37 @@ test('traps are skipped when the PS does not write oC0 (RT0 format never observe
   backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
   const state = backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })); // GAMMA RT0
   assert.equal(log.pipelines.length, 1, 'no oC0 export → no RT0 format validation');
+});
+
+test('the pass receives setScissorRect decoded from the PA_SC_* snapshot (offset applied, clamped to canvas)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({
+    scissor: defaultScissor({ windowScissorTl: (4 << 16) | 4, windowScissorBr: (36 << 16) | 36, windowOffset: (2 << 16) | 2 }),
+  }));
+  assert.deepEqual(log.scissorRect, [6, 6, 32, 32]);
+
+  // screen scissor clips the window rect from outside
+  backend.draw(drawParams({
+    scissor: defaultScissor({ screenScissorTl: (8 << 16) | 12, screenScissorBr: (24 << 16) | 60 }),
+  }));
+  assert.deepEqual(log.scissorRect, [12, 8, 48, 16]);
+
+  // a rect fully outside the canvas clamps to a zero-sized scissor
+  backend.draw(drawParams({
+    scissor: defaultScissor({ windowScissorTl: (100 << 16) | 100, windowScissorBr: 0x00400040 }),
+  }));
+  assert.deepEqual(log.scissorRect, [64, 64, 0, 0]);
+});
+
+test('a draw without the scissor snapshot refuses (the CP always attaches it)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const params = drawParams();
+  delete params.scissor;
+  assert.throws(() => backend.draw(params), /scissor register snapshot missing/);
 });

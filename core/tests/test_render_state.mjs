@@ -237,3 +237,77 @@ test('the error class is stable and carries the message', () => {
     assert.match(e.message, /k_16_16_16_16_FLOAT/);
   }
 });
+
+// ------------------------------------------------------------ scissor (PA_SC_*)
+const ZERO_SCISSOR = {
+  windowScissorTl: 0,
+  windowScissorBr: 0x00400040, // 64x64 (u14 fields)
+  windowOffset: 0,
+  screenScissorTl: 0,
+  screenScissorBr: 0x20002000, // reset default: 8192x8192
+};
+const sc = (overrides = {}) => ({ ...ZERO_SCISSOR, ...overrides });
+const scState = (overrides = {}, width = 64, height = 64) => RS.buildScissorState(sc(overrides), { width, height });
+
+test('scissor decodes a full-surface rect', () => {
+  assert.deepEqual(scState(), { x: 0, y: 0, width: 64, height: 64 });
+});
+
+test('window scissor br is exclusive (extent = br - tl)', () => {
+  assert.deepEqual(
+    scState({ windowScissorTl: (10 << 16) | 8, windowScissorBr: (40 << 16) | 32 }),
+    { x: 8, y: 10, width: 24, height: 30 },
+  );
+});
+
+test('window offset is added when the TL disable bit is clear; signed 15-bit offsets', () => {
+  // offset (+3, +5): rect shifts
+  assert.deepEqual(
+    scState({ windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: (5 << 16) | 3 }),
+    { x: 3, y: 5, width: 61, height: 59 },
+  );
+  // negative offsets collapse at 0 (xenia: max(tl, 0), br = max(br, tl))
+  const r = scState({ windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: ((-10 & 0x7fff) << 16) | (-4 & 0x7fff) });
+  assert.equal(r.x, 0);
+  assert.equal(r.y, 0);
+  // disable bit (31) skips the offset entirely
+  assert.deepEqual(
+    scState({ windowScissorTl: 0x80000000, windowScissorBr: 0x00400040, windowOffset: 0x7FFF7FFF }),
+    { x: 0, y: 0, width: 64, height: 64 },
+  );
+});
+
+test('screen scissor clamps the window rect from outside (tl max, br min)', () => {
+  // screen rect (16,8)-(48,48): window rect clipped to it
+  const r = scState({ screenScissorTl: (8 << 16) | 16, screenScissorBr: (48 << 16) | 48 });
+  assert.deepEqual(r, { x: 16, y: 8, width: 32, height: 40 });
+  // screen rect strictly inside a larger window rect keeps window bounds where screen is wider
+  const r2 = scState({ windowScissorTl: (20 << 16) | 20, windowScissorBr: (30 << 16) | 30, screenScissorTl: 0, screenScissorBr: 0x20002000 });
+  assert.deepEqual(r2, { x: 20, y: 20, width: 10, height: 10 });
+});
+
+test('inverted rects collapse to a zero-sized scissor (xenia)', () => {
+  assert.deepEqual(
+    scState({ windowScissorTl: 0x00400040, windowScissorBr: 0 }),
+    { x: 64, y: 64, width: 0, height: 0 },
+  );
+});
+
+test('rect is clamped to the surface (WebGPU requires the scissor inside the attachment)', () => {
+  const r = scState({ windowScissorTl: 0, windowScissorBr: 0x1FFF1FFF }, 64, 64); // way past the canvas
+  assert.deepEqual(r, { x: 0, y: 0, width: 64, height: 64 });
+  const r2 = scState({ windowScissorTl: (100 << 16) | 100, windowScissorBr: 0x00400040 }, 64, 64);
+  assert.deepEqual(r2, { x: 64, y: 64, width: 0, height: 0 });
+});
+
+test('window_offset_disable is only bit 31 (other TL bits are the u14 coords)', () => {
+  const r = scState({ windowScissorTl: 0x80000005 | (7 << 16), windowScissorBr: 0x00400040, windowOffset: (100 << 16) | 100 });
+  assert.equal(r.x, 5);
+  assert.equal(r.y, 7);
+});
+
+test('a missing snapshot traps with a named reason (no fabricated raster state)', () => {
+  assert.throws(() => RS.buildScissorState(undefined, { width: 64, height: 64 }), /params\.scissor/);
+  assert.throws(() => RS.buildScissorState(null, { width: 64, height: 64 }), /params\.scissor/);
+  assert.throws(() => RS.buildScissorState({}, { width: 0, height: 64 }), /no extent/);
+});

@@ -550,8 +550,32 @@
       return rtState;
     }
 
+    /**
+     * Decode the PA_SC_* scissor snapshot (xenia GetScissor semantics, see
+     * render_state.js) into a canvas-clamped rect. Missing snapshot traps — a
+     * host that does not attach it must not draw with the guest's scissor
+     * silently ignored.
+     */
+    _resolveScissor(params) {
+      const rs = globalThis.XenonGpuRenderState;
+      if (!rs) {
+        throw new XenosWebGpuError('XenonGpuRenderState is not loaded — public/js/gpu/render_state.js must be loaded before the backend builds a draw');
+      }
+      try {
+        return rs.buildScissorState(params.scissor, {
+          width: this.canvas?.width ?? 0,
+          height: this.canvas?.height ?? 0,
+        });
+      } catch (e) {
+        if (e && e.constructor && e.constructor.name === 'XenosRenderStateError') {
+          throw new XenosWebGpuError(`draw: ${e.message}`);
+        }
+        throw e;
+      }
+    }
+
     /** Begin the render pass for a frame segment: canvas color attachment + depth/stencil attachment. */
-    _beginPass(encoder, colorView, rtState) {
+    _beginPass(encoder, colorView, rtState, scissor) {
       const colorAttachments = [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }];
       const desc = { colorAttachments };
       if (this.depthView) {
@@ -569,6 +593,9 @@
       if (rtState) {
         pass.setBlendConstant(rtState.blendConstant);
         pass.setStencilReference(rtState.stencilRef);
+      }
+      if (scissor) {
+        pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
       }
       return pass;
     }
@@ -754,10 +781,11 @@
         const buffers = plan ? this.uploadVertexBuffers(plan) : [];
         this._uploadShaderConstants(params, program);
         const rtState = this._resolveRenderTargets(params, program);
+        const scissor = this._resolveScissor(params);
         const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginPass(encoder, colorView, rtState);
+        const pass = this._beginPass(encoder, colorView, rtState, scissor);
         pass.setPipeline(pipeline);
         if (bindGroup) pass.setBindGroup(0, bindGroup);
         for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
@@ -775,10 +803,11 @@
       const fetchReady = !!(this.shaders.vertex && params.vertexFetchConstants);
       if (fetchReady) {
         const rtState = this._resolveRenderTargets(params, null);
+        const scissor = this._resolveScissor(params);
         const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginPass(encoder, colorView, rtState);
+        const pass = this._beginPass(encoder, colorView, rtState, scissor);
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
           pass.setPipeline((plan._pipeline ??= this._getFetchPlaceholderPipeline(plan.descriptors, rtState)));
@@ -798,9 +827,10 @@
         this.log('warn', 'draw: vertex shader loaded but the packet carried no fetch constants — bypassing the fetch path (full-canvas placeholder)');
       }
       const rtState = this._resolveRenderTargets(params, null);
+      const scissor = this._resolveScissor(params);
       const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
       const colorView = this.context.getCurrentTexture().createView();
-      const pass = this._beginPass(encoder, colorView, rtState);
+      const pass = this._beginPass(encoder, colorView, rtState, scissor);
       pass.setPipeline(this._getPlaceholderPipeline(rtState));
       pass.draw(3);
       pass.end();

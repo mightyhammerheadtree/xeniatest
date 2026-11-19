@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil) *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -532,6 +532,8 @@
       const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
       const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
+      const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082, PA_SC_WINDOW_OFFSET = 0x2080;
+      const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
         colorInfo0: this.registers.read(RB_COLOR_INFO) >>> 0,
         depthInfo: this.registers.read(RB_DEPTH_INFO) >>> 0,
@@ -552,6 +554,13 @@
         blendControl2: this.registers.read(RB_BLENDCONTROL2) >>> 0,
         blendControl3: this.registers.read(RB_BLENDCONTROL3) >>> 0,
       };
+      const scissor = {
+        windowScissorTl: this.registers.read(PA_SC_WINDOW_SCISSOR_TL) >>> 0,
+        windowScissorBr: this.registers.read(PA_SC_WINDOW_SCISSOR_BR) >>> 0,
+        windowOffset: this.registers.read(PA_SC_WINDOW_OFFSET) >>> 0,
+        screenScissorTl: this.registers.read(PA_SC_SCREEN_SCISSOR_TL) >>> 0,
+        screenScissorBr: this.registers.read(PA_SC_SCREEN_SCISSOR_BR) >>> 0,
+      };
       const draw = backendOrTrap(this.backend, 'draw', opcodeName);
       draw({
         primType: di.primType,
@@ -568,6 +577,7 @@
         aluConstants,
         boolConstants,
         renderTargets,
+        scissor,
       });
       this.stats.draws++;
       return end;

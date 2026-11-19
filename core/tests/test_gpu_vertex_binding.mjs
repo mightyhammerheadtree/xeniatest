@@ -99,6 +99,7 @@ function makeFakeDevice() {
       setVertexBuffer(i, b) { p.vbs[i] = b; },
       setIndexBuffer(b, f) { p.ib = { buffer: b, format: f }; },
       setBlendConstant(c) { p.blendConstant = c; },
+      setScissorRect(x, y, w, h) { p.scissorRect = [x, y, w, h]; },
       setStencilReference(ref) { p.stencilRef = ref; },
       draw(n) { p.drawN = n; },
       drawIndexed(n, inst, first, baseVertex) { p.drawIN = { n, inst, first, baseVertex }; },
@@ -160,6 +161,7 @@ const baseParams = {
   isIndexed: false, indexGuestBase: 0, indexFormat: 0, indexEndianness: 0, indexLengthWords: 0,
   vertexFetchConstants: FETCH_CONSTS,
   renderTargets: DEFAULT_RT,
+  scissor: { windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0, screenScissorTl: 0, screenScissorBr: 0x20002000 },
 };
 
 test('fetch draw uploads the guest vertex buffer with BE→LE dword swap and binds it', () => {

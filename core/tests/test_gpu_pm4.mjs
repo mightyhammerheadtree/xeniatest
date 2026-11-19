@@ -342,7 +342,14 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   // RB_DEPTHCONTROL (0x2200): z_enable|z_write|zfunc GreaterEqual(6)<<4|stencil off.
   // RB_COLORCONTROL (0x2202): 0 (no alpha test).
   // RB_BLENDCONTROL0 (0x2201): src=src-alpha(6), one-minus-src-alpha(7) — 0x07000506.
+  // PA_SC_WINDOW_SCISSOR_TL/BR (0x2081/0x2082): (8,8)-(40,40); WINDOW_OFFSET (0x2080): (+2,+3);
+  // PA_SC_SCREEN_SCISSOR_TL/BR (0x200e/0x200f): (4,4)-(52,52).
   const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+  setReg(0x2080, (3 << 16) | 2);
+  setReg(0x2081, (8 << 16) | 8);
+  setReg(0x2082, (40 << 16) | 40);
+  setReg(0x200e, (4 << 16) | 4);
+  setReg(0x200f, (52 << 16) | 52);
   setReg(0x2001, (5 << 16) | 0x42);
   setReg(0x2002, 0); // kD24S8
   setReg(0x2104, 0xA5A5A5A5);
@@ -368,4 +375,10 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   assert.equal(draw.renderTargets.depthControl, 0x2 | 0x4 | (0x6 << 4));
   assert.equal(draw.renderTargets.blendControl0, (7 << 8) | 6);
   assert.equal(draw.renderTargets.colorControl, 0);
+  assert.ok(draw.scissor, 'scissor snapshot is attached');
+  assert.equal(draw.scissor.windowScissorTl, (8 << 16) | 8);
+  assert.equal(draw.scissor.windowScissorBr, (40 << 16) | 40);
+  assert.equal(draw.scissor.windowOffset, (3 << 16) | 2);
+  assert.equal(draw.scissor.screenScissorTl, (4 << 16) | 4);
+  assert.equal(draw.scissor.screenScissorBr, (52 << 16) | 52);
 });
