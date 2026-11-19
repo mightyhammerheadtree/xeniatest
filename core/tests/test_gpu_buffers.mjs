@@ -22,7 +22,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
 
 // microcode fixture (same as test_gpu_vertex_binding)
 function execCf(address, count, sequence, opcode = 2) {
-  return { dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: opcode & 0xF };
+  return { dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: (opcode & 0xF) << 12 };
 }
 function cfPair(a, b) {
   return [a.dword0 >>> 0, (a.dword1 & 0xFFFF) | ((b.dword0 & 0xFFFF) << 16), ((b.dword0 >>> 16) & 0xFFFF) | ((b.dword1 & 0xFFFF) << 16)];

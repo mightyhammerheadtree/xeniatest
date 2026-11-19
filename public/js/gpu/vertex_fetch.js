@@ -194,13 +194,17 @@
 
   /** Exec-family CF decode: opcode/address/count/sequence (layouts shared by all exec opcodes). */
   function decodeExecCf(cf) {
+    // Xenia layout (ucode.h): word1 (16 bits) = vc_lo:2, [bool_address:8 for
+    // kCondExec], is_predicate_clean/condition:1 @9/10, address_mode:1 @11,
+    // opcode:4 @12.
     return {
-      opcode: cf.dword1 & 0xF,
+      opcode: (cf.dword1 >>> 12) & 0xF,
       address: cf.dword0 & 0xFFF,
       count: (cf.dword0 >>> 12) & 0x7,
       isYield: (cf.dword0 >>> 15) & 1,
       sequence: (cf.dword0 >>> 16) & 0xFFF,
-      addressingMode: (cf.dword1 >>> 4) & 1,
+      isPredicateClean: (cf.dword1 >>> 9) & 1,
+      addressingMode: (cf.dword1 >>> 11) & 1,
     };
   }
 
@@ -273,7 +277,7 @@
     for (let i = 0; i < instructionBound; i++) {
       const [a, b] = unpackControlFlowPair(dwords, i);
       for (const cf of [a, b]) {
-        const opcode = cf.dword1 & 0xF;
+        const opcode = decodeExecCf(cf).opcode;
         if (EXEC_FAMILY.has(opcode)) {
           cfPairBound = Math.min(cfPairBound, decodeExecCf(cf).address);
         }
@@ -287,7 +291,7 @@
     for (let i = 0; i < cfPairBound; i++) {
       const pair = unpackControlFlowPair(dwords, i);
       for (const cf of pair) {
-        const opcode = cf.dword1 & 0xF;
+        const opcode = decodeExecCf(cf).opcode;
         if (!EXEC_FAMILY.has(opcode)) continue;
         const exec = decodeExecCf(cf);
         for (let k = 0; k < exec.count; k++) {
@@ -453,6 +457,30 @@
     return descriptors;
   }
 
+  // Internals shared with the WGSL translator (wgsl_translate.js). Not public
+  // API — the shapes are unstable. Kept in one place so both walkers agree on
+  // CF-pair unpacking and exec decoding.
+  const _internal = {
+    CF_K_EXEC,
+    CF_K_EXEC_END,
+    CF_K_COND_EXEC,
+    CF_K_COND_EXEC_END,
+    CF_K_COND_EXEC_PRED,
+    CF_K_COND_EXEC_PRED_END,
+    CF_K_LOOP_START,
+    CF_K_LOOP_END,
+    CF_K_COND_CALL,
+    CF_K_RETURN,
+    CF_K_COND_JMP,
+    CF_K_ALLOC,
+    CF_K_COND_EXEC_PRED_CLEAN,
+    CF_K_COND_EXEC_PRED_CLEAN_END,
+    CF_K_MARK_VS_FETCH_DONE,
+    EXEC_FAMILY,
+    unpackControlFlowPair,
+    decodeExecCf,
+  };
+
   const api = {
     XenosFetchError,
     VERTEX_FORMAT,
@@ -462,6 +490,7 @@
     mapVertexFormat,
     buildGpuVertexBufferDescriptors,
     vertexFormatBytes,
+    _internal,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.XenonGpuVertexFetch = api;
