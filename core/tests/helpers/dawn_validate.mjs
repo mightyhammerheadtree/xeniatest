@@ -42,3 +42,39 @@ export async function assertValidWgsl(code) {
   }
   return true;
 }
+
+/**
+ * Create a render pipeline on the null backend from two candidate modules and
+ * capture any interface/layout validation diagnostic via an error scope.
+ * Fresh device, destroyed in the same linear scope — never held across calls.
+ *
+ * @returns {Promise<string|null>} null when the pipeline validates, else the
+ *   full diagnostic message.
+ */
+export async function checkProgramLinks(vsCode, fsCode, vertexBuffers = [], format = 'bgra8unorm') {
+  const gpu = create(['backend=null']);
+  const adapter = await gpu.requestAdapter();
+  if (!adapter) throw new Error('Dawn (null backend) returned no adapter');
+  const device = await adapter.requestDevice();
+  device.pushErrorScope('validation');
+  const vsModule = device.createShaderModule({ code: vsCode });
+  const fsModule = device.createShaderModule({ code: fsCode });
+  device.createRenderPipeline({
+    layout: 'auto',
+    vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
+    fragment: { module: fsModule, entryPoint: 'fs_main', targets: [{ format }] },
+    // A fragment stage writing frag_depth is rejected without depth-stencil state (Dawn validation).
+    depthStencil: /@builtin\(frag_depth\)/.test(fsCode)
+      ? { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'always' }
+      : undefined,
+    primitive: { topology: 'triangle-list' },
+  });
+  const err = await device.popErrorScope();
+  try {
+    device.destroy();
+  } catch {
+    // best-effort
+  }
+  return err ? String(err.message ?? err) : null;
+}
+

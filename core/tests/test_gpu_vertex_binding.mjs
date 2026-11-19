@@ -17,6 +17,7 @@ import '../../public/js/gpu/command_processor.js';
 import '../../public/js/gpu/vertex_fetch.js';
 import '../../public/js/gpu/wgsl_translate.js';
 import '../../public/js/gpu/webgpu_backend.js';
+import '../../public/js/gpu/render_state.js';
 
 const PM4 = globalThis.XenonPM4;
 const { XenosCommandProcessor } = globalThis.XenonGpuCommandProcessor;
@@ -97,6 +98,8 @@ function makeFakeDevice() {
       setPipeline(pl) { p.pipeline = pl; },
       setVertexBuffer(i, b) { p.vbs[i] = b; },
       setIndexBuffer(b, f) { p.ib = { buffer: b, format: f }; },
+      setBlendConstant(c) { p.blendConstant = c; },
+      setStencilReference(ref) { p.stencilRef = ref; },
       draw(n) { p.drawN = n; },
       drawIndexed(n, inst, first, baseVertex) { p.drawIN = { n, inst, first, baseVertex }; },
       end() { calls.passes.push(p); },
@@ -141,10 +144,22 @@ function makeBackend(guest, { withShader = true, placeholderShader = true } = {}
   return backend;
 }
 
+/** A sane zeroed render-target snapshot: 8_8_8_8 RT0, all writes, no blend/depth/stencil (xenia: RB_BLENDCONTROL=1 <<16|1 disables blending). */
+const DEFAULT_RT = {
+  colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
+  depthInfo: 0,
+  colorMask: 0x0000FFFF,
+  blendRed: 0, blendGreen: 0, blendBlue: 0, blendAlpha: 0,
+  stencilRefMask: 0, stencilRefMaskBf: 0,
+  depthControl: 0,
+  blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
+  colorControl: 0,
+};
 const baseParams = {
   primType: 4, primTypeName: 'triangle-list', numIndices: 3,
   isIndexed: false, indexGuestBase: 0, indexFormat: 0, indexEndianness: 0, indexLengthWords: 0,
   vertexFetchConstants: FETCH_CONSTS,
+  renderTargets: DEFAULT_RT,
 };
 
 test('fetch draw uploads the guest vertex buffer with BE→LE dword swap and binds it', () => {

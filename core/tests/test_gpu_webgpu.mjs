@@ -14,6 +14,7 @@ import '../../public/js/gpu/register_file.js';
 import '../../public/js/gpu/pm4.js';
 import '../../public/js/gpu/command_processor.js';
 import '../../public/js/gpu/webgpu_backend.js';
+import '../../public/js/gpu/render_state.js';
 
 const { XenosWebGpuBackend, XenosWebGpuError } = globalThis.XenonWebGpuBackend;
 const PM4 = globalThis.XenonPM4;

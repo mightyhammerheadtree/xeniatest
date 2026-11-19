@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil) *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -521,6 +521,37 @@
       for (let i = 0; i < 1024; i++) aluConstants[i] = this.registers.read(SHADER_CONSTANT_ALU_BASE + i) >>> 0;
       const boolConstants = new Uint32Array(8);
       for (let i = 0; i < 8; i++) boolConstants[i] = this.registers.read(SHADER_CONSTANT_BOOL_BASE + i) >>> 0;
+      // Render-target (RB_*) registers — raw values; the backend decodes them
+      // into the WebGPU pipeline/render-pass state (blend, write mask, depth/
+      // stencil) and traps loudly on anything it cannot represent. xenia
+      // register indices (see xenia gpu/registers.h).
+      const RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
+      const RB_COLOR1_INFO = 0x2003, RB_COLOR2_INFO = 0x2004, RB_COLOR3_INFO = 0x2005;
+      const RB_COLOR_MASK = 0x2104;
+      const RB_BLEND_RED = 0x2105, RB_BLEND_GREEN = 0x2106, RB_BLEND_BLUE = 0x2107, RB_BLEND_ALPHA = 0x2108;
+      const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
+      const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
+      const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
+      const renderTargets = {
+        colorInfo0: this.registers.read(RB_COLOR_INFO) >>> 0,
+        depthInfo: this.registers.read(RB_DEPTH_INFO) >>> 0,
+        colorInfo1: this.registers.read(RB_COLOR1_INFO) >>> 0,
+        colorInfo2: this.registers.read(RB_COLOR2_INFO) >>> 0,
+        colorInfo3: this.registers.read(RB_COLOR3_INFO) >>> 0,
+        colorMask: this.registers.read(RB_COLOR_MASK) >>> 0,
+        blendRed: this.registers.read(RB_BLEND_RED) >>> 0,
+        blendGreen: this.registers.read(RB_BLEND_GREEN) >>> 0,
+        blendBlue: this.registers.read(RB_BLEND_BLUE) >>> 0,
+        blendAlpha: this.registers.read(RB_BLEND_ALPHA) >>> 0,
+        stencilRefMaskBf: this.registers.read(RB_STENCILREFMASK_BF) >>> 0,
+        stencilRefMask: this.registers.read(RB_STENCILREFMASK) >>> 0,
+        depthControl: this.registers.read(RB_DEPTHCONTROL) >>> 0,
+        blendControl0: this.registers.read(RB_BLENDCONTROL0) >>> 0,
+        colorControl: this.registers.read(RB_COLORCONTROL) >>> 0,
+        blendControl1: this.registers.read(RB_BLENDCONTROL1) >>> 0,
+        blendControl2: this.registers.read(RB_BLENDCONTROL2) >>> 0,
+        blendControl3: this.registers.read(RB_BLENDCONTROL3) >>> 0,
+      };
       const draw = backendOrTrap(this.backend, 'draw', opcodeName);
       draw({
         primType: di.primType,
@@ -536,6 +567,7 @@
         vertexFetchConstants,
         aluConstants,
         boolConstants,
+        renderTargets,
       });
       this.stats.draws++;
       return end;

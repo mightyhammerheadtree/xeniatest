@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import '../../public/js/gpu/vertex_fetch.js';
 import '../../public/js/gpu/wgsl_translate.js';
-import { assertValidWgsl } from './helpers/dawn_validate.mjs';
+import { assertValidWgsl, checkProgramLinks } from './helpers/dawn_validate.mjs';
 
 const T = globalThis.XenonGpuTranslate;
 
@@ -807,4 +807,267 @@ test('a larger end-to-end shader passes Dawn validation', async () => {
   assert.match(withCexec.wgsl, /if \(bc\(7u\)\) \{/);
   assert.match(withCexec.wgsl, /out\.v6 = /);
   await assertValidWgsl(withCexec.wgsl);
+});
+
+// ================================================================ pixel shaders
+// Fixtures: oC0 = vectorDest 0, oDepth = 61, MRT targets 1–3 = vectorDest 1–3.
+
+/** PS that exports oC0 = fc[0] + fc[1]. */
+const PS_CONST = () => shader(
+  cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+  aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [konst(0), konst(1), konst(1)] }),
+);
+/** PS that exports oC0 = r[7] + r[7] (static bound 8). */
+const PS_READ_R7 = () => shader(
+  cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+  aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(7), temp(7), temp(7)] }),
+);
+/** VS exporting interpolators 7 and 62(position). */
+const VS_EXPORT_7 = () => shader(
+  cfPair(execCf(1, 3, seq(SEQ_FETCH, SEQ_ALU, SEQ_ALU)), NOP_CF),
+  vfetchWords({ dstReg: 1, format: 57 }),
+  aluWords({ isExport: 1, vectorDest: 7, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  aluWords({ isExport: 1, vectorDest: 62, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+);
+
+test('pixel shader: oC0 from constants translates and validates', async () => {
+  const out = T.translatePixelShader(PS_CONST());
+  assert.equal(out.type, 'pixel');
+  assert.match(out.wgsl, /struct PsOut \{\n  @location\(0\) color0: vec4f\n\};/);
+  assert.match(out.wgsl, /function|fn fs_main\(\) -> PsOut/);
+  assert.doesNotMatch(out.wgsl, /struct PsIn\b/, 'no interpolators referenced → no PsIn');
+  assert.equal(out.usesFloatConstants, true);
+  assert.deepEqual(out.inputLocations, []);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: interpolator lanes are linked to the VS exports, others read as zero', async () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7());
+  assert.deepEqual(program.interpolatorLocations, [7], 'VS exports interpolator 7');
+  assert.deepEqual(program.fragment.inputLocations, [7], 'the FS wires exactly lane 7');
+  assert.match(program.fragment.wgsl, /@location\(7\) i7: vec4f/);
+  assert.doesNotMatch(program.fragment.wgsl, /@location\(0\) i0/);
+  assert.match(program.fragment.wgsl, /r\[7\] = in\.i7/);
+  assert.match(program.fragment.wgsl, /var r: array<vec4f, 8>/, 'static bound 8 covers lanes 0–7');
+  await assertValidWgsl(program.vertex.wgsl);
+  await assertValidWgsl(program.fragment.wgsl);
+});
+
+test('pixel shader: lanes the VS does not export are not declared (link-safe by construction)', async () => {
+  // PS reads r[0] (static bound 1), VS exports lane 7 → linked = ∅; r[0] stays zero-initialized.
+  const PS_READ_R0 = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(0), temp(0), temp(0)] }),
+  );
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R0);
+  assert.deepEqual(program.fragment.inputLocations, []);
+  assert.doesNotMatch(program.fragment.wgsl, /struct PsIn\b/);
+  await assertValidWgsl(program.fragment.wgsl);
+});
+
+test('pixel shader: Dawn pipeline accepts the translated pair (interface rule enforced)', async () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7());
+  const vsBuf = [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] }];
+  assert.equal(await checkProgramLinks(program.vertex.wgsl, program.fragment.wgsl, vsBuf), null);
+});
+
+test('pixel shader: kill_eq (vector opcode 24) emits discard with an any-lane compare', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 24, vectorWriteMask: 0xF, src: [temp(1), konst(0), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  assert.match(out.wgsl, /if \(any\(vec4<bool>\(\(r\[1\]\.x == fc\[0\]\.x\), \(r\[1\]\.y == fc\[0\]\.y\), \(r\[1\]\.z == fc\[0\]\.z\), \(r\[1\]\.w == fc\[0\]\.w\)\)\)\) \{ discard; \}/);
+  assert.match(out.wgsl, /r\[3\] = vec4f\(0\.0, 0\.0, 0\.0, 0\.0\);/, 'kill writes 0.0 to its dest with the mask');
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: kill_ne (opcode 27) uses unordered semantics (!=)', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 27, vectorWriteMask: 0xF, src: [temp(1), temp(2), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  assert.match(out.wgsl, /any\(vec4<bool>\(\(r\[1\]\.x != r\[2\]\.x\)/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: scalar kills (kills_eq/gt/ge/ne/one) compare the W lane of the scalar source', async () => {
+  for (const [op, needle] of [[35, '== 0.0'], [36, '> 0.0'], [37, '>= 0.0'], [38, '!= 0.0'], [39, '== 1.0']]) {
+    const out = T.translatePixelShader(shader(
+      cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+      aluWords({ scalarOpcode: op, vectorOpcode: 2, vectorWriteMask: 0, src: [temp(2), temp(2), temp(1)] }),
+      aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+    ));
+    assert.match(out.wgsl, new RegExp(`if \\(\\(r\\[1\\]\\.w ${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\)\\) \\{ discard; \\}`), `opcode ${op}`);
+    assert.match(out.wgsl, /ps = 0\.0;/, 'kill writes 0.0 to ps');
+  }
+});
+
+test('pixel shader: a predicated kill only discards under p0', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 24, vectorWriteMask: 0xF, predicated: 1, predicateCondition: 1, src: [temp(1), temp(2), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  const killIdx = out.wgsl.indexOf('discard');
+  const predIdx = out.wgsl.lastIndexOf('if (p0) {', killIdx);
+  assert.ok(predIdx !== -1 && predIdx < killIdx, 'the discard is nested inside the predicate');
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: kills in a VERTEX shader still trap loudly', () => {
+  assert.throws(() => T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ vectorDest: 3, vectorOpcode: 24, src: [temp(1), temp(2), temp(1)] }),
+  )), /pixel-shader-only/);
+  assert.throws(() => T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ scalarOpcode: 35, vectorWriteMask: 0, src: [temp(1), temp(1), temp(1)] }),
+  )), /pixel-shader-only/);
+});
+
+test('pixel shader: MRT color exports (oC1..oC3) trap with a named reason', () => {
+  for (const dest of [1, 2, 3]) {
+    assert.throws(() => T.translatePixelShader(shader(
+      cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+      aluWords({ isExport: 1, vectorDest: dest, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),
+    )), /MRT/);
+  }
+});
+
+test('pixel shader: oDepth export emits a clamped @builtin(frag_depth) output', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 1, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),           // r1 = fc0+fc0
+    aluWords({ isExport: 1, vectorDest: 61, vectorWriteMask: 1, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }), // oDepth = r1.x
+  ));
+  assert.equal(out.exportsDepth, true);
+  assert.match(out.wgsl, /@builtin\(frag_depth\) depth: f32,/);
+  assert.match(out.wgsl, /out\.depth = clamp\(\(r\[1\]\.x \+ r\[1\]\.x\), 0\.0, 1\.0\);/);
+  assert.match(out.wgsl, /out\.depth = 1\.0;/, 'unwritten paths still define frag_depth');
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: oDepth in a VS+PS pair links through Dawn with depth-stencil state', async () => {
+  const PS_DEPTH = shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 1, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),
+    aluWords({ isExport: 1, vectorDest: 61, vectorWriteMask: 1, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_DEPTH);
+  assert.equal(program.exportsDepth, true);
+  assert.match(program.fragment.wgsl, /@builtin\(frag_depth\)/);
+  const vsBuf = [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] }];
+  assert.equal(await checkProgramLinks(program.vertex.wgsl, program.fragment.wgsl, vsBuf), null);
+});
+
+test('pixel shader: a program with no oDepth export declares no frag_depth (normal depth path)', () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_CONST());
+  assert.equal(program.exportsDepth, false);
+  assert.doesNotMatch(program.fragment.wgsl, /frag_depth/);
+});
+
+test('pixel shader: texture fetch traps naming the limitation (tfetch is step 8)', () => {
+  assert.throws(() => T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    tfetchWords({ dstReg: 5 }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(5), temp(5), temp(5)] }),
+  )), /texture fetch[\s\S]*step 8/);
+});
+
+test('pixel shader: a vertex fetch inside a pixel shader traps loudly', () => {
+  assert.throws(() => T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  )), /vertex fetch inside a pixel shader/);
+});
+
+test('pixel shader: unsupported opcodes trap exactly as in the VS (cube, transcendentals)', () => {
+  assert.throws(() => T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorOpcode: 18, src: [temp(1), temp(2), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  )), /cube/);
+  assert.throws(() => T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ scalarOpcode: 40 /* sqrt */, vectorWriteMask: 0, src: [temp(1), temp(1), temp(1)] }),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  )), /sqrt/);
+});
+
+test('translateShaderProgram: no pixel shader → fragment is null, bindings match the plain VS', () => {
+  const bare = T.translateShaderProgram(VS_EXPORT_7(), null);
+  assert.equal(bare.fragment, null);
+  const plain = T.translateVertexShader(VS_EXPORT_7());
+  assert.equal(bare.vertex.wgsl, plain.wgsl, 'VS-only program output equals the standalone VS translation');
+});
+
+test('translateShaderProgram: constants merged across stages share the fc/bool bindings', async () => {
+  // VS uses bools only; PS uses fc only.
+  const VS_BOOL = shader(
+    cfPair(condExecCf(1, 2, seq(SEQ_FETCH, SEQ_ALU), 3, 1), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ isExport: 1, vectorDest: 7, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const PS_FC = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),
+  );
+  const program = T.translateShaderProgram(VS_BOOL, PS_FC);
+  assert.equal(program.usesFloatConstants, true);
+  assert.equal(program.usesBoolConstants, true);
+  // VS: no fc of its own → only bools, declared at binding 1 (fc is merged-binding 0)
+  assert.match(program.vertex.wgsl, /@group\(0\) @binding\(1\) var<uniform> bools/);
+  assert.doesNotMatch(program.vertex.wgsl, /var<uniform> fc/);
+  // PS: fc only → binding 0
+  assert.match(program.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.doesNotMatch(program.fragment.wgsl, /var<uniform> bools/);
+  await assertValidWgsl(program.vertex.wgsl);
+  await assertValidWgsl(program.fragment.wgsl);
+  // Both declare the same bools/fc layout? No — bools only in VS; the merged layout
+  // is fc@0 (PS) + bools@1 (VS): one bind group covering both is what the backend builds.
+
+  // VS uses fc+bools; PS uses fc only → PS must NOT declare bools at binding 0 or 1.
+  const VS_FC_BOOL = shader(
+    cfPair(condExecCf(1, 2, seq(SEQ_FETCH, SEQ_ALU), 3, 1), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ isExport: 1, vectorDest: 7, vectorOpcode: 0, src: [temp(1), konst(0), temp(1)] }),
+  );
+  const program2 = T.translateShaderProgram(VS_FC_BOOL, PS_FC);
+  assert.match(program2.vertex.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.match(program2.vertex.wgsl, /@group\(0\) @binding\(1\) var<uniform> bools/);
+  assert.match(program2.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.doesNotMatch(program2.fragment.wgsl, /var<uniform> bools/, 'PS does not use bools — must not declare them');
+  await assertValidWgsl(program2.vertex.wgsl);
+  await assertValidWgsl(program2.fragment.wgsl);
+});
+
+test('pixel shader: an empty (0-dword) blob translates to a degenerate-but-valid black shader', async () => {
+  const out = T.translatePixelShader(new Uint32Array(0));
+  assert.match(out.wgsl, /out\.color0 = vec4f\(0\.0\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: malformed blob (exec pointing at slot 0) traps instead of shading nothing', () => {
+  assert.throws(() => T.translatePixelShader(shader(
+    cfPair(execCf(0, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),
+  )), /no executable control flow/);
+});
+
+test('checkProgramLinks reports the exact diagnostic when the FS declares an unlinked input', async () => {
+  // Negative control for the link-safe-by-construction design: the helper must be
+  // able to SEE an interface break, not just rubber-stamp pairs.
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7());
+  const badFs = program.fragment.wgsl.replace('struct PsIn {', 'struct PsIn {\n  @location(9) i9: vec4f,');
+  assert.notEqual(badFs, program.fragment.wgsl);
+  const err = await checkProgramLinks(program.vertex.wgsl, badFs, [{
+    arrayStride: 12, stepMode: 'vertex',
+    attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }],
+  }]);
+  assert.match(err, /fragment input at location 9|corresponding vertex output/i);
 });

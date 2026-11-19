@@ -17,6 +17,7 @@ import '../../public/js/recomp/hle.js';       // side effect: globalThis.XenonHL
 import '../../public/js/recomp/hle_tables.js'; // side effect: globalThis.XenonHLETables
 import '../../public/js/gpu/webgpu_backend.js';
 import '../../public/js/gpu/gpu_host.js';     // side effect: globalThis.XenonGpuHostFactory
+import '../../public/js/gpu/render_state.js';
 
 const PM4 = globalThis.XenonPM4;
 const { XenosCommandProcessor } = globalThis.XenonGpuCommandProcessor;
