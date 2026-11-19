@@ -360,6 +360,7 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   setReg(0x210d, 0x0000427F); // RB_STENCILREFMASK: ref 0x7F, mask 0x42
   setReg(0x2200, 0x2 | 0x4 | (0x6 << 4));
   setReg(0x2201, (7 << 8) | (0 << 5) | 6);
+  setReg(0x210e, 0x3F000000); // RB_ALPHA_REF: 0.5f
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
   const draw = backend.calls.find((c) => c.kind === 'draw');
@@ -375,6 +376,7 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   assert.equal(draw.renderTargets.depthControl, 0x2 | 0x4 | (0x6 << 4));
   assert.equal(draw.renderTargets.blendControl0, (7 << 8) | 6);
   assert.equal(draw.renderTargets.colorControl, 0);
+  assert.equal(draw.renderTargets.alphaRef, 0x3F000000);
   assert.ok(draw.scissor, 'scissor snapshot is attached');
   assert.equal(draw.scissor.windowScissorTl, (8 << 16) | 8);
   assert.equal(draw.scissor.windowScissorBr, (40 << 16) | 40);

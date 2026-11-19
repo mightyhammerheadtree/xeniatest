@@ -206,18 +206,30 @@
       raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, raw.colorMask >>> 0, raw.depthControl >>> 0,
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
+      raw.alphaRef === undefined ? -1 : (raw.alphaRef >>> 0),
       (psExportsColor0 ? 1 : 0) | ((psExportsDepth ? 1 : 0) << 1),
     ].join(',');
     const cached = rtDecodeCache.get(cacheKey);
     if (cached) return cached;
 
-    // --- RB_COLORCONTROL: alpha test is not representable yet ---------------
+    // --- alpha test (RB_COLORCONTROL) — applied by the translated guest PS ---
+    // xenia implements the alpha test in the pixel shader itself (OpDiscard),
+    // comparing the oC0 alpha against RB_ALPHA_REF (a bitcast float). The
+    // reference is not pipeline state: the backend uploads the raw dword as a
+    // tiny uniform the translated PS declares. Applies only when the PS
+    // exports oC0 (xenia's condition); kAlways passes trivially (xenia skips).
     const colorControl = raw.colorControl >>> 0;
-    if ((colorControl & 0x8) !== 0) {
-      const func = cmp(colorControl);
-      throw new XenosRenderStateError(
-        `alpha test is not implemented (RB_COLORCONTROL.ALPHA_TEST: alpha_func=${func}, alpha ref from RB_ALPHA_REF) — ` +
-        'no WGSL representation exists yet; refusing to render rejected pixels as visible');
+    const alphaTestEnable = (colorControl & 0x8) !== 0;
+    const alphaFunc = colorControl & 0x7;
+    const alphaRef = raw.alphaRef;
+    let alphaTest = null;
+    if (alphaTestEnable && alphaFunc !== 7) {
+      if (alphaRef === undefined) {
+        throw new XenosRenderStateError(
+          'RB_COLORCONTROL has alpha_test_enable set but the render-target snapshot carries no alpha reference ' +
+          '(params.renderTargets.alphaRef) — refusing to draw with a fabricated reference');
+      }
+      alphaTest = { compare: alphaFunc, referenceDword: alphaRef >>> 0 };
     }
 
     // --- RB_COLOR_INFO RT0: format must be representable when written ------
@@ -315,6 +327,7 @@
       blendConstant,
       depthStencil,
       stencilRef: ref,
+      alphaTest,
       colorFormatName: colorInfo0.formatName,
       depthFormatName: depthInfo.formatName,
     };
@@ -378,6 +391,13 @@
     RB_DEPTHCONTROL, RB_BLENDCONTROL0, RB_COLORCONTROL,
     RB_BLENDCONTROL1, RB_BLENDCONTROL2, RB_BLENDCONTROL3,
     decodeColorInfo, decodeDepthInfo, decodeBlendControl, blendEnabled, normalizeWriteMask,
+    /** The alpha-test decision from raw RB_COLORCONTROL alone: { compare } or null (xenia's rules: bit 3 enable, bits 0-2 CompareFunction, kAlways disables). */
+    decodeAlphaTest(colorControl) {
+      const c = colorControl >>> 0;
+      const enabled = (c & 0x8) !== 0;
+      const func = c & 0x7;
+      return enabled && func !== 7 ? { compare: func } : null;
+    },
     buildRenderTargetState,
     PA_SC_WINDOW_SCISSOR_TL, PA_SC_WINDOW_SCISSOR_BR, PA_SC_WINDOW_OFFSET,
     PA_SC_SCREEN_SCISSOR_TL, PA_SC_SCREEN_SCISSOR_BR,

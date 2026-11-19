@@ -448,8 +448,9 @@
      * stage is null when no pixel shader is loaded (the caller binds the
      * bring-up FS then). Loud on any unsupported construct.
      */
-    _translateProgram(vsCode, psCode) {
-      const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
+    _translateProgram(vsCode, psCode, alphaTest) {
+      const atKey = alphaTest ? `at${alphaTest.compare}` : 'at-';
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + '|' + atKey;
       let perVs = this.programMemo.get(vsCode);
       if (!perVs) {
         perVs = new Map();
@@ -460,7 +461,7 @@
       const TX = globalThis.XenonGpuTranslate;
       if (!TX) throw new XenosWebGpuError('XenonGpuTranslate is not loaded — public/js/gpu/wgsl_translate.js must be loaded before the backend builds a draw pipeline');
       try {
-        pair = TX.translateShaderProgram(vsCode, psCode);
+        pair = TX.translateShaderProgram(vsCode, psCode, { alphaTest: alphaTest ?? undefined });
       } catch (e) {
         const name = e && e.constructor && e.constructor.name ? e.constructor.name : 'Error';
         const detail = e && e.message ? e.message : String(e);
@@ -508,6 +509,30 @@
           this.uploads.constantUploads++;
         }
       }
+    }
+
+    /**
+     * Upload RB_ALPHA_REF (IEEE-754 bitcast) into a persistent 16-byte uniform
+     * for the translated guest pixel shader's alpha test. Content-hashed: the
+     * write happens only when the reference dword changes. Loud when the
+     * translated program declares the alpha test but the snapshot carried no
+     * reference — never fabricate one.
+     */
+    _uploadAlphaTest(params, program) {
+      if (!program.alphaTest) return;
+      const dword = params.renderTargets?.alphaRef;
+      if (dword === undefined) {
+        throw new XenosWebGpuError('draw: the translated guest pixel shader has an alpha test enabled but the render-target snapshot carries no alpha reference (params.renderTargets.alphaRef) — refusing to draw with a fabricated reference');
+      }
+      if (dword === this.alphaRefHash && this.alphaTestBuffer) return;
+      if (!this.alphaTestBuffer) {
+        this.alphaTestBuffer = this.device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'xenos-alpha-test' });
+      }
+      const bytes = new Uint8Array(16);
+      new DataView(bytes.buffer).setUint32(0, dword >>> 0, true);
+      this.device.queue.writeBuffer(this.alphaTestBuffer, 0, bytes);
+      this.alphaRefHash = dword >>> 0;
+      this.uploads.constantUploads++;
     }
 
     /** The color target descriptor for the canvas attachment (format + write mask + blend). */
@@ -648,10 +673,11 @@
         primitive: { topology },
       });
       let bindGroup = null;
-      if (program.usesFloatConstants || program.usesBoolConstants) {
+      if (program.usesFloatConstants || program.usesBoolConstants || program.alphaTest) {
         const entries = [];
         if (program.usesFloatConstants) entries.push({ binding: 0, resource: { buffer: this.aluConstantBuffer } });
         if (program.usesBoolConstants) entries.push({ binding: program.usesFloatConstants ? 1 : 0, resource: { buffer: this.boolConstantBuffer } });
+        if (program.alphaTest) entries.push({ binding: program.alphaTest.binding, resource: { buffer: this.alphaTestBuffer } });
         bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
       }
       entry = { pipeline, bindGroup };
@@ -752,7 +778,8 @@
         // A pixel shader, when loaded, IS translated and run — no guessed fragment stage anywhere.
         const psCode = this.shaders.pixel?.code ?? null;
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
-        const program = this._translateProgram(code, psCode);
+        const alphaTest = globalThis.XenonGpuRenderState?.decodeAlphaTest(params.renderTargets?.colorControl ?? 0) ?? null;
+        const program = this._translateProgram(code, psCode, alphaTest);
 
         // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
         if (!params.vertexFetchConstants && program.vertex.inputLocations.length > 0) {
@@ -780,6 +807,7 @@
         }
         const buffers = plan ? this.uploadVertexBuffers(plan) : [];
         this._uploadShaderConstants(params, program);
+        this._uploadAlphaTest(params, program);
         const rtState = this._resolveRenderTargets(params, program);
         const scissor = this._resolveScissor(params);
         const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);

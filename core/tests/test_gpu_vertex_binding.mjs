@@ -155,6 +155,7 @@ const DEFAULT_RT = {
   depthControl: 0,
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0,
 };
 const baseParams = {
   primType: 4, primTypeName: 'triangle-list', numIndices: 3,

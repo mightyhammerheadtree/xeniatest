@@ -22,6 +22,7 @@ const ZERO_RT = {
   depthControl: 0,
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0,
 };
 const rt = (overrides = {}) => ({ ...ZERO_RT, ...overrides });
 const rtState = (overrides = {}, opts = {}) => RS.buildRenderTargetState(rt(overrides), { psExportsColor0: true, psExportsDepth: false, ...opts });
@@ -217,10 +218,23 @@ test('kD24FS8 depth traps when the PS exports oDepth', () => {
   assert.throws(() => rtState({ depthInfo: 1 << 16 }, { psExportsDepth: true }), /kD24FS8/);
 });
 
-test('alpha test traps loudly (no WGSL representation)', () => {
-  assert.throws(() => rtState({ colorControl: 0x8 | (1 << 0) }), /alpha test/i);
+test('alpha test decodes (applied by the translated PS, not pipeline state)', () => {
+  const st = rtState({ colorControl: 0x8 | 0x1, alphaRef: 0x3F000000 }); // enable | kLess
+  assert.deepEqual(st.alphaTest, { compare: 1, referenceDword: 0x3F000000 });
+  // kAlways (7): always passes — decode treats the test as disabled (xenia skips it)
+  assert.equal(rtState({ colorControl: 0x8 | 0x7, alphaRef: 0 }).alphaTest, null);
+  // disabled (bit 3 clear): no alpha test even with function bits set
+  assert.equal(rtState({ colorControl: 0x6 }).alphaTest, null);
+  // every Xenos CompareFunction decodes 0..6 and alphaTest only appears with bit 3
+  for (let compare = 0; compare <= 7; compare++) {
+    const st = rtState({ colorControl: 0x8 | compare, alphaRef: 0x3F800000 });
+    if (compare === 7) assert.equal(st.alphaTest, null);
+    else assert.equal(st.alphaTest.compare, compare);
+  }
   // alpha-to-coverage on its own is not alpha test — it is a no-op at 1x MSAA and does not trap
-  assert.doesNotThrow(() => rtState({ colorControl: 0x10 }));
+  assert.doesNotThrow(() => rtState({ colorControl: 0x10, alphaRef: 0 }));
+  // enabled without a reference in the snapshot traps (no fabricated reference)
+  assert.throws(() => rtState({ colorControl: 0x8 | 0x1, alphaRef: undefined }), /alphaRef/);
 });
 
 test('a missing snapshot traps with a named reason (no fabricated ROP state)', () => {

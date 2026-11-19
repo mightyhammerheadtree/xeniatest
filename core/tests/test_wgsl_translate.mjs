@@ -1071,3 +1071,92 @@ test('checkProgramLinks reports the exact diagnostic when the FS declares an unl
   }]);
   assert.match(err, /fragment input at location 9|corresponding vertex output/i);
 });
+
+// ================================================================ alpha test
+// RB_COLORCONTROL.alpha_test_enable + alpha_func (CompareFunction, same 3-bit
+// numbering as zfunc). The reference is NOT baked into the shader — it arrives
+// as a small uniform (IEEE-754 bits at bindings.alphaTest) the backend binds.
+
+test('pixel shader: alpha test emits the discard + uniform, and Dawn accepts it', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { alphaTest: { compare: 3 } }); // kLessEqual, PS also reads fc
+  assert.equal(out.type, 'pixel');
+  assert.match(out.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.match(out.wgsl, /@group\(0\) @binding\(1\) var<uniform> alphaTest: vec4f;/, 'fc occupies 0 — the alpha test takes the next free binding');
+  assert.match(out.wgsl, /fn alphaTestPass\(x: f32\) -> bool \{ return x <= alphaTest\.x; \}/);
+  assert.match(out.wgsl, /if \(!alphaTestPass\(out\.color0\.w\)\) \{ discard; \}\n  return out;/);
+  assert.deepEqual(out.alphaTest, { compare: 3, binding: 1 });
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: alpha test reuses the merged layout — fc + bools + alphaTest get distinct bindings', async () => {
+  // VS uses fc+bools; PS uses fc; alpha test for the pair → alphaTest takes binding 2.
+  const VS_FC_BOOL = shader(
+    cfPair(condExecCf(1, 2, seq(SEQ_FETCH, SEQ_ALU), 3, 1), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ isExport: 1, vectorDest: 7, vectorOpcode: 0, src: [temp(1), konst(0), temp(1)] }),
+  );
+  const program = T.translateShaderProgram(VS_FC_BOOL, PS_CONST(), { alphaTest: { compare: 1 } }); // kLess
+  assert.match(program.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+  assert.match(program.fragment.wgsl, /@group\(0\) @binding\(2\) var<uniform> alphaTest/);
+  assert.doesNotMatch(program.fragment.wgsl, /var<uniform> bools/);
+  assert.equal(program.alphaTest.compare, 1);
+  assert.equal(program.alphaTest.binding, 2);
+  await assertValidWgsl(program.fragment.wgsl);
+  const ok = await checkProgramLinks(program.vertex.wgsl, program.fragment.wgsl,
+    [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] }]);
+  assert.equal(ok, null);
+});
+
+test('pixel shader: alpha test without fc/bools binds alphaTest at 0; bools present → at 1', async () => {
+  const p1 = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { alphaTest: { compare: 6 } }); // kGreaterEqual
+  assert.match(p1.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> alphaTest/);
+  assert.equal(p1.alphaTest.binding, 0);
+  await assertValidWgsl(p1.fragment.wgsl);
+
+  const PS_BOOL = shader( // PS uses bools only (fresh binding 0) + alphaTest (binding 1)
+    cfPair(condExecCf(1, 1, seq(SEQ_ALU), 5, 1), NOP_CF),
+    aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const p2 = T.translateShaderProgram(VS_EXPORT_7(), PS_BOOL, { alphaTest: { compare: 5 } }); // kNotEqual
+  assert.match(p2.fragment.wgsl, /@group\(0\) @binding\(0\) var<uniform> bools/);
+  assert.match(p2.fragment.wgsl, /@group\(0\) @binding\(1\) var<uniform> alphaTest/);
+  assert.equal(p2.alphaTest.binding, 1);
+  await assertValidWgsl(p2.fragment.wgsl);
+});
+
+test('pixel shader: alpha test ignored when the PS does not statically export oC0 (xenia applies it only then)', () => {
+  const PS_DEAD = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }), // dead write, no exports
+  );
+  const out = T.translatePixelShader(PS_DEAD, { alphaTest: { compare: 2 } });
+  assert.equal(out.alphaTest, null);
+  assert.doesNotMatch(out.wgsl, /alphaTest|discard/);
+});
+
+test('pixel shader: kAlways (7) is treated as no test at the program level', () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { alphaTest: { compare: 7 } });
+  assert.equal(program.alphaTest, null);
+  assert.doesNotMatch(program.fragment.wgsl, /alphaTest|discard/);
+});
+
+test('pixel shader: compare 8 is rejected loudly', () => {
+  assert.throws(() => T.translateShaderProgram(VS_EXPORT_7(), PS_CONST(), { alphaTest: { compare: 8 } }), /CompareFunction/);
+});
+
+test('pixel shader: every Xenos CompareFunction maps to the operator with matching NaN semantics', async () => {
+  const expected = [
+    [0, 'return false;'],
+    [1, 'return x < alphaTest.x;'],
+    [2, 'return x == alphaTest.x;'],
+    [3, 'return x <= alphaTest.x;'],
+    [4, 'return x > alphaTest.x;'],
+    [5, 'return x != alphaTest.x;'],
+    [6, 'return x >= alphaTest.x;'],
+  ];
+  for (const [compare, expr] of expected) {
+    const out = T.translatePixelShader(PS_CONST(), { alphaTest: { compare } });
+    assert.ok(out.wgsl.includes(`fn alphaTestPass(x: f32) -> bool { ${expr} }`), `compare ${compare}`);
+    await assertValidWgsl(out.wgsl);
+  }
+});

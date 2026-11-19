@@ -91,6 +91,7 @@ const DEFAULT_RT = {
   depthControl: 0,
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0,
 };
 const DEFAULT_SCISSOR = {
   windowScissorTl: 0, windowScissorBr: 0x00400040, windowOffset: 0,

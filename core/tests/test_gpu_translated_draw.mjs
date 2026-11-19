@@ -210,6 +210,7 @@ const defaultRenderTargets = (overrides = {}) => ({
   // one/zero/add for both color and alpha is what actually disables blending.
   blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
   colorControl: 0,
+  alphaRef: 0x3F000000, // 0.5f
   ...overrides,
 });
 /** A sane zeroed scissor snapshot: full 64x64 canvas (the test canvas size). */
@@ -557,15 +558,74 @@ test('different render-target states produce distinct cached pipelines; identica
   assert.equal(log.drawCalls.length, 3);
 });
 
-test('traps: alpha test enabled is refused loudly (no WGSL representation yet)', () => {
+// A pixel shader statically exporting oC0 (add r0+r0 → oC0).
+const psWithExportsColor0 = () => shader(
+  cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+  aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 0, src: [temp(0), temp(0), temp(0)] }),
+);
+
+test('alpha test: the translated PS declares the discard + uniform bound at bindings.alphaTest', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
-  assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x9 }) })), // alpha_test_enable | alpha_func 1
-    (e) => e instanceof XenosWebGpuError && /alpha test/i.test(e.message));
-  assert.equal(log.pipelines.length, 0);
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  assert.ok(globalThis.XenonGpuTranslate.translateShaderProgram(FETCH_VS, PS_BLACK, { alphaTest: { compare: 1 } }).fragment.wgsl.includes('discard'), 'translator emits the discard when exportsColor0');
+  const state = backend.draw(drawParams({
+    renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x1, alphaRef: 0x3F000000 }), // enable | kLess
+  }));
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.ok(fsModule, 'translated PS module');
+  assert.match(fsModule.code, /fn alphaTestPass/);
+  assert.match(fsModule.code, /if \(!alphaTestPass\(out\.color0\.w\)\) \{ discard; \}/);
+  assert.match(fsModule.code, /var<uniform> alphaTest: vec4f;/);
+  assert.equal(log.pipelines.length, 1, 'pipeline created with the alpha-test PS');
+  const bg = log.bindGroupsCreated.find((g) => g.entries.some((e) => e.resource.buffer === backend.alphaTestBuffer));
+  assert.ok(bg, 'bind group binds the alpha-test uniform');
+  assert.equal(bg.entries.find((e) => e.resource.buffer === backend.alphaTestBuffer).binding, 0, 'binding 0 when no fc/bools are declared by either stage');
+  assert.equal(backend.alphaRefHash, 0x3F000000 >>> 0);
+  assert.equal(backend.uploads.constantUploads, 1, 'one 16-byte upload for the ref');
+});
+
+test('alpha test: the reference upload is content-hashed (rewritten only when RB_ALPHA_REF changes)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x4, alphaRef: 0x3F000000 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x4, alphaRef: 0x3F000000 }) }));
+  assert.equal(backend.uploads.constantUploads, 1, 'identical ref → one upload');
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x4, alphaRef: 0x40000000 }) }));
+  assert.equal(backend.uploads.constantUploads, 2, 'changed ref → re-upload');
+  assert.equal(backend.alphaRefHash, 0x40000000 >>> 0);
+});
+
+test('alpha test: different compare functions produce distinct pipelines (translation keyed)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x1 }) })); // kLess
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x3 }) })); // kLessEqual
+  assert.equal(log.pipelines.length, 2, 'alpha-test enable/func is part of the pipeline key');
+});
+
+test('alpha test: kAlways draws normally (decode treats the test as disabled, xenia skips it)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x8 | 0x7 }) })); // enable | kAlways
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.ok(!/discard/.test(fsModule.code), 'no discard emitted for kAlways');
+  assert.equal(backend.alphaTestBuffer, undefined, 'no alpha-test uniform allocated');
 });
 
 test('traps: GAMMA color format is refused (needs the PWL gamma pass, step 7)', () => {
