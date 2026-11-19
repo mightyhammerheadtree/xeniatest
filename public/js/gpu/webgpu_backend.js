@@ -310,7 +310,11 @@
 
     setShaderBases(vsBase, psBase) { this.log('debug', `setShaderBases vs=0x${vsBase.toString(16)} ps=0x${psBase.toString(16)}`); }
 
-    vizQuery(state) { this.log('debug', `vizQuery ${state}`); }
+    vizQuery(state) {
+      // Occlusion queries need a querySet + resolve + guest-memory writeback — none of which exists yet (step 9).
+      // xenia issues real D3D queries here; silently no-op'ing would leave the guest polling a status that never lands.
+      throw new XenosWebGpuError(`PM4_VIZ_QUERY '${state}' is not supported yet — the occlusion-query path (querySet, resolve, guest-memory writeback) is step 9; refusing to silently no-op`);
+    }
 
     setShaders({ vertex, pixel }) {
       if (vertex) this.shaders.vertex = vertex;

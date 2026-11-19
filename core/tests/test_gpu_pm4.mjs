@@ -386,3 +386,36 @@ test('draw packet snapshots the RB_* render-target registers from the register f
   assert.equal(draw.scissor.screenScissorTl, (4 << 16) | 4);
   assert.equal(draw.scissor.screenScissorBr, (52 << 16) | 52);
 });
+
+test('draw with PA_SC_VIZ_QUERY ena+kill (0x81) is dropped — occlusion hint, not an RT write (xenia rule)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+  setReg(0x2293, 0x81); // viz_query_ena | kill_pix_post_hi_z
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'no draw issued — xenia skips it');
+});
+
+test('PA_SC_VIZ_QUERY ena without kill (or kill without ena) still draws (xenia rule)', () => {
+  for (const viz of [0x01, 0x80, 0x00]) {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = makeCP(guest, backend);
+    const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+    setReg(0x2293, viz);
+    const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 1, `PA_SC_VIZ_QUERY=0x${viz.toString(16)} must still draw`);
+  }
+});
+
+test('PM4_VIZ_QUERY traps loudly (occlusion queries unimplemented — step 9)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_VIZ_QUERY, 1), 0])),
+    (e) => e instanceof XenosGpuError && /VIZ_QUERY/.test(e.message));
+});

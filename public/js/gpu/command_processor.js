@@ -92,7 +92,6 @@
       this.vertexShader = null;
       this.pixelShader = null;
       /** Viz query bookkeeping: number of open surveys (depth may exceed 1 across nested flushes). */
-      this.vizQueryOpen = false;
       /** GPU event counter written back by EVENT_WRITE* with the counter bit (initiator & 0x80000000). */
       this.counter = 0;
       /** WRITEBACK_START/SIZE register indices (guest physical window for event writebacks). */
@@ -331,13 +330,11 @@
           this._writeRegister(regFile().XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3f);
           return end;
         }
-        case op.PM4_VIZ_QUERY: {
-          const value = u32s[start];
-          const begin = (value & 0x1) === 0; // 0 = begin query, 1 = end query (r6xx VIZ_QUERY semantics)
-          this.vizQueryOpen = begin;
-          if (this.backend && typeof this.backend.vizQuery === 'function') this.backend.vizQuery(begin ? 'start' : 'end');
-          return end;
-        }
+        case op.PM4_VIZ_QUERY:
+          // Occlusion queries cannot be produced here (the query path — querySet, resolve,
+          // guest-visible PA_SC_VIZ_QUERY_STATUS results — is step 9). Silently swallowing the
+          // packet would leave the guest polling a status that never lands, so refuse loudly.
+          throw new XenosGpuError(`${parsed.opcodeName}: occlusion queries are not supported (step 9) — results cannot be produced; refusing to silently no-op (the draw path still honors PA_SC_VIZ_QUERY ena+kill by dropping hint draws)`);
         case op.PM4_INTERRUPT: {
           const mask = u32s[start];
           if (this.backend && typeof this.backend.interrupt === 'function') this.backend.interrupt(mask);
@@ -533,6 +530,7 @@
       const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
       const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
+      const PA_SC_VIZ_QUERY = 0x2293;
       const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082, PA_SC_WINDOW_OFFSET = 0x2080;
       const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
@@ -557,6 +555,14 @@
         blendControl2: this.registers.read(RB_BLENDCONTROL2) >>> 0,
         blendControl3: this.registers.read(RB_BLENDCONTROL3) >>> 0,
       };
+      // xenia: if PA_SC_VIZ_QUERY has viz_query_ena (bit 0) AND kill_pix_post_hi_z (bit 7),
+      // the draw is an occlusion-query hint and must NOT touch the render target (r6xx/r7xx
+      // VIZ_QUERY). IssueDraw is not called then; other bit combinations draw normally.
+      const vizQuery = this.registers.read(PA_SC_VIZ_QUERY) >>> 0;
+      if ((vizQuery & 0x81) === 0x81) {
+        this.log('debug', `${opcodeName}: draw skipped — PA_SC_VIZ_QUERY enables the query test with kill_pix_post_hi_z (xenia drops such draws; occlusion-vector hint, not an RT write)`);
+        return end;
+      }
       const scissor = {
         windowScissorTl: this.registers.read(PA_SC_WINDOW_SCISSOR_TL) >>> 0,
         windowScissorBr: this.registers.read(PA_SC_WINDOW_SCISSOR_BR) >>> 0,
