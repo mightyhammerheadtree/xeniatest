@@ -155,3 +155,68 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08, UNIFORM
   const ms = performance.now() - t0;
   console.log(`translated draws: ${REPS} in ${ms.toFixed(1)} ms (${(ms / REPS * 1000).toFixed(1)} µs/draw); pipelines=${ops.pipeline}, modules=${ops.module}, shader modules created once, buffers created=${ops.buf}, writeBuffer=${ops.write}, bindGroups=${ops.bindGroup}`);
 }
+
+// ---- bench 4: repeated draws on the translated VS+PS path — pair is memoized, constants shared
+{
+  const guest = makeGuest();
+  const VB_BASE = 0x00100000;
+  const view = new DataView(guest.arena.buffer);
+  for (let i = 0; i < 9; i++) view.setFloat32(VB_BASE + i * 4, i + 1, false);
+  const execCf = (address, count, sequence, opcode = 2, extraW1 = 0) => ({ dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: ((opcode & 0xF) << 12) | (extraW1 & 0x0FFF) });
+  const NOP_CF = { dword0: 0, dword1: 0 };
+  const cfPair = (a, b) => [a.dword0 >>> 0, (a.dword1 & 0xFFFF) | ((b.dword0 & 0xFFFF) << 16), ((b.dword0 >>> 16) & 0xFFFF) | ((b.dword1 & 0xFFFF) << 16)];
+  const temp = (reg) => ({ sel: 1, reg: reg & 0x3F });
+  const konst = (index) => ({ sel: 0, reg: index & 0xFF });
+  const aluWords = ({ vectorDest = 0, isExport = 0, vectorWriteMask = 0xF, vectorOpcode = 2, src = [temp(0), temp(1), temp(1)] } = {}) => {
+    const w0 = ((vectorDest & 0x3F) | ((isExport & 1) << 15) | ((vectorWriteMask & 0xF) << 16) | (50 << 26)) >>> 0;
+    const w2 = (((src[2].reg & 0xFF) | ((src[1].reg & 0xFF) << 8) | ((src[0].reg & 0xFF) << 16)) | ((vectorOpcode & 0x1F) << 24) | ((src[2].sel & 1) << 29) | ((src[1].sel & 1) << 30) | ((src[0].sel & 1) << 31)) >>> 0;
+    return [w0, 0, w2];
+  };
+  const vfetchW = () => [((1 & 0x3F) << 12) | (1 << 19), 0x688 | (57 << 16), 3];
+  // VS: fetch r1, export v2 = r1 + r1, oPos = r1 (1 + 1 interpolator + position)
+  const VS = new Uint32Array([
+    ...cfPair(execCf(1, 3, 1 /* seq(FETCH, ALU, ALU) */, 2), NOP_CF),
+    ...vfetchW(),
+    ...aluWords({ isExport: 1, vectorDest: 2, vectorOpcode: 0 /* add */, src: [temp(1), temp(1), temp(1)] }),
+    ...aluWords({ isExport: 1, vectorDest: 62, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  ]);
+  // PS: oC0 = fc[1] + v2-ish input: reads lane 2 (VS exports it) and fc[0]
+  const PS = new Uint32Array([
+    ...cfPair(execCf(1, 1, 0 /* SEQ_ALU */, 2), NOP_CF),
+    ...aluWords({ isExport: 1, vectorDest: 0, vectorOpcode: 11 /* mad */, src: [temp(2), konst(0), konst(1)] }),
+  ]);
+  const consts = new Uint32Array(192);
+  consts[0] = (VB_BASE & 0x1FFFFFFC) | 3;
+  consts[1] = 9 << 2;
+  const alu = new Uint32Array(1024);
+  alu[0] = 0x3f800000;
+  alu[4] = 0x40000000;
+  const ops = { buf: 0, write: 0, pipeline: 0, module: 0, bindGroup: 0 };
+  const fakeDevice = {
+    queue: { writeBuffer() { ops.write++; }, submit() {} },
+    createBuffer(desc) { ops.buf++; return { desc }; },
+    createTexture() { return { destroy() {} }; },
+    createShaderModule(desc) { ops.module++; return { desc }; },
+    createRenderPipeline(desc) { ops.pipeline++; return { desc, getBindGroupLayout() { return {}; } }; },
+    createBindGroup(desc) { ops.bindGroup++; return { desc }; },
+    createCommandEncoder() {
+      const pass = { setPipeline() {}, setVertexBuffer() {}, setBindGroup() {}, setIndexBuffer() {}, draw() {}, drawIndexed() {}, end() {} };
+      return { beginRenderPass() { return pass; }, finish() { return {}; } };
+    },
+    destroy() {},
+  };
+  const backend = new XenosWebGpuBackend({ readGuestMemory: guest.readGuestMemory, writeGuestMemory: guest.writeGuestMemory });
+  backend.device = fakeDevice;
+  backend.format = 'bgra8unorm';
+  const canvas = { width: 64, height: 64, getContext: () => ({ getCurrentTexture: () => ({ createView: () => ({}) }) }) };
+  backend.canvas = canvas;
+  backend.context = canvas.getContext('webgpu');
+  backend.shaders.vertex = { kind: 'vertex', code: VS, dwords: VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS, dwords: PS.length };
+  const params = { primType: 4, primTypeName: 'triangle-list', numIndices: 3, isIndexed: false, vertexFetchConstants: consts, aluConstants: alu };
+  const REPS = 2000;
+  const t0 = performance.now();
+  for (let i = 0; i < REPS; i++) backend.draw({ ...params });
+  const ms = performance.now() - t0;
+  console.log(`translated VS+PS draws: ${REPS} in ${ms.toFixed(1)} ms (${(ms / REPS * 1000).toFixed(1)} µs/draw); pipelines=${ops.pipeline}, modules=${ops.module}, buffers created=${ops.buf}, writeBuffer=${ops.write}, bindGroups=${ops.bindGroup} (expect 1, 2, ≤3, 2, 1)`);
+}

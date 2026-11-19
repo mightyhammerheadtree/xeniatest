@@ -73,6 +73,16 @@ const ALU_VECTOR_TRAPS = Object.freeze({
   18: 'cube', 24: 'kill_eq', 25: 'kill_gt', 26: 'kill_ge', 27: 'kill_ne',
   29: 'maxa', 30: 'opcode_30', 31: 'opcode_31',
 });
+// Pixel shaders additionally support the kill ops (opcode 24–27), which
+// demote the invocation (discard) with an any-lane compare and write 0.0.
+const ALU_VECTOR_OPS_PIXEL = Object.freeze({
+  ...ALU_VECTOR_OPS,
+  24: 'kill_eq', 25: 'kill_gt', 26: 'kill_ge', 27: 'kill_ne',
+});
+const ALU_VECTOR_TRAPS_PIXEL = Object.freeze({
+  18: 'cube',
+  29: 'maxa', 30: 'opcode_30', 31: 'opcode_31',
+});
 const ALU_SCALAR_OPS = Object.freeze({
   0: 'adds', 1: 'adds_prev', 2: 'muls', 3: 'muls_prev', 5: 'maxs', 6: 'mins',
   7: 'seqs', 8: 'sgts', 9: 'sges', 10: 'snes', 11: 'frcs', 12: 'truncs', 13: 'floors',
@@ -89,6 +99,28 @@ const ALU_SCALAR_TRAPS = Object.freeze({
   56: 'opcode_56', 57: 'opcode_57', 58: 'opcode_58', 59: 'opcode_59', 60: 'opcode_60',
   61: 'opcode_61', 62: 'opcode_62', 63: 'opcode_63',
 });
+// Pixel shaders additionally support the scalar kill ops (opcode 35–39):
+// demote the invocation on a comparison against 0.0 (1.0 for kills_one),
+// lane W of the third source, writing 0.0.
+const ALU_SCALAR_OPS_PIXEL = Object.freeze({
+  ...ALU_SCALAR_OPS,
+  35: 'kills_eq', 36: 'kills_gt', 37: 'kills_ge', 38: 'kills_ne', 39: 'kills_one',
+});
+const ALU_SCALAR_TRAPS_PIXEL = Object.freeze({
+  4: 'muls_prev2', 14: 'exp', 15: 'logc', 16: 'log', 17: 'rcpc', 18: 'rcpf', 19: 'rcp',
+  20: 'rsqc', 21: 'rsqf', 22: 'rsq', 23: 'maxas', 24: 'maxasf', 40: 'sqrt',
+  41: 'opcode_41', 42: 'mulsc', 43: 'mulsc', 44: 'addsc', 45: 'addsc', 46: 'subsc',
+  47: 'subsc', 48: 'sin', 49: 'cos',
+  51: 'opcode_51', 52: 'opcode_52', 53: 'opcode_53', 54: 'opcode_54', 55: 'opcode_55',
+  56: 'opcode_56', 57: 'opcode_57', 58: 'opcode_58', 59: 'opcode_59', 60: 'opcode_60',
+  61: 'opcode_61', 62: 'opcode_62', 63: 'opcode_63',
+});
+/** Op tables for a shader type. */
+function opcodeTablesFor(shaderType) {
+  return shaderType === 'pixel'
+    ? { vectorOps: ALU_VECTOR_OPS_PIXEL, vectorTraps: ALU_VECTOR_TRAPS_PIXEL, scalarOps: ALU_SCALAR_OPS_PIXEL, scalarTraps: ALU_SCALAR_TRAPS_PIXEL }
+    : { vectorOps: ALU_VECTOR_OPS, vectorTraps: ALU_VECTOR_TRAPS, scalarOps: ALU_SCALAR_OPS, scalarTraps: ALU_SCALAR_TRAPS };
+}
 
 // ---------------------------------------------------------------- decode
 const SEQ_FETCH = 0b01;
@@ -99,7 +131,8 @@ function swizzledComponent(swizzle, componentIndex) {
 }
 
 /** Decode one ALU instruction (3 dwords). */
-function decodeAluInstruction(dwords, instructionIndex) {
+function decodeAluInstruction(dwords, instructionIndex, shaderType) {
+  const tables = opcodeTablesFor(shaderType);
   const base = instructionIndex * 3;
   const w0 = dwords[base] >>> 0, w1 = dwords[base + 1] >>> 0, w2 = dwords[base + 2] >>> 0;
   const swz = [(w1 >>> 16) & 0xFF, (w1 >>> 8) & 0xFF, w1 & 0xFF];
@@ -172,8 +205,8 @@ function decodeAluInstruction(dwords, instructionIndex) {
     isExport,
     vectorOpcode,
     scalarOpcode,
-    vectorOpName: ALU_VECTOR_OPS[vectorOpcode] ?? null,
-    scalarOpName: ALU_SCALAR_OPS[scalarOpcode] ?? null,
+    vectorOpName: tables.vectorOps[vectorOpcode] ?? null,
+    scalarOpName: tables.scalarOps[scalarOpcode] ?? null,
     vectorDest: w0 & 0x3F,
     vectorDestRelative,
     scalarDest: (w0 >>> 8) & 0x3F,
@@ -278,9 +311,14 @@ function decodeShader(dwords, shaderType) {
         }
         const sequence = (exec.sequence >>> (2 * k)) & 0b11;
         if (sequence & SEQ_FETCH) {
-          const fetch = decodeFetchForAttribute(dwords, instructionIndex);
+          const fetch = decodeFetchForAttribute(dwords, instructionIndex, shaderType);
           if (fetch.kind === 'tfetch') {
-            throw new XenosTranslateError(`fetch[${instructionIndex}]: texture fetch in a vertex shader is not supported (vertex shaders fetch attributes only)`);
+            throw new XenosTranslateError(shaderType === 'pixel'
+              ? `fetch[${instructionIndex}]: texture fetch in a pixel shader is not supported yet (texture path is bring-up step 8)`
+              : `fetch[${instructionIndex}]: texture fetch in a vertex shader is not supported (vertex shaders fetch attributes only)`);
+          }
+          if (fetch.kind === 'vfetch' && shaderType === 'pixel') {
+            throw new XenosTranslateError(`fetch[${instructionIndex}]: a vertex fetch inside a pixel shader is not supported (pixel shaders fetch textures only)`);
           }
           if (fetch.writtenLanes !== 0) {
             if (fetch.destReg >= 16) {
@@ -290,13 +328,20 @@ function decodeShader(dwords, shaderType) {
           }
           instructions.push({ kind: 'vfetch', instructionIndex });
         } else {
-          const decoded = decodeAluInstruction(dwords, instructionIndex);
+          const decoded = decodeAluInstruction(dwords, instructionIndex, shaderType);
           resolveTargets(decoded, shaderType, interpolatorSet);
           instructions.push({ kind: 'alu', instructionIndex, decoded });
         }
       }
       blocks.push({ condition, instructions });
     }
+  }
+  if (blocks.length === 0 && instructionBound > 0) {
+    // Either the CF bound collapsed to 0 (an exec CF pointed at slot 0 — impossible
+    // in a well-formed blob: the CF pairs occupy slots before any instruction) or
+    // there was no executable control flow at all. Emitting an empty module
+    // would shade nothing, silently.
+    throw new XenosTranslateError(`${shaderType} shader ucode: no executable control flow (malformed blob or missing exec CF)`);
   }
   return {
     blocks,
@@ -308,7 +353,7 @@ function decodeShader(dwords, shaderType) {
 }
 
 /** Decode a fetch instruction's dest lane mask (for attribute binding input). */
-function decodeFetchForAttribute(dwords, instructionIndex) {
+function decodeFetchForAttribute(dwords, instructionIndex, _shaderType) {
   const FW = fetchInternal();
   const base = instructionIndex * 3;
   const w0 = dwords[base] >>> 0, w1 = dwords[base + 1] >>> 0;
@@ -353,6 +398,20 @@ function resolveTargets(decoded, shaderType, interpolatorSet) {
 }
 
 function resolveExportTarget(vectorDest, shaderType, interpolatorSet) {
+  if (shaderType === 'pixel') {
+    // kPSColor0..3 / kPSDepth — xenia ExportRegister; games virtually always export oC0.
+    if (vectorDest === 0) return { kind: 'color0' };
+    if (vectorDest >= 1 && vectorDest <= 3) {
+      throw new XenosTranslateError(`export: pixel color target ${vectorDest} (MRT) is not supported yet — write to oC0 only`);
+    }
+    if (vectorDest === 61) {
+      throw new XenosTranslateError('export: pixel depth export is not supported yet (needs depth-stencil state in the pipeline)');
+    }
+    if (vectorDest >= 32 && vectorDest <= 37) {
+      throw new XenosTranslateError(`export: memory exports (eA/eM${vectorDest - 33}) are not supported yet`);
+    }
+    throw new XenosTranslateError(`export: unsupported pixel export register ${vectorDest}`);
+  }
   if (vectorDest === 62) return { kind: 'position' };
   if (vectorDest >= 0 && vectorDest <= 15) {
     interpolatorSet.add(vectorDest);
@@ -367,17 +426,18 @@ function resolveExportTarget(vectorDest, shaderType, interpolatorSet) {
   throw new XenosTranslateError(`export: unsupported export register ${vectorDest}`);
 }
 
-/** Trap on an operand class the subset does not support (already throws there; kept for clarity). */
-function assertOpcodeSupported(decoded) {
+/** Trap on an opcode the subset does not support for this shader type. */
+function assertOpcodeSupported(decoded, shaderType) {
   const { instructionIndex, vectorOpcode, scalarOpcode } = decoded;
-  const vectorTrap = ALU_VECTOR_TRAPS[vectorOpcode];
+  const tables = opcodeTablesFor(shaderType);
+  const vectorTrap = tables.vectorTraps[vectorOpcode];
   if (vectorTrap) {
     if (vectorTrap === 'cube') throw new XenosTranslateError(`alu[${instructionIndex}]: cube is not supported yet`);
     if (vectorTrap === 'maxa') throw new XenosTranslateError(`alu[${instructionIndex}]: maxa (a0 write) is not supported yet`);
     if (vectorTrap.startsWith('kill_')) throw new XenosTranslateError(`alu[${instructionIndex}]: ${vectorTrap} is pixel-shader-only (kills do not exist in a vertex stage)`);
     throw new XenosTranslateError(`alu[${instructionIndex}]: vector opcode ${vectorOpcode} (${vectorTrap}) is invalid`);
   }
-  const scalarTrap = ALU_SCALAR_TRAPS[scalarOpcode];
+  const scalarTrap = tables.scalarTraps[scalarOpcode];
   if (scalarTrap) {
     if (scalarTrap === 'muls_prev2') throw new XenosTranslateError(`alu[${instructionIndex}]: muls_prev2 is not supported yet`);
     if (scalarTrap === 'maxas' || scalarTrap === 'maxasf') throw new XenosTranslateError(`alu[${instructionIndex}]: ${scalarTrap} (a0 write) is not supported yet`);
@@ -437,6 +497,33 @@ function vectorValue(op) {
 }
 
 const CMP_OP = Object.freeze({ eq: '==', ne: '!=', gt: '>', ge: '>=' });
+const KILL_VECTOR_CMP = Object.freeze({ kill_eq: '==', kill_gt: '>', kill_ge: '>=', kill_ne: '!=' });
+
+/**
+ * WGSL condition under which a kill instruction demotes this invocation
+ * (`discard`), or null for non-kill instructions. xenia semantics:
+ *   - vector kills compare all 4 lanes with the vector opcode and OR them
+ *     (OpAny over bool4; kKillNe is FUnordNotEqual, which WGSL `!=` matches);
+ *   - scalar kills compare lane W ('a') of the scalar source against 0.0
+ *     (1.0 for kills_one), ordered except kills_ne/FUnordNotEqual.
+ */
+function killConditionFor(instr) {
+  const o = instr.operands;
+  const vcmp = instr.vectorOpName && KILL_VECTOR_CMP[instr.vectorOpName];
+  if (vcmp) {
+    const lanes = [0, 1, 2, 3].map((l) => `(${laneExpr(o[0], l)} ${vcmp} ${laneExpr(o[1], l)})`);
+    return `any(vec4<bool>(${lanes.join(', ')}))`;
+  }
+  const a = componentExpr(o[2], 3); // W lane of the scalar source
+  switch (instr.scalarOpName) {
+    case 'kills_eq': return `(${a} == 0.0)`;
+    case 'kills_gt': return `(${a} > 0.0)`;
+    case 'kills_ge': return `(${a} >= 0.0)`;
+    case 'kills_ne': return `(${a} != 0.0)`;
+    case 'kills_one': return `(${a} == 1.0)`;
+    default: return null;
+  }
+}
 const SCALAR_CMP = Object.freeze({
   seqs: '==', sgts: '>', sges: '>=', snes: '!=',
   setp_eq: '==', setp_ne: '!=', setp_gt: '>', setp_ge: '>=',
@@ -510,6 +597,13 @@ function computeVectorLanes(instr, suffix) {
       broadcast(expr);
       break;
     }
+    case 'kill_eq':
+    case 'kill_gt':
+    case 'kill_ge':
+    case 'kill_ne':
+      // Kill instructions demote the invocation; the vector result is 0.0.
+      broadcast('0.0');
+      break;
     case 'dst': {
       const ySrc = `(${lanePair(1, 0)} * ${lanePair(1, 1)})`;
       for (let lane = 0; lane < 4; lane++) {
@@ -562,6 +656,13 @@ function computeScalarResult(instr) {
 
   const set = (expr) => { valueExpr = expr; };
   switch (instr.scalarOpName) {
+    case 'kills_eq':
+    case 'kills_gt':
+    case 'kills_ge':
+    case 'kills_ne':
+    case 'kills_one':
+      // Kill instructions demote the invocation; the scalar result is 0.0.
+      return { valueExpr: '0.0', storePs: true, predicateExpr: null, isNop: false };
     case 'retain_prev':
       // Value is ps; ps is not modified.
       return { valueExpr: 'ps', storePs: false, predicateExpr: null, isNop: mask === 0b0000 && !instr.scalarClamp };
@@ -640,7 +741,7 @@ function makeEmitter() {
 const POSITION_TARGET = { kind: 'position' };
 
 /** Pre-pass over decoded blocks: opcode traps, count registers, detect feature use. */
-function collectStats(dwords, decoded) {
+function collectStats(dwords, decoded, shaderType) {
   let maxReg = 0;
   let usesFloatConstants = false;
   let usesBoolConstants = false;
@@ -654,12 +755,12 @@ function collectStats(dwords, decoded) {
     }
     for (const ins of block.instructions) {
       if (ins.kind === 'vfetch') {
-        const fetch = decodeFetchForAttribute(dwords, ins.instructionIndex);
+        const fetch = decodeFetchForAttribute(dwords, ins.instructionIndex, shaderType);
         if (fetch.writtenLanes !== 0) maxReg = Math.max(maxReg, fetch.destReg + 1);
         continue;
       }
       const alu = ins.decoded;
-      assertOpcodeSupported(alu);
+      assertOpcodeSupported(alu, shaderType);
       if (isAluNop(alu)) continue;
       for (const op of alu.operands) {
         if (op.storageSource === 'constant') {
@@ -687,8 +788,14 @@ function collectStats(dwords, decoded) {
   return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition };
 }
 
+const EXPORT_TARGET_MEMBER = Object.freeze({ position: 'pos', interpolator: (i) => `v${i}`, color0: () => 'color0' });
+
 function emitExportTarget(alu) {
-  return alu.vectorDestTarget.kind === 'position' ? 'out.pos' : `out.v${alu.vectorDestTarget.index}`;
+  const t = alu.vectorDestTarget;
+  if (t.kind === 'position') return 'out.pos';
+  if (t.kind === 'interpolator') return `out.v${t.index}`;
+  if (t.kind === 'color0') return 'out.color0';
+  throw new XenosTranslateError(`export: unknown target kind ${t.kind}`);
 }
 
 /** Emit the combined export (vector + scalar halves + constant lanes). */
@@ -750,14 +857,16 @@ function emitScalarTail(em, alu, scalar, isExport) {
   }
 }
 
-function emitAluInstruction(em, alu) {
+function emitAluInstruction(em, alu, shaderType) {
   if (isAluNop(alu)) return;
-  assertOpcodeSupported(alu); // traps before any output for this instruction
+  assertOpcodeSupported(alu, shaderType); // traps before any output for this instruction
   em.emit(`// alu[${alu.instructionIndex}] ${alu.vectorOpName ?? 'nop'}/${alu.scalarOpName ?? 'nop'}`);
   if (alu.isPredicated) {
     em.emit(`if (${alu.predicateCondition ? 'p0' : '!p0'}) {`);
     em.indentIn();
   }
+  const kill = killConditionFor(alu);
+  if (kill) em.emit(`if (${kill}) { discard; }`);
   if (alu.isExport) {
     emitExportInstruction(em, alu);
   } else {
@@ -771,7 +880,7 @@ function emitAluInstruction(em, alu) {
   }
 }
 
-function emitBlock(em, block) {
+function emitBlock(em, block, shaderType) {
   const condition = block.condition;
   if (condition) {
     let condText;
@@ -786,7 +895,7 @@ function emitBlock(em, block) {
       em.emit(`// vfetch[${ins.instructionIndex}] — attribute load happens at the pipeline boundary`);
       continue;
     }
-    emitAluInstruction(em, ins.decoded);
+    emitAluInstruction(em, ins.decoded, shaderType);
   }
   if (condition) {
     em.indentOut();
@@ -795,40 +904,85 @@ function emitBlock(em, block) {
 }
 
 // ---------------------------------------------------------------- module assembly
-function translateVertexShader(ucodeWords) {
-  const dwords = ucodeWords instanceof Uint32Array ? ucodeWords : Uint32Array.from(ucodeWords ?? [], (w) => w >>> 0);
-  const decoded = decodeShader(dwords, 'vertex');
-  const stats = collectStats(dwords, decoded);
+function dwordsOf(ucodeWords) {
+  return ucodeWords instanceof Uint32Array ? ucodeWords : Uint32Array.from(ucodeWords ?? [], (w) => w >>> 0);
+}
+
+function range(count) {
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(i);
+  return out;
+}
+
+/** Lane range of interpolator GPRs a pixel shader may read (r0..r15 ∩ static bound). */
+function pixelInterpolatorLanes(stats) {
+  return range(Math.min(16, stats.registerCount));
+}
+
+/**
+ * Emit one shader module (vertex or pixel) from an already-decoded program.
+ * @param {'vertex'|'pixel'} shaderType
+ * @param {Uint32Array} dwords
+ * @param {object} decoded from decodeShader
+ * @param {object} stats from collectStats
+ * @param {{bindings?: {float: number, bool: number}|null, linkedInterpolators?: number[]|null}} options
+ *   bindings — global (program-wide) binding indices to use instead of the
+ *   per-stage self-computation (needed so VS and PS agree on @binding);
+ *   linkedInterpolators — pixel only: the interpolator lanes (GPRs) wired to
+ *   vertex outputs; others read as zero (xenia zero-initializes registers).
+ */
+function assembleStage(shaderType, dwords, decoded, stats, options) {
+  const bindings = options?.bindings ?? null;
   const { registerCount, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition } = stats;
   const inputLocations = decoded.inputLocations;
   const interpolatorLocations = decoded.interpolatorLocations;
+  const linked = shaderType === 'pixel' ? (options?.linkedInterpolators ?? pixelInterpolatorLanes(stats)) : null;
 
   // Interface.
-  // WGSL forbids empty structs; an attribute-less vertex shader (legal Xenos) takes no @vertex input.
-  const vsInMembers = inputLocations.map((n) => `  @location(${n}) a${n}: vec4f,`);
-  const vsIn = vsInMembers.length > 0 ? ['struct VsIn {', ...vsInMembers, '};'].join('\n') : null;
-  const vsOutLines = ['struct VsOut {', '  @builtin(position) pos: vec4f,'];
-  for (const n of interpolatorLocations) vsOutLines.push(`  @location(${n}) v${n}: vec4f,`);
-  vsOutLines.push('};');
-  const vsOut = vsOutLines.join('\n');
+  let inStruct = null;
+  let outStruct = null;
+  if (shaderType === 'vertex') {
+    const vsInMembers = inputLocations.map((n) => `  @location(${n}) a${n}: vec4f,`);
+    inStruct = vsInMembers.length > 0 ? ['struct VsIn {', ...vsInMembers, '};'].join('\n') : null;
+    const vsOutLines = ['struct VsOut {', '  @builtin(position) pos: vec4f,'];
+    for (const n of interpolatorLocations) vsOutLines.push(`  @location(${n}) v${n}: vec4f,`);
+    vsOutLines.push('};');
+    outStruct = vsOutLines.join('\n');
+  } else {
+    const psInMembers = linked.map((n) => `  @location(${n}) i${n}: vec4f,`);
+    inStruct = psInMembers.length > 0 ? ['struct PsIn {', ...psInMembers, '};'].join('\n') : null;
+    outStruct = 'struct PsOut {\n  @location(0) color0: vec4f\n};';
+  }
 
   const em = makeEmitter();
-  em.emit('// Generated by wgsl_translate.js — Xenos vertex shader ucode → WGSL');
+  em.emit(shaderType === 'vertex'
+    ? '// Generated by wgsl_translate.js — Xenos vertex shader ucode → WGSL'
+    : '// Generated by wgsl_translate.js — Xenos pixel shader ucode → WGSL');
   em.emit('// Registers: rN = Xenos vector GPRs (zero-initialized); ps = previous scalar');
   em.emit('// result; p0 = the (single) hardware predicate register.');
   let floatBinding = -1;
-  if (usesFloatConstants) floatBinding = 0;
   let boolBinding = -1;
-  if (usesBoolConstants) boolBinding = floatBinding >= 0 ? 1 : 0;
-  if (usesFloatConstants) em.emit(`@group(0) @binding(${floatBinding}) var<uniform> fc: array<vec4f, 256>;`);
-  if (usesBoolConstants) {
+  if (bindings) {
+    floatBinding = bindings.float;
+    boolBinding = bindings.bool;
+  } else {
+    if (usesFloatConstants) floatBinding = 0;
+    boolBinding = usesBoolConstants ? (floatBinding >= 0 ? 1 : 0) : -1;
+  }
+  if (usesFloatConstants && floatBinding >= 0) em.emit(`@group(0) @binding(${floatBinding}) var<uniform> fc: array<vec4f, 256>;`);
+  if (usesBoolConstants && boolBinding >= 0) {
     em.emit(`@group(0) @binding(${boolBinding}) var<uniform> bools: array<u32, 8>;`);
     em.emit('fn bc(n: u32) -> bool { return ((bools[n >> 5u] >> (n & 31u)) & 1u) != 0u; }');
   }
-  if (vsIn) em.emit(vsIn);
-  em.emit(vsOut);
-  em.emit('@vertex');
-  em.emit(vsIn ? 'fn vs_main(in: VsIn) -> VsOut {' : 'fn vs_main() -> VsOut {');
+  if (inStruct) em.emit(inStruct);
+  em.emit(outStruct);
+  if (shaderType === 'vertex') {
+    em.emit('@vertex');
+    em.emit(inStruct ? 'fn vs_main(in: VsIn) -> VsOut {' : 'fn vs_main() -> VsOut {');
+  } else {
+    em.emit('@fragment');
+    em.emit(inStruct ? 'fn fs_main(in: PsIn) -> PsOut {' : 'fn fs_main() -> PsOut {');
+  }
   em.indentIn();
   if (registerCount > 0) {
     em.emit(`var r: array<vec4f, ${registerCount}>;`);
@@ -836,23 +990,29 @@ function translateVertexShader(ucodeWords) {
   }
   if (psUsed) em.emit('var ps: f32 = 0.0;');
   if (predicateUsed) em.emit('var p0: bool = false;');
-  for (const n of inputLocations) em.emit(`r[${n}] = in.a${n};`);
-  em.emit('var out: VsOut;');
-  em.emit('out.pos = vec4f(0.0);');
-  for (const n of interpolatorLocations) em.emit(`out.v${n} = vec4f(0.0);`);
+  if (shaderType === 'vertex') {
+    for (const n of inputLocations) em.emit(`r[${n}] = in.a${n};`);
+    em.emit('var out: VsOut;');
+    em.emit('out.pos = vec4f(0.0);');
+    for (const n of interpolatorLocations) em.emit(`out.v${n} = vec4f(0.0);`);
+  } else {
+    for (const n of linked) em.emit(`r[${n}] = in.i${n};`);
+    em.emit('var out: PsOut;');
+    em.emit('out.color0 = vec4f(0.0);');
+  }
   for (const block of decoded.blocks) {
-    emitBlock(em, block);
+    emitBlock(em, block, shaderType);
   }
   em.emit('return out;');
   em.indentOut();
   em.emit('}');
 
   return {
-    type: 'vertex',
+    type: shaderType,
     wgsl: em.toString(),
-    inputLocations,
+    inputLocations: shaderType === 'vertex' ? inputLocations : linked,
     interpolatorLocations,
-    writesPosition,
+    writesPosition: shaderType === 'vertex' ? writesPosition : false,
     tempRegisterCount: registerCount,
     usesFloatConstants,
     usesBoolConstants,
@@ -860,9 +1020,71 @@ function translateVertexShader(ucodeWords) {
   };
 }
 
+function translateVertexShader(ucodeWords) {
+  const dwords = dwordsOf(ucodeWords);
+  const decoded = decodeShader(dwords, 'vertex');
+  const stats = collectStats(dwords, decoded, 'vertex');
+  return assembleStage('vertex', dwords, decoded, stats, {});
+}
+
+/**
+ * Translate a pixel shader. Standalone by default: declares exactly the
+ * interpolator lanes the ucode statically references (r0..r15 ∩ bound), at
+ * @location(<lane>). Pass { bindings, linkedInterpolators } to make it agree
+ * with a vertex shader — see translateShaderProgram().
+ */
+function translatePixelShader(ucodeWords, options) {
+  const dwords = dwordsOf(ucodeWords);
+  const decoded = decodeShader(dwords, 'pixel');
+  const stats = collectStats(dwords, decoded, 'pixel');
+  const bindings = options?.bindings ?? null;
+  const psLanes = pixelInterpolatorLanes(stats);
+  const linked = options?.linkedInterpolators ?? psLanes;
+  return assembleStage('pixel', dwords, decoded, stats, { bindings, linkedInterpolators: linked });
+}
+
+/**
+ * Translate a vertex shader and (optionally) the pixel shader it feeds as one
+ * consistent program. The pair shares one set of constant bindings (`fc` @0,
+ * `bools` @(usesFloat ? 1 : 0) — only the stages that read constants declare
+ * them), and the fragment stage declares exactly the interpolator locations
+ * the vertex stage exports that the pixel shader can statically read — WGSL/
+ * WebGPU forbid a fragment input without a matching vertex output, so lanes
+ * the VS does not export read as zeros here (xenia zero-initializes registers
+ * the same way).
+ */
+function translateShaderProgram(vsUcodeWords, psUcodeWords) {
+  const vd = dwordsOf(vsUcodeWords);
+  const decodedV = decodeShader(vd, 'vertex');
+  const statsV = collectStats(vd, decodedV, 'vertex');
+  const pd = psUcodeWords ? dwordsOf(psUcodeWords) : null;
+  const decodedP = pd ? decodeShader(pd, 'pixel') : null;
+  const statsP = pd ? collectStats(pd, decodedP, 'pixel') : null;
+  const mergedFloat = statsV.usesFloatConstants || (statsP?.usesFloatConstants ?? false);
+  const mergedBool = statsV.usesBoolConstants || (statsP?.usesBoolConstants ?? false);
+  const bindings = { float: mergedFloat ? 0 : -1, bool: mergedBool ? (mergedFloat ? 1 : 0) : -1 };
+  const vertex = assembleStage('vertex', vd, decodedV, statsV, { bindings });
+  let fragment = null;
+  if (pd) {
+    const vsExports = new Set(decodedV.interpolatorLocations);
+    const linked = pixelInterpolatorLanes(statsP).filter((i) => vsExports.has(i));
+    fragment = assembleStage('pixel', pd, decodedP, statsP, { bindings, linkedInterpolators: linked });
+  }
+  return {
+    type: 'program',
+    vertex,
+    fragment,
+    usesFloatConstants: mergedFloat,
+    usesBoolConstants: mergedBool,
+    interpolatorLocations: vertex.interpolatorLocations,
+  };
+}
+
 const api = {
   XenosTranslateError,
   translateVertexShader,
+  translatePixelShader,
+  translateShaderProgram,
 };
 if (typeof module !== 'undefined' && module.exports) module.exports = api;
 global.XenonGpuTranslate = api;

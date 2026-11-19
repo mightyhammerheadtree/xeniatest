@@ -203,11 +203,13 @@
       this.depthTexture = null;
       this.depthFormat = 'depth24plus';
       this.pipelineCache = new Map(); // key -> GPURenderPipeline
-      // Translated-VS path: WeakMap<ucode object, translation result> and a
-      // per-shader Map<layoutKey, { pipeline, bindGroup }>. Pipelines/bind groups
-      // are created once per (shader, layout, topology) — never per draw.
-      this.translateMemo = new WeakMap();
+      // Translated-program path: WeakMap<vs ucode object, Map<pairKey, program pair>>
+      // and a per-VS-shader Map<layoutKey, { pipeline, bindGroup }>. Pipelines/bind groups
+      // are created once per (shader pair, layout, topology) — never per draw.
+      this.programMemo = new WeakMap();
       this.translatedPipelines = new WeakMap();
+      this.psCodeIds = new WeakMap();
+      this.psCodeIdCounter = 0;
       this.aluConstantBuffer = null;     // GPUBuffer, persistent — contents re-uploaded only on change
       this.boolConstantBuffer = null;    // GPUBuffer, persistent likewise
       this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
@@ -287,7 +289,7 @@
 
     interrupt(mask) { this.log('info', `interrupt request mask=0x${(mask >>> 0).toString(16)}`); }
 
-    invalidateState(mask) { this.log('debug', `invalidateState mask=0x${(mask >>> 0).toString(16)}`); this.pipelineCache.clear(); this.translateMemo = new WeakMap(); this.translatedPipelines = new WeakMap(); }
+    invalidateState(mask) { this.log('debug', `invalidateState mask=0x${(mask >>> 0).toString(16)}`); this.pipelineCache.clear(); this.programMemo = new WeakMap(); this.translatedPipelines = new WeakMap(); }
 
     setShaderBases(vsBase, psBase) { this.log('debug', `setShaderBases vs=0x${vsBase.toString(16)} ps=0x${psBase.toString(16)}`); }
 
@@ -298,7 +300,7 @@
       if (pixel) this.shaders.pixel = pixel;
       this.pipelineCache.clear(); // microcode changed — pipelines are keyed on shader content, so drop everything
       this.planMemo = new WeakMap();
-      this.translateMemo = new WeakMap();
+      this.programMemo = new WeakMap();
       this.translatedPipelines = new WeakMap();
     }
 
@@ -430,21 +432,42 @@
       return buffers;
     }
 
-    /** Translate the loaded vertex shader ucode to WGSL (memoized per ucode object). Loud on any unsupported construct. */
-    _translateVertexShader(code) {
-      let translated = this.translateMemo.get(code);
-      if (translated) return translated;
+    /** Stable identity key for a pixel shader ucode object (pipelines differ per PS). */
+    _psId(code) {
+      let id = this.psCodeIds.get(code);
+      if (!id) {
+        id = ++this.psCodeIdCounter;
+        this.psCodeIds.set(code, id);
+      }
+      return id;
+    }
+
+    /**
+     * Translate the loaded vertex shader and (optionally) its pixel shader as one
+     * consistent program — memoized per (vs, ps) ucode object pair. The fragment
+     * stage is null when no pixel shader is loaded (the caller binds the
+     * bring-up FS then). Loud on any unsupported construct.
+     */
+    _translateProgram(vsCode, psCode) {
+      const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
+      let perVs = this.programMemo.get(vsCode);
+      if (!perVs) {
+        perVs = new Map();
+        this.programMemo.set(vsCode, perVs);
+      }
+      let pair = perVs.get(pairKey);
+      if (pair) return pair;
       const TX = globalThis.XenonGpuTranslate;
       if (!TX) throw new XenosWebGpuError('XenonGpuTranslate is not loaded — public/js/gpu/wgsl_translate.js must be loaded before the backend builds a draw pipeline');
       try {
-        translated = TX.translateVertexShader(code);
+        pair = TX.translateShaderProgram(vsCode, psCode);
       } catch (e) {
         const name = e && e.constructor && e.constructor.name ? e.constructor.name : 'Error';
         const detail = e && e.message ? e.message : String(e);
-        throw new XenosWebGpuError(`draw: the vertex shader failed to translate to WGSL (${name}): ${detail}`);
+        throw new XenosWebGpuError(`draw: the guest shaders failed to translate to WGSL (${name}): ${detail}`);
       }
-      this.translateMemo.set(code, translated);
-      return translated;
+      perVs.set(pairKey, pair);
+      return pair;
     }
 
     /**
@@ -452,10 +475,10 @@
      * buffers. Content-hashed: the ~1032-word hash costs microseconds and the
      * 4 KB writeBuffer only happens on draws whose constants actually changed.
      */
-    _uploadShaderConstants(params, translated) {
+    _uploadShaderConstants(params, program) {
       if (typeof GPUBufferUsage === 'undefined') throw new XenosWebGpuError('_uploadShaderConstants: GPUBufferUsage is not defined in this environment');
       const alu = params.aluConstants, bools = params.boolConstants;
-      if (translated.usesFloatConstants) {
+      if (program.usesFloatConstants) {
         if (!alu) throw new XenosWebGpuError('draw: the translated vertex shader reads fc[] (ALU constants) but the packet carried no ALU constants — refusing to bind fabricated constants');
         const hash = fnv1a32Words(alu);
         if (hash !== this.aluHash || !this.aluConstantBuffer) {
@@ -470,7 +493,7 @@
           this.uploads.constantUploads++;
         }
       }
-      if (translated.usesBoolConstants) {
+      if (program.usesBoolConstants) {
         if (!bools) throw new XenosWebGpuError('draw: the translated vertex shader reads bool constants (bc(n)) but the packet carried none — refusing to bind fabricated bools');
         const hash = fnv1a32Words(bools);
         if (hash !== this.boolHash || !this.boolConstantBuffer) {
@@ -488,41 +511,51 @@
     }
 
     /**
-     * Fetch or build the { pipeline, bindGroup } for the translated vertex
-     * shader at a given vertex-buffer layout + topology. One pipeline per
-     * (ucode object, layoutKey) — created once, reused for every draw. The
-     * bind group is likewise created once per pipeline; the constant buffers
-     * it binds are persistent and are re-uploaded only when the guest changes
-     * the constants (see _uploadShaderConstants).
+     * Fetch or build the { pipeline, bindGroup } for the translated shader program
+     * at a given vertex-buffer layout + topology. One pipeline per
+     * (vs ucode, ps ucode, layoutKey) — created once, reused for every draw. The
+     * bind group is likewise created once per pipeline; the constant buffers it
+     * binds are persistent and are re-uploaded only when the guest changes the
+     * constants (see _uploadShaderConstants).
+     *
+     * When no pixel shader is loaded the fragment stage is the fixed bring-up
+     * FS (amber; clearly labelled, never the guest's shader). When one is
+     * loaded, the translated guest pixel shader runs.
      */
-    _getTranslatedVsResources(code, translated, plan, topology) {
-      let perShader = this.translatedPipelines.get(code);
+    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program) {
+      let perShader = this.translatedPipelines.get(vsCode);
       if (!perShader) {
         perShader = new Map();
-        this.translatedPipelines.set(code, perShader);
+        this.translatedPipelines.set(vsCode, perShader);
       }
-      const layoutKey = `${topology}:${this.format}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
+      const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
+      const layoutKey = `${pairKey}|${topology}:${this.format}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
       if (entry) return entry;
 
-      const module = this.device.createShaderModule({ code: `${translated.wgsl}\n${FLAT_FRAGMENT_WGSL}`, label: 'xenos-translated-vs' });
+      if (!program) program = this._translateProgram(vsCode, psCode);
+      const vsModule = this.device.createShaderModule({ code: program.vertex.wgsl, label: 'xenos-translated-vs' });
+      const fsModule = this.device.createShaderModule({
+        code: program.fragment ? program.fragment.wgsl : FLAT_FRAGMENT_WGSL,
+        label: program.fragment ? 'xenos-translated-ps' : 'xenos-bringup-fs',
+      });
       const vertexBuffers = (plan?.descriptors ?? []).map((d) => ({
         arrayStride: d.arrayStride,
         stepMode: d.stepMode ?? 'vertex',
         attributes: d.attributes.map((a) => ({ shaderLocation: a.shaderLocation, offset: a.offset, format: a.format })),
       }));
       const pipeline = this.device.createRenderPipeline({
-        label: 'xenos-translated-vs',
+        label: program.fragment ? 'xenos-translated-vs-ps' : 'xenos-translated-vs',
         layout: 'auto',
-        vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+        vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
+        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [{ format: this.format }] },
         primitive: { topology },
       });
       let bindGroup = null;
-      if (translated.usesFloatConstants || translated.usesBoolConstants) {
+      if (program.usesFloatConstants || program.usesBoolConstants) {
         const entries = [];
-        if (translated.usesFloatConstants) entries.push({ binding: 0, resource: { buffer: this.aluConstantBuffer } });
-        if (translated.usesBoolConstants) entries.push({ binding: translated.usesFloatConstants ? 1 : 0, resource: { buffer: this.boolConstantBuffer } });
+        if (program.usesFloatConstants) entries.push({ binding: 0, resource: { buffer: this.aluConstantBuffer } });
+        if (program.usesBoolConstants) entries.push({ binding: program.usesFloatConstants ? 1 : 0, resource: { buffer: this.boolConstantBuffer } });
         bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
       }
       entry = { pipeline, bindGroup };
@@ -606,29 +639,24 @@
       if (!this.canvas) throw new XenosWebGpuError('draw requires a canvas (headless rendering into textures is not wired yet)');
       this.uploads.frames++;
       if (!this.placeholderShader) {
-        // --- the real path: translated guest vertex shader, fixed flat FS -------------------------
-        // The vertex stage executes the guest's microcode (translated to WGSL). The fragment
-        // stage is a trivially constant bring-up FS — guest pixel shaders do not translate yet
-        // (step 6), and a draw with a pixel shader loaded refuses to run rather than render
-        // with a guessed fragment stage.
+        // --- the real path: translated guest shaders ------------------------------------------------
+        // Both stages execute the guest's microcode (translated to WGSL). When no pixel shader is
+        // loaded the fragment stage is a fixed bring-up FS (amber, labelled, never guest state).
         const code = this.shaders.vertex?.code ?? null;
         if (!code) {
           throw new XenosWebGpuError(
             `draw(prim=${params.primTypeName ?? params.primType}, indices=${params.numIndices}): no vertex shader is loaded (IM_LOAD/IM_LOAD_IMMEDIATE with shader type 0 first) — ` +
             'refusing to fabricate geometry. Pass { placeholderShader: true } to attach() to render the bring-up triangle instead.');
         }
-        if (this.shaders.pixel) {
-          throw new XenosWebGpuError(
-            'draw: a pixel shader is loaded but pixel-shader translation does not exist yet (docs/XENOS_GPU.md, step 6) — ' +
-            'refusing to render with a guessed fragment stage. Unset the pixel shader (or load one only when step 6 lands).');
-        }
+        // A pixel shader, when loaded, IS translated and run — no guessed fragment stage anywhere.
+        const psCode = this.shaders.pixel?.code ?? null;
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
-        const translated = this._translateVertexShader(code);
+        const program = this._translateProgram(code, psCode);
 
         // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
-        if (!params.vertexFetchConstants && translated.inputLocations.length > 0) {
+        if (!params.vertexFetchConstants && program.vertex.inputLocations.length > 0) {
           throw new XenosWebGpuError(
-            `draw: the translated vertex shader reads attributes at locations [${translated.inputLocations}] but the packet carried no fetch constants — ` +
+            `draw: the translated vertex shader reads attributes at locations [${program.vertex.inputLocations}] but the packet carried no fetch constants — ` +
             'the command processor normally attaches them; refusing to bind fabricated attributes');
         }
         const plan = params.vertexFetchConstants
@@ -637,7 +665,7 @@
         // The translated VS declares vec4f inputs; pure uint/sint attribute formats cannot feed a
         // vec4<f32> location (WebGPU interface matching) — trap loudly instead of erroring inside wgpu.
         if (plan) {
-          const wanted = new Set(translated.inputLocations);
+          const wanted = new Set(program.vertex.inputLocations);
           for (const d of plan.descriptors) {
             for (const a of d.attributes) {
               if (wanted.has(a.shaderLocation) && isIntegerGpuVertexFormat(a.format)) {
@@ -650,8 +678,8 @@
           }
         }
         const buffers = plan ? this.uploadVertexBuffers(plan) : [];
-        this._uploadShaderConstants(params, translated);
-        const { pipeline, bindGroup } = this._getTranslatedVsResources(code, translated, plan, topology);
+        this._uploadShaderConstants(params, program);
+        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program);
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
         const pass = encoder.beginRenderPass({
@@ -739,6 +767,8 @@
       if (this.device) { this.device.destroy(); this.device = null; }
       this.context = null;
       this.pipelineCache.clear();
+      this.programMemo = new WeakMap();
+      this.translatedPipelines = new WeakMap();
       this.placeholderPipeline = null;
     }
   }
