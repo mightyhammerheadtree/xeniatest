@@ -32,15 +32,18 @@
  *     already applied the BE→host swap when parsing PM4 packets).
  *
  * Honest-support policy (docs/XENOS_GPU.md step 6):
- *   - Only k_8_8_8_8 is representable on the scanout target today, so any
- *     other color format the pixel shader could actually be writing to traps
- *     loudly. Gamma-encoded targets (k_8_8_8_8_GAMMA) additionally need the
- *     PWL gamma encode, which lives with the EDRAM render-target cache
- *     (step 7) — trapping beats rendering 2.2x-dark output.
+ *   - k_8_8_8_8 and k_8_8_8_8_GAMMA are representable on the scanout target;
+ *     other color formats the pixel shader could actually be writing to trap
+ *     loudly (they need the EDRAM render-target cache, step 7). k_8_8_8_8_GAMMA
+ *     is honored by gamma-encoding oC0's RGB in the translated PS (xenia's RTV
+ *     path); blending then happens on gamma-encoded values (same caveat as xenia).
  *   - kD24S8 depth maps to WebGPU depth24plus-stencil8. kD24FS8 (20e4 float
  *     depth) is not representable and traps.
- *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST) has no WGSL representation yet
- *     and traps loudly rather than silently passing rejected pixels.
+ *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST): xenia implements it in the
+ *     pixel shader (OpDiscard), so it is honored exactly when the translated
+ *     guest PS statically exports oC0 — discard against RB_ALPHA_REF (IEEE-754
+ *     uniform). kAlways disables it (xenia skips it). The fixed bring-up FS
+ *     never applies it (never the guest's shader).
  *   - WebGPU exposes one stencil reference per render pass; the back-face
  *     reference (RB_STENCILREFMASK_BF) cannot differ from the front-face one
  *     when back-face stencil is in effect.
@@ -233,20 +236,21 @@
     }
 
     // --- RB_COLOR_INFO RT0: format must be representable when written ------
+    // k_8_8_8_8 (0) is the canvas format; k_8_8_8_8_GAMMA (1) is honored by
+    // gamma-encoding in the translated PS (xenia's RTV path; blending then
+    // happens on gamma-encoded values — same caveat as xenia). Everything else
+    // needs the EDRAM render-target cache (step 7) and traps.
     const colorInfo0 = decodeColorInfo(raw.colorInfo0);
     if (psExportsColor0) {
-      if (colorInfo0.format === 1) {
+      if (colorInfo0.format !== 0 && colorInfo0.format !== 1) {
         throw new XenosRenderStateError(
-          'render target 0 has format k_8_8_8_8_GAMMA — gamma-encoded output needs the PWL gamma conversion ' +
-          '(xenia converts in the pixel shader; it lives with the EDRAM render-target cache work, step 7). ' +
-          'Refusing to render linear values into a gamma-encoded target');
-      }
-      if (colorInfo0.format !== 0) {
-        throw new XenosRenderStateError(
-          `render target 0 has format ${colorInfo0.formatName} — the only format representable on the ` +
-          'scanout target today is k_8_8_8_8 (8-bit unorm); other formats need the EDRAM render-target cache (step 7). Refusing to draw');
+          `render target 0 has format ${colorInfo0.formatName} — the only formats representable on the ` +
+          'scanout target today are k_8_8_8_8 and k_8_8_8_8_GAMMA; other formats need the EDRAM render-target cache (step 7). Refusing to draw');
       }
     }
+    // The gamma encode is a no-op unless the PS statically exports oC0 (the
+    // translator enforces that itself); the flag records the RT's format.
+    const convertColor0ToGamma = colorInfo0.format === 1;
 
     // --- RB_DEPTH_INFO: D24S8 maps to depth24plus-stencil8; D24FS8 traps ----
     const depthInfo = decodeDepthInfo(raw.depthInfo);
@@ -328,6 +332,7 @@
       depthStencil,
       stencilRef: ref,
       alphaTest,
+      convertColor0ToGamma,
       colorFormatName: colorInfo0.formatName,
       depthFormatName: depthInfo.formatName,
     };

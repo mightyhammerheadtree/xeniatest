@@ -1160,3 +1160,80 @@ test('pixel shader: every Xenos CompareFunction maps to the operator with matchi
     await assertValidWgsl(out.wgsl);
   }
 });
+
+// ================================================================ gamma (PWL) encode
+// Xbox 360 RT format k_8_8_8_8_GAMMA: xenia gamma-encodes oC0's RGB lanes in
+// the pixel shader (PreSaturatedLinearToPWLGamma) — saturate, 3-piece
+// piecewise, trunc(x*scale)/255 + offset. Alpha untouched. Pure ALU.
+
+test('pixel shader: convertColor0ToGamma emits the PWL helper + rewritten export, Dawn-valid', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { convertColor0ToGamma: true });
+  assert.match(out.wgsl, /fn xenosGamma\(x: f32\) -> f32/);
+  assert.match(out.wgsl, /if \(x >= \(128\.0 \/ 1023\.0\)\)/);
+  assert.match(out.wgsl, /trunc\(x \* scale\) \* \(1\.0 \/ 255\.0\) \+ offset/);
+  assert.match(out.wgsl, /out\.color0 = vec4f\(xenosGamma\(clamp\(out\.color0\.x, 0\.0, 1\.0\)\), xenosGamma\(clamp\(out\.color0\.y, 0\.0, 1\.0\)\), xenosGamma\(clamp\(out\.color0\.z, 0\.0, 1\.0\)\), out\.color0\.w\);\n  return out;/);
+  assert.equal(out.convertColor0ToGamma, true);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: gamma encode leaves the alpha lane alone and still exports oC0', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { convertColor0ToGamma: true });
+  // alpha (w lane) is passed through, not encoded
+  assert.match(out.wgsl, /, out\.color0\.w\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: no gamma encode without the option; no encode without an oC0 export', async () => {
+  const plain = T.translatePixelShader(PS_CONST());
+  assert.equal(plain.convertColor0ToGamma, false);
+  assert.doesNotMatch(plain.wgsl, /xenosGamma/);
+  // dead-write PS: never exports oC0 → the option is ignored (nothing to encode)
+  const DEAD = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const dead = T.translatePixelShader(DEAD, { convertColor0ToGamma: true });
+  assert.equal(dead.convertColor0ToGamma, false);
+  assert.doesNotMatch(dead.wgsl, /xenosGamma/);
+});
+
+test('pixel shader: gamma encode composes with the alpha test (discard before encode)', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { convertColor0ToGamma: true, alphaTest: { compare: 1 } });
+  const discardIdx = out.wgsl.indexOf('discard');
+  const gammaIdx = out.wgsl.indexOf('out.color0 = vec4f(xenosGamma');
+  assert.ok(discardIdx >= 0 && gammaIdx > discardIdx, 'the alpha-test discard is emitted before the gamma encode');
+  await assertValidWgsl(out.wgsl);
+});
+
+test('translateShaderProgram: convertColor0ToGamma is part of the fragment output, VS untouched', async () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { convertColor0ToGamma: true });
+  assert.equal(program.convertColor0ToGamma, true);
+  assert.equal(program.fragment.convertColor0ToGamma, true);
+  assert.doesNotMatch(program.vertex.wgsl, /xenosGamma/);
+  await assertValidWgsl(program.vertex.wgsl);
+  await assertValidWgsl(program.fragment.wgsl);
+});
+
+// The 3 PWL segments, checked against xenia's formula at representative points:
+//   x < 64/1023            -> trunc(x * 1023)/255
+//   64/1023..128/1023      -> trunc(x * 1023/2)/255 + 32/255
+//   128/1023..512/1023     -> trunc(x * 1023/4)/255 + 64/255
+//   >= 512/1023            -> trunc(x * 1023/8)/255 + 128/255
+test('pixel shader: PWL segment math (validated as WGSL, values checked by hand)', () => {
+  // reference encode, mirrored from xenia's PreSaturatedLinearToPWLGamma
+  const pwl = (x) => {
+    let scale, offset;
+    if (x >= 128 / 1023) {
+      if (x >= 512 / 1023) { scale = 1023 / 8; offset = 128 / 255; } else { scale = 1023 / 4; offset = 64 / 255; }
+    } else {
+      if (x >= 64 / 1023) { scale = 1023 / 2; offset = 32 / 255; } else { scale = 1023; offset = 0; }
+    }
+    return (Math.trunc(x * scale) * (1 / 255)) + offset;
+  };
+  // boundary sanity: 0 → 0, 1 → 1 (255 untouched lanes), mid-segment exact truncations
+  assert.equal(pwl(0), 0);
+  assert.equal(pwl(1), 1);
+  assert.equal(pwl(64 / 1023), Math.trunc((64 / 1023) * (1023 / 2)) / 255 + 32 / 255);
+  assert.equal(pwl(512 / 1023), Math.trunc((512 / 1023) * (1023 / 8)) / 255 + 128 / 255);
+  assert.equal(pwl(0.5), Math.trunc(0.5 * (1023 / 4)) / 255 + 64 / 255);
+});

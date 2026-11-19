@@ -56,8 +56,17 @@ test('every other color format traps with its xenia name when the PS writes oC0'
   }
 });
 
-test('k_8_8_8_8_GAMMA traps naming the PWL gamma conversion (not silently rendered linear)', () => {
-  assert.throws(() => rtState({ colorInfo0: 1 << 16 }), /8_8_8_8_GAMMA/);
+test('k_8_8_8_8_GAMMA decodes (the PWL gamma encode happens in the translated PS, not here)', () => {
+  const state = rtState({ colorInfo0: 1 << 16 });
+  assert.equal(state.convertColor0ToGamma, true);
+  assert.equal(state.colorFormatName, 'k_8_8_8_8_GAMMA');
+  // and with the PS not exporting oC0 — the attachment is never written; the flag still records the format
+  const state2 = RS.buildRenderTargetState(rt({ colorInfo0: 1 << 16 }), { psExportsColor0: false, psExportsDepth: false });
+  assert.equal(state2.convertColor0ToGamma, true);
+});
+
+test('k_8_8_8_8 (0) does not gamma-encode', () => {
+  assert.equal(rtState({ colorInfo0: 0 }).convertColor0ToGamma, false);
 });
 
 test('format traps are skipped when the pixel shader does not export oC0 (no MSAA garbage-writes)', () => {

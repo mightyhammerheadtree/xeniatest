@@ -448,9 +448,10 @@
      * stage is null when no pixel shader is loaded (the caller binds the
      * bring-up FS then). Loud on any unsupported construct.
      */
-    _translateProgram(vsCode, psCode, alphaTest) {
+    _translateProgram(vsCode, psCode, alphaTest, convertColor0ToGamma = false) {
       const atKey = alphaTest ? `at${alphaTest.compare}` : 'at-';
-      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + '|' + atKey;
+      const gKey = convertColor0ToGamma ? 'g1' : 'g0';
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + '|' + atKey + '|' + gKey;
       let perVs = this.programMemo.get(vsCode);
       if (!perVs) {
         perVs = new Map();
@@ -461,7 +462,7 @@
       const TX = globalThis.XenonGpuTranslate;
       if (!TX) throw new XenosWebGpuError('XenonGpuTranslate is not loaded — public/js/gpu/wgsl_translate.js must be loaded before the backend builds a draw pipeline');
       try {
-        pair = TX.translateShaderProgram(vsCode, psCode, { alphaTest: alphaTest ?? undefined });
+        pair = TX.translateShaderProgram(vsCode, psCode, { alphaTest: alphaTest ?? undefined, convertColor0ToGamma });
       } catch (e) {
         const name = e && e.constructor && e.constructor.name ? e.constructor.name : 'Error';
         const detail = e && e.message ? e.message : String(e);
@@ -779,7 +780,12 @@
         const psCode = this.shaders.pixel?.code ?? null;
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
         const alphaTest = globalThis.XenonGpuRenderState?.decodeAlphaTest(params.renderTargets?.colorControl ?? 0) ?? null;
-        const program = this._translateProgram(code, psCode, alphaTest);
+        const convertColor0ToGamma = (() => {
+          const rs = globalThis.XenonGpuRenderState;
+          if (!rs || !params.renderTargets) return false;
+          try { return rs.decodeColorInfo(params.renderTargets.colorInfo0 ?? 0).format === 1; } catch { return false; }
+        })();
+        const program = this._translateProgram(code, psCode, alphaTest, convertColor0ToGamma);
 
         // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
         if (!params.vertexFetchConstants && program.vertex.inputLocations.length > 0) {

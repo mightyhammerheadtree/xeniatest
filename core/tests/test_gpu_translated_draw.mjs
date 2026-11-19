@@ -628,14 +628,24 @@ test('alpha test: kAlways draws normally (decode treats the test as disabled, xe
   assert.equal(backend.alphaTestBuffer, undefined, 'no alpha-test uniform allocated');
 });
 
-test('traps: GAMMA color format is refused (needs the PWL gamma pass, step 7)', () => {
+test('GAMMA RT0: the translated PS is gamma-encoded (xenia PWL); the draw runs, no trap', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
-  const { backend } = makeBackend(guest);
+  const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
-  assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })),
-    /8_8_8_8_GAMMA/);
+  const PS_BLACK = psWithExportsColor0();
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })); // k_8_8_8_8_GAMMA
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.match(fsModule.code, /fn xenosGamma/);
+  assert.match(fsModule.code, /out\.color0 = vec4f\(xenosGamma/);
+  assert.equal(log.pipelines.length, 1, 'pipeline created for the GAMMA PS');
+
+  // same ucode with an unorm RT0: no gamma code — distinct pipelines
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  assert.equal(log.pipelines.length, 2, 'gamma conversion is part of the translation/pipeline key');
+  const fsModule2 = log.modules[log.modules.length - 1];
+  assert.doesNotMatch(fsModule2.code, /fn xenosGamma/);
 });
 
 test('traps: float color format is refused naming the format', () => {
