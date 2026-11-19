@@ -14,6 +14,7 @@ import '../../public/js/gpu/render_state.js';
 const RS = globalThis.XenonGpuRenderState;
 
 const ZERO_RT = {
+  surfaceInfo: 0,
   colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
   depthInfo: 0,
   colorMask: 0x0000FFFF,
@@ -333,4 +334,24 @@ test('a missing snapshot traps with a named reason (no fabricated raster state)'
   assert.throws(() => RS.buildScissorState(undefined, { width: 64, height: 64 }), /params\.scissor/);
   assert.throws(() => RS.buildScissorState(null, { width: 64, height: 64 }), /params\.scissor/);
   assert.throws(() => RS.buildScissorState({}, { width: 0, height: 64 }), /no extent/);
+});
+
+// ------------------------------------------------------------ MSAA (RB_SURFACE_INFO)
+test('RB_SURFACE_INFO msaa_samples 2x/4x trap loudly naming MSAA (canvas/depth are single-sampled)', () => {
+  for (const [samples, label] of [[1, '2x'], [2, '4x']]) {
+    assert.throws(() => rtState({ surfaceInfo: samples << 16 }), new RegExp(label + ' MSAA'));
+  }
+  // 3 (k3X, "this value is not supported on hardware" but must still not pass) — also traps
+  assert.throws(() => rtState({ surfaceInfo: 3 << 16 }), /MSAA/);
+});
+
+test('RB_SURFACE_INFO k1X renders (default reset state) and exposes the surface pitch', () => {
+  const state = rtState({ surfaceInfo: (0 << 16) | 0x0123 });
+  assert.equal(state.surfacePitch, 0x0123);
+});
+
+test('render-target snapshot without RB_SURFACE_INFO refuses to draw (MSAA decision required)', () => {
+  const noSurface = { ...rt() };
+  delete noSurface.surfaceInfo;
+  assert.throws(() => RS.buildRenderTargetState(noSurface, { psExportsColor0: true }), /RB_SURFACE_INFO/);
 });

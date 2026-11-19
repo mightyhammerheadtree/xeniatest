@@ -525,6 +525,7 @@
       // into the WebGPU pipeline/render-pass state (blend, write mask, depth/
       // stencil) and traps loudly on anything it cannot represent. xenia
       // register indices (see xenia gpu/registers.h).
+      const RB_SURFACE_INFO = 0x2000;
       const RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
       const RB_COLOR1_INFO = 0x2003, RB_COLOR2_INFO = 0x2004, RB_COLOR3_INFO = 0x2005;
       const RB_COLOR_MASK = 0x2104, RB_ALPHA_REF = 0x210e;
@@ -535,6 +536,7 @@
       const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082, PA_SC_WINDOW_OFFSET = 0x2080;
       const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
+        surfaceInfo: this.registers.read(RB_SURFACE_INFO) >>> 0,
         colorInfo0: this.registers.read(RB_COLOR_INFO) >>> 0,
         depthInfo: this.registers.read(RB_DEPTH_INFO) >>> 0,
         colorInfo1: this.registers.read(RB_COLOR1_INFO) >>> 0,

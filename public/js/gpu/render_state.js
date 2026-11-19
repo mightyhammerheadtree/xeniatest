@@ -9,6 +9,7 @@
  * reference (WebGPU has one reference per pass — see the BF trap below).
  *
  * Decode contracts come from xenia (BSD-3-Clause):
+ *   - RB_SURFACE_INFO: surface_pitch +0:14, msaa_samples +16:2, hiz_pitch +18:14.
  *   - RB_COLOR_INFO (+ RB_COLOR[1-3]_INFO): color_format nibble at +16
  *     (xenos::ColorRenderTargetFormat), color_exp_bias at +20, color_base
  *     tiles at +0/+11.
@@ -39,6 +40,8 @@
  *     path); blending then happens on gamma-encoded values (same caveat as xenia).
  *   - kD24S8 depth maps to WebGPU depth24plus-stencil8. kD24FS8 (20e4 float
  *     depth) is not representable and traps.
+ *   - RB_SURFACE_INFO.msaa_samples must be k1X — the canvas/depth attachments are
+ *     single-sampled; 2x/4x guest MSAA traps (needs the EDRAM render-target cache, step 7).
  *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST): xenia implements it in the
  *     pixel shader (OpDiscard), so it is honored exactly when the translated
  *     guest PS statically exports oC0 — discard against RB_ALPHA_REF (IEEE-754
@@ -205,8 +208,24 @@
         'RB_STENCILREFMASK[_BF]/RB_BLEND_* at draw time; refusing to draw with fabricated render state');
     }
     const { psExportsColor0 = true, psExportsDepth = false } = opts;
+    // --- RB_SURFACE_INFO: MSAA must be off (canvas/depth targets are single-sampled) ----
+    // msaa_samples at bits +16:2 (k1X=0, k2X=1, k4X=2) — xenia's RB_SURFACE_INFO.
+    // The scanout canvas and the depth24plus-stencil8 attachment are 1x; rendering
+    // guest-4x-MSAA state into them would silently drop sample shading/resolve, so trap.
+    const surfaceInfo = raw.surfaceInfo;
+    if (surfaceInfo === undefined) {
+      throw new XenosRenderStateError(
+        'render-target snapshot carries no RB_SURFACE_INFO (params.renderTargets.surfaceInfo) — ' +
+        'the command processor snapshots it at draw time; refusing to draw without the MSAA decision');
+    }
+    const msaaSamples = (surfaceInfo >>> 16) & 0x3;
+    if (msaaSamples !== 0) {
+      throw new XenosRenderStateError(
+        `guest render target is configured for ${msaaSamples === 1 ? '2x' : '4x'} MSAA (RB_SURFACE_INFO.msaa_samples=${msaaSamples}) — ` +
+        'the canvas and the depth24plus-stencil8 attachment are single-sampled; MSAA needs the EDRAM render-target cache (step 7). Refusing to draw');
+    }
     const cacheKey = [
-      raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, raw.colorMask >>> 0, raw.depthControl >>> 0,
+      raw.surfaceInfo === undefined ? -1 : (raw.surfaceInfo >>> 0), raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, raw.colorMask >>> 0, raw.depthControl >>> 0,
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
       raw.alphaRef === undefined ? -1 : (raw.alphaRef >>> 0),
@@ -332,6 +351,7 @@
       depthStencil,
       stencilRef: ref,
       alphaTest,
+      surfacePitch: surfaceInfo & 0x3FFF,
       convertColor0ToGamma,
       colorFormatName: colorInfo0.formatName,
       depthFormatName: depthInfo.formatName,

@@ -200,6 +200,7 @@ function aluConstantArray() {
 }
 /** A sane zeroed-register render-target snapshot: 8_8_8_8 RT0, all writes enabled, no blend/depth/stencil. */
 const defaultRenderTargets = (overrides = {}) => ({
+  surfaceInfo: 0,
   colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
   depthInfo: 0,
   colorMask: 0x0000FFFF, // all components of all four RTs
@@ -810,4 +811,14 @@ test('resize() forces a defined-target frame (resize of the canvas = new frame)'
   backend.draw(drawParams());
   assert.equal(log.passes[0].colorAttachments[0].loadOp, 'clear');
   assert.equal(log.passes[1].colorAttachments[0].loadOp, 'clear');
+});
+
+test('traps: a 4x-MSAA guest render target refuses to draw (single-sampled canvas)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
+    /4x MSAA/);
 });

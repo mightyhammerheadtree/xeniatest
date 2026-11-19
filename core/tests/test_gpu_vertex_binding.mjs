@@ -147,6 +147,7 @@ function makeBackend(guest, { withShader = true, placeholderShader = true } = {}
 
 /** A sane zeroed render-target snapshot: 8_8_8_8 RT0, all writes, no blend/depth/stencil (xenia: RB_BLENDCONTROL=1 <<16|1 disables blending). */
 const DEFAULT_RT = {
+  surfaceInfo: 0,
   colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
   depthInfo: 0,
   colorMask: 0x0000FFFF,

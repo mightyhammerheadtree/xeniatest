@@ -32,7 +32,8 @@ public/js/gpu/render_state.js      Xenos RB_* render-target decode + PA_SC_* sci
                                    RB_STENCILREFMASK[_BF], WINDOW scissor + WINDOW offset + SCREEN scissor
                                    combined and clamped to the surface, alpha-test decision from
                                    RB_COLORCONTROL (the discard itself lives in the translated PS). Traps
-                                   loudly on anything unrepresentable (named reason)
+                                   loudly on anything unrepresentable (named reason); RB_SURFACE_INFO
+                                   msaa_samples (2x/4x) traps — the canvas/depth targets are 1x
 public/js/gpu/ring_buffer.js       The CP ring buffer, host-side: VdInitializeRingBuffer / VdEnableRingBufferRPtrWriteBack
                                    semantics, the CP_RB_WPTR doorbell draining the ring through the command
                                    processor (wraparound, 0xBAADF00D sentinel, one-ring-overrun trap,
@@ -61,7 +62,7 @@ core/tests/test_render_state.mjs   34 render-target/scissor decode tests: xenia'
                                    traps (alpha test, GAMMA/float/unknown formats, kD24FS8, BF stencil ref),
                                    and PA_SC_* scissor semantics (offset apply/disable, screen clip, collapse,
                                    surface clamp), alpha-test decision decode (all CompareFunctions, kAlways →
-                                   disabled, missing reference traps), gamma (PWL) decode
+                                   disabled, missing reference traps), RB_SURFACE_INFO MSAA decode/trap/missing trap, gamma (PWL) decode
 core/tests/helpers/dawn_validate.mjs  Dawn (Tint) WGSL validation for tests — the only WGSL validator we trust
 tools/gen_gpu_registers.mjs        xenos register_table.inc → xenos_registers.js
 ```
@@ -108,7 +109,7 @@ tools/gen_gpu_registers.mjs        xenos register_table.inc → xenos_registers.
 4. ✅ Vertex fetch decode: `FETCH_*` constants, ucode walker, `GPUVertexFormat` mapping, `GPUVertexBufferLayout` descriptors (`vertex_fetch.js`, `core/tests/test_vertex_fetch.mjs`).
 4.5 ✅ GPU MMIO aperture in the recompiler: `[0x00F02000, 0x00F03000)` routed as `xenorecomp.gpu_mmio_store/gpu_mmio_load` (integer + FP load/store paths), forwarded by `makeImports` / export templates to `globalThis.XenonGpuHost.mmioStore/mmioLoad` (`gpu_host.js`); CP_RB_WPTR drains the ring synchronously (guest → recompiled store → aperture → doorbell → CP → memory, end-to-end tested), CP_RB_RPTR reads back the drained read pointer; every other register traps with its name. End-to-end test: a guest assembles a PM4 MEM_WRITE packet in ring memory, rings the doorbell via MMIO, and the bytes are in guest memory afterwards.
 5. ✅ Shader HIR + WGSL codegen for ALU-only vertex shaders — translator done (vfetch → position/interpolator exports; `wgsl_translate.js`, 103 Dawn-validated tests, plus VS+PS pairs link-checked with an actual null-backend pipeline) **and wired into `draw()`**: the default draw path translates and runs both stages (pipeline/bind group per shader pair+layout+topology, shared content-hashed constants). The guest pixel shader runs when loaded — linked interpolators, merged constant bindings, kills → `discard`.
-6. ◐ Pixel-shader render targets — **partially done.** Honor `RB_COLOR_MASK` RT0 writes, `RB_BLENDCONTROL0` blend (+ IEEE-754 blend constants), `RB_DEPTHCONTROL` depth/stencil on a `depth24plus-stencil8` attachment, the alpha test (discard in the translated PS against the `RB_ALPHA_REF` uniform), `k_8_8_8_8_GAMMA` RT0 (PWL encode in the translated PS), the `oDepth` export (`@builtin(frag_depth)`, clamped), and the `PA_SC_*` scissor rect (canvas-clamped `setScissorRect`). Pixel shaders not statically exporting oC0 get `writeMask: 0` (no fabricated color writes). Loudly traps: `oC1–3` MRT, color formats other than `k_8_8_8_8`/`k_8_8_8_8_GAMMA`, kD24FS8 depth, BF stencil-ref mismatch.
+6. ◐ Pixel-shader render targets — **partially done.** Honor `RB_COLOR_MASK` RT0 writes, `RB_BLENDCONTROL0` blend (+ IEEE-754 blend constants), `RB_DEPTHCONTROL` depth/stencil on a `depth24plus-stencil8` attachment, the alpha test (discard in the translated PS against the `RB_ALPHA_REF` uniform), `k_8_8_8_8_GAMMA` RT0 (PWL encode in the translated PS), the `oDepth` export (`@builtin(frag_depth)`, clamped), and the `PA_SC_*` scissor rect (canvas-clamped `setScissorRect`). Pixel shaders not statically exporting oC0 get `writeMask: 0` (no fabricated color writes). Loudly traps: `oC1–3` MRT, color formats other than `k_8_8_8_8`/`k_8_8_8_8_GAMMA`, kD24FS8 depth, BF stencil-ref mismatch, 2x/4x MSAA.
 7. ⬜ The EDRAM render-target cache: guest-memory color/depth targets, tiling-mode handling, `RB_COLOR_CLEAR`/clears, scissor, MSAA, gamma (PWL) encode, MRT, kD24FS8 depth — the real "render targets" step; the canvas-as-RT above is the bring-up subset.
 8. ⬜ Textures + samplers (`VTXFETCH`, `SET_SAMPLER`), addressing modes.
 9. ⬜ Queries (VIZ_QUERY), predication, EVENT_WRITE consumers (e.g. XMA fences).
