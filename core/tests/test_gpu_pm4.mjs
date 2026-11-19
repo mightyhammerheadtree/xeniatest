@@ -308,3 +308,24 @@ test('draw without a backend trap: clear error naming the missing method', () =>
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   assert.throws(() => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator])), (e) => /backend does not implement draw\(\)/.test(e.message));
 });
+
+test('draw packet snapshots ALU and bool constants from the register file', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // SET_CONSTANT ALU index 0: two dwords (1.0f, 2.0f bits) — packet has 3 payload dwords (index + 2)
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_CONSTANT, 3), 0, 0x3f800000, 0x40000000]));
+  // SET_CONSTANT BOOL index 4: value with bit for bool 4
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_CONSTANT, 2), (2 << 16) | 4, 1 << 4]));
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+  const draw = backend.calls.find((c) => c.kind === 'draw');
+  assert.ok(draw, 'draw packet reached the backend');
+  assert.equal(draw.aluConstants.length, 1024);
+  assert.equal(draw.aluConstants[0], 0x3f800000);
+  assert.equal(draw.aluConstants[1], 0x40000000);
+  assert.equal(draw.boolConstants.length, 8);
+  assert.equal(draw.boolConstants[4], 1 << 4);
+  // Fetch constants remain attached too (regression: same snapshot path)
+  assert.equal(draw.vertexFetchConstants.length, 192);
+});

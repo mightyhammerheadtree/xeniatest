@@ -115,6 +115,25 @@ test('mini fetch with no preceding full fetch traps instead of fabricating a str
   assert.throws(() => VF.analyzeVertexShader(ucode), /mini/i);
 });
 
+test('trailing instruction words that alias an exec CF do not corrupt the CF bound', () => {
+  // The vfetch's w1 low nibble is 0x3 = kCondExec: read as a CF pair the
+  // instruction looks like an EXEC-family CF with address 0. Pass 1 must shrink
+  // the CF bound live (like xenia / the WGSL translator) and never treat
+  // instruction words as control flow — this exact aliasing silently dropped
+  // the fetch before the fix.
+  const aliased = vfetchWords({ dstReg: 1, constIndex: 0, constIndexSel: 1, format: 6 /* k_8_8_8_8 */, stride: 1, isSigned: 1, numFormatAll: 1 });
+  assert.equal((aliased[1] >>> 12) & 0xF, 0x3, 'fixture must alias kCondExec');
+  const ucode = exec(
+    cfPair(execCf(1, 1, seq(SEQ_FETCH)), NOP_CF),
+    aliased,
+  );
+  const analysis = VF.analyzeVertexShader(ucode);
+  assert.equal(analysis.controlFlowPairBound, 1);
+  assert.equal(analysis.vertexFetchInstructionCount, 1);
+  assert.equal(analysis.bindings.length, 1);
+  assert.equal(analysis.bindings[0].attributes[0].format, VF.VERTEX_FORMAT.k_8_8_8_8);
+});
+
 test('exec CF pointing past the blob traps loudly', () => {
   const ucode = exec(cfPair(execCf(7, 1, seq(SEQ_FETCH)), NOP_CF), ALU_ZERO);
   assert.throws(() => VF.analyzeVertexShader(ucode), /out of shader/);

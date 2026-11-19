@@ -140,6 +140,41 @@
 }
 `;
 
+  // Fixed fragment stage for the translated-vertex-shader path. The guest PIXEL
+  // shader has no translator yet (step 6), so a trivially constant FS is used:
+  // it shades the real, guest-microcode-transformed geometry and nothing else.
+  // It never feeds back into guest state. Not reachable when a pixel shader is
+  // loaded — draw() traps loudly instead of fabricating a fragment stage.
+  const FLAT_FRAGMENT_WGSL = `// Bring-up fragment stage — NOT translated Xenos microcode (pixel-shader translation is step 6).
+@fragment fn fs_main() -> @location(0) vec4<f32> {
+  return vec4<f32>(0.9, 0.55, 0.15, 1.0);
+}
+`;
+
+  /** Integer-component GPUVertexFormat strings (need vec4<u32>/vec4<i32> shader locations, not vec4<f32>). */
+  function isIntegerGpuVertexFormat(format) {
+    return format.startsWith('uint') || format.startsWith('sint');
+  }
+
+  // Xenos VGT_DRAW_INITIATOR prim_type (pm4.js PRIMITIVE_TYPE) → GPUPrimitiveTopology.
+  // Anything WebGPU cannot represent (triangle fan, quads, polygon, rect lists)
+  // traps loudly instead of silently drawing with the wrong connectivity.
+  const PRIM_TYPE_TOPOLOGY = new Map([
+    [0x01 /* kPointList */, 'point-list'],
+    [0x02 /* kLineList */, 'line-list'],
+    [0x03 /* kLineStrip */, 'line-strip'],
+    [0x04 /* kTriangleList */, 'triangle-list'],
+    [0x06 /* kTriangleStrip */, 'triangle-strip'],
+  ]);
+  function topologyForPrimType(primType, primTypeName) {
+    const topology = PRIM_TYPE_TOPOLOGY.get(primType & 0x3f);
+    if (!topology) {
+      // Called at draw time, long after XenosWebGpuError (declared below) is initialized.
+      throw new XenosWebGpuError(`prim ${primTypeName ?? `prim_0x${(primType & 0x3f).toString(16)}`}: primitive topology is not encodable in WebGPU (triangle-fan/quad/polygon connectivity would need index conversion) — refusing to draw with the wrong connectivity`);
+    }
+    return topology;
+  }
+
   class XenosWebGpuError extends Error {}
 
   class XenosWebGpuBackend {
@@ -168,8 +203,17 @@
       this.depthTexture = null;
       this.depthFormat = 'depth24plus';
       this.pipelineCache = new Map(); // key -> GPURenderPipeline
+      // Translated-VS path: WeakMap<ucode object, translation result> and a
+      // per-shader Map<layoutKey, { pipeline, bindGroup }>. Pipelines/bind groups
+      // are created once per (shader, layout, topology) — never per draw.
+      this.translateMemo = new WeakMap();
+      this.translatedPipelines = new WeakMap();
+      this.aluConstantBuffer = null;     // GPUBuffer, persistent — contents re-uploaded only on change
+      this.boolConstantBuffer = null;    // GPUBuffer, persistent likewise
+      this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
+      this.boolHash = -1;
       this.placeholderPipeline = null;
-      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0 };
+      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0 };
       this.lastVertexFetch = null;    // set by prepareVertexFetch() (draw path) — descriptors + constants
       this.lastFetchConstants = null;
       // Content-addressed GPU buffer cache (key: kind:base:bytes:endian → hash-verified buffer).
@@ -243,7 +287,7 @@
 
     interrupt(mask) { this.log('info', `interrupt request mask=0x${(mask >>> 0).toString(16)}`); }
 
-    invalidateState(mask) { this.log('debug', `invalidateState mask=0x${(mask >>> 0).toString(16)}`); this.pipelineCache.clear(); }
+    invalidateState(mask) { this.log('debug', `invalidateState mask=0x${(mask >>> 0).toString(16)}`); this.pipelineCache.clear(); this.translateMemo = new WeakMap(); this.translatedPipelines = new WeakMap(); }
 
     setShaderBases(vsBase, psBase) { this.log('debug', `setShaderBases vs=0x${vsBase.toString(16)} ps=0x${psBase.toString(16)}`); }
 
@@ -254,6 +298,8 @@
       if (pixel) this.shaders.pixel = pixel;
       this.pipelineCache.clear(); // microcode changed — pipelines are keyed on shader content, so drop everything
       this.planMemo = new WeakMap();
+      this.translateMemo = new WeakMap();
+      this.translatedPipelines = new WeakMap();
     }
 
     /**
@@ -384,6 +430,106 @@
       return buffers;
     }
 
+    /** Translate the loaded vertex shader ucode to WGSL (memoized per ucode object). Loud on any unsupported construct. */
+    _translateVertexShader(code) {
+      let translated = this.translateMemo.get(code);
+      if (translated) return translated;
+      const TX = globalThis.XenonGpuTranslate;
+      if (!TX) throw new XenosWebGpuError('XenonGpuTranslate is not loaded — public/js/gpu/wgsl_translate.js must be loaded before the backend builds a draw pipeline');
+      try {
+        translated = TX.translateVertexShader(code);
+      } catch (e) {
+        const name = e && e.constructor && e.constructor.name ? e.constructor.name : 'Error';
+        const detail = e && e.message ? e.message : String(e);
+        throw new XenosWebGpuError(`draw: the vertex shader failed to translate to WGSL (${name}): ${detail}`);
+      }
+      this.translateMemo.set(code, translated);
+      return translated;
+    }
+
+    /**
+     * Upload the ALU (fc[]) and bool constant snapshots into persistent GPU
+     * buffers. Content-hashed: the ~1032-word hash costs microseconds and the
+     * 4 KB writeBuffer only happens on draws whose constants actually changed.
+     */
+    _uploadShaderConstants(params, translated) {
+      if (typeof GPUBufferUsage === 'undefined') throw new XenosWebGpuError('_uploadShaderConstants: GPUBufferUsage is not defined in this environment');
+      const alu = params.aluConstants, bools = params.boolConstants;
+      if (translated.usesFloatConstants) {
+        if (!alu) throw new XenosWebGpuError('draw: the translated vertex shader reads fc[] (ALU constants) but the packet carried no ALU constants — refusing to bind fabricated constants');
+        const hash = fnv1a32Words(alu);
+        if (hash !== this.aluHash || !this.aluConstantBuffer) {
+          if (!this.aluConstantBuffer) {
+            this.aluConstantBuffer = this.device.createBuffer({ size: 4096, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'xenos-alu-constants' });
+          }
+          const bytes = new Uint8Array(4096);
+          const dv = new DataView(bytes.buffer);
+          for (let i = 0; i < 1024; i++) dv.setUint32(i * 4, alu[i] >>> 0, true);
+          this.device.queue.writeBuffer(this.aluConstantBuffer, 0, bytes);
+          this.aluHash = hash;
+          this.uploads.constantUploads++;
+        }
+      }
+      if (translated.usesBoolConstants) {
+        if (!bools) throw new XenosWebGpuError('draw: the translated vertex shader reads bool constants (bc(n)) but the packet carried none — refusing to bind fabricated bools');
+        const hash = fnv1a32Words(bools);
+        if (hash !== this.boolHash || !this.boolConstantBuffer) {
+          if (!this.boolConstantBuffer) {
+            this.boolConstantBuffer = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'xenos-bool-constants' });
+          }
+          const bytes = new Uint8Array(32);
+          const dv = new DataView(bytes.buffer);
+          for (let i = 0; i < 8; i++) dv.setUint32(i * 4, bools[i] >>> 0, true);
+          this.device.queue.writeBuffer(this.boolConstantBuffer, 0, bytes);
+          this.boolHash = hash;
+          this.uploads.constantUploads++;
+        }
+      }
+    }
+
+    /**
+     * Fetch or build the { pipeline, bindGroup } for the translated vertex
+     * shader at a given vertex-buffer layout + topology. One pipeline per
+     * (ucode object, layoutKey) — created once, reused for every draw. The
+     * bind group is likewise created once per pipeline; the constant buffers
+     * it binds are persistent and are re-uploaded only when the guest changes
+     * the constants (see _uploadShaderConstants).
+     */
+    _getTranslatedVsResources(code, translated, plan, topology) {
+      let perShader = this.translatedPipelines.get(code);
+      if (!perShader) {
+        perShader = new Map();
+        this.translatedPipelines.set(code, perShader);
+      }
+      const layoutKey = `${topology}:${this.format}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
+      let entry = perShader.get(layoutKey);
+      if (entry) return entry;
+
+      const module = this.device.createShaderModule({ code: `${translated.wgsl}\n${FLAT_FRAGMENT_WGSL}`, label: 'xenos-translated-vs' });
+      const vertexBuffers = (plan?.descriptors ?? []).map((d) => ({
+        arrayStride: d.arrayStride,
+        stepMode: d.stepMode ?? 'vertex',
+        attributes: d.attributes.map((a) => ({ shaderLocation: a.shaderLocation, offset: a.offset, format: a.format })),
+      }));
+      const pipeline = this.device.createRenderPipeline({
+        label: 'xenos-translated-vs',
+        layout: 'auto',
+        vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
+        fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+        primitive: { topology },
+      });
+      let bindGroup = null;
+      if (translated.usesFloatConstants || translated.usesBoolConstants) {
+        const entries = [];
+        if (translated.usesFloatConstants) entries.push({ binding: 0, resource: { buffer: this.aluConstantBuffer } });
+        if (translated.usesBoolConstants) entries.push({ binding: translated.usesFloatConstants ? 1 : 0, resource: { buffer: this.boolConstantBuffer } });
+        bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+      }
+      entry = { pipeline, bindGroup };
+      perShader.set(layoutKey, entry);
+      return entry;
+    }
+
     /** Placeholder pipeline whose vertex stage consumes the plan's attributes (fetch bring-up). */
     _getFetchPlaceholderPipeline(descriptors) {
       const key = 'fetch:' + JSON.stringify(descriptors.map((d) => [d.arrayStride, d.attributes])) + ':' + this.format;
@@ -460,10 +606,64 @@
       if (!this.canvas) throw new XenosWebGpuError('draw requires a canvas (headless rendering into textures is not wired yet)');
       this.uploads.frames++;
       if (!this.placeholderShader) {
-        throw new XenosWebGpuError(
-          `draw(prim=${params.primTypeName ?? params.primType}, indices=${params.numIndices}): the Xenos microcode→WGSL translation is not wired yet — ` +
-          'see docs/XENOS_GPU.md ("Bring-up order"). Pass { placeholderShader: true } to attach() to render the bring-up triangle instead.'
-        );
+        // --- the real path: translated guest vertex shader, fixed flat FS -------------------------
+        // The vertex stage executes the guest's microcode (translated to WGSL). The fragment
+        // stage is a trivially constant bring-up FS — guest pixel shaders do not translate yet
+        // (step 6), and a draw with a pixel shader loaded refuses to run rather than render
+        // with a guessed fragment stage.
+        const code = this.shaders.vertex?.code ?? null;
+        if (!code) {
+          throw new XenosWebGpuError(
+            `draw(prim=${params.primTypeName ?? params.primType}, indices=${params.numIndices}): no vertex shader is loaded (IM_LOAD/IM_LOAD_IMMEDIATE with shader type 0 first) — ` +
+            'refusing to fabricate geometry. Pass { placeholderShader: true } to attach() to render the bring-up triangle instead.');
+        }
+        if (this.shaders.pixel) {
+          throw new XenosWebGpuError(
+            'draw: a pixel shader is loaded but pixel-shader translation does not exist yet (docs/XENOS_GPU.md, step 6) — ' +
+            'refusing to render with a guessed fragment stage. Unset the pixel shader (or load one only when step 6 lands).');
+        }
+        const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
+        const translated = this._translateVertexShader(code);
+
+        // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
+        if (!params.vertexFetchConstants && translated.inputLocations.length > 0) {
+          throw new XenosWebGpuError(
+            `draw: the translated vertex shader reads attributes at locations [${translated.inputLocations}] but the packet carried no fetch constants — ` +
+            'the command processor normally attaches them; refusing to bind fabricated attributes');
+        }
+        const plan = params.vertexFetchConstants
+          ? this.prepareVertexFetch({ vertexShaderCode: code, fetchConstants: params.vertexFetchConstants })
+          : null;
+        // The translated VS declares vec4f inputs; pure uint/sint attribute formats cannot feed a
+        // vec4<f32> location (WebGPU interface matching) — trap loudly instead of erroring inside wgpu.
+        if (plan) {
+          const wanted = new Set(translated.inputLocations);
+          for (const d of plan.descriptors) {
+            for (const a of d.attributes) {
+              if (wanted.has(a.shaderLocation) && isIntegerGpuVertexFormat(a.format)) {
+                throw new XenosWebGpuError(
+                  `draw: attribute at location ${a.shaderLocation} (fetch constant ${d.fetchConstant}) has integer GPU format '${a.format}' — ` +
+                  'the translated vertex shader declares vec4f inputs (Xenos ucode carries no format information) and WebGPU forbids uint/sint ' +
+                  'attributes at a vec4<f32> location. Fetch this attribute with the sign/normalization bit set (unorm/snorm) or as a float format.');
+              }
+            }
+          }
+        }
+        const buffers = plan ? this.uploadVertexBuffers(plan) : [];
+        this._uploadShaderConstants(params, translated);
+        const { pipeline, bindGroup } = this._getTranslatedVsResources(code, translated, plan, topology);
+        const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
+        const colorView = this.context.getCurrentTexture().createView();
+        const pass = encoder.beginRenderPass({
+          colorAttachments: [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
+        });
+        pass.setPipeline(pipeline);
+        if (bindGroup) pass.setBindGroup(0, bindGroup);
+        for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
+        this._setIndexBufferAndDraw(pass, params);
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+        return;
       }
       // --- clearly-labelled bring-up path ---------------------------------------------------------
       // When a vertex shader is loaded AND the draw carries fetch constants (the command
@@ -534,6 +734,8 @@
     /** Call after the last frame of a session to release GPU resources. */
     destroy() {
       if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; }
+      if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
+      if (this.boolConstantBuffer) { this.boolConstantBuffer.destroy(); this.boolConstantBuffer = null; }
       if (this.device) { this.device.destroy(); this.device = null; }
       this.context = null;
       this.pipelineCache.clear();
@@ -541,7 +743,10 @@
     }
   }
 
-  const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL };
+  // Internals exposed for unit tests only — unstable shapes, not public API.
+  const _internal = { topologyForPrimType, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY };
+
+  const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL, _internal };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   global.XenonWebGpuBackend = api;
 })(typeof self !== 'undefined' ? self : globalThis);
