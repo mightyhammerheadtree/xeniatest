@@ -20,6 +20,7 @@ import '../../public/js/gpu/command_processor.js';
 import '../../public/js/gpu/ring_buffer.js';
 import '../../public/js/gpu/webgpu_backend.js';
 import '../../public/js/gpu/vertex_fetch.js';
+import '../../public/js/gpu/render_state.js';
 await import('../../public/js/gpu/gpu_host.js');
 const XenonGpuHost = globalThis.XenonGpuHostFactory;
 

@@ -938,11 +938,36 @@ test('pixel shader: MRT color exports (oC1..oC3) trap with a named reason', () =
   }
 });
 
-test('pixel shader: depth export (oDepth) traps with a named reason', () => {
-  assert.throws(() => T.translatePixelShader(shader(
-    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
-    aluWords({ isExport: 1, vectorDest: 61, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),
-  )), /depth export/);
+test('pixel shader: oDepth export emits a clamped @builtin(frag_depth) output', async () => {
+  const out = T.translatePixelShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 1, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),           // r1 = fc0+fc0
+    aluWords({ isExport: 1, vectorDest: 61, vectorWriteMask: 1, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }), // oDepth = r1.x
+  ));
+  assert.equal(out.exportsDepth, true);
+  assert.match(out.wgsl, /@builtin\(frag_depth\) depth: f32,/);
+  assert.match(out.wgsl, /out\.depth = clamp\(\(r\[1\]\.x \+ r\[1\]\.x\), 0\.0, 1\.0\);/);
+  assert.match(out.wgsl, /out\.depth = 1\.0;/, 'unwritten paths still define frag_depth');
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: oDepth in a VS+PS pair links through Dawn with depth-stencil state', async () => {
+  const PS_DEPTH = shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 1, vectorOpcode: 0, src: [konst(0), konst(0), konst(0)] }),
+    aluWords({ isExport: 1, vectorDest: 61, vectorWriteMask: 1, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_DEPTH);
+  assert.equal(program.exportsDepth, true);
+  assert.match(program.fragment.wgsl, /@builtin\(frag_depth\)/);
+  const vsBuf = [{ arrayStride: 12, stepMode: 'vertex', attributes: [{ shaderLocation: 1, offset: 0, format: 'float32x3' }] }];
+  assert.equal(await checkProgramLinks(program.vertex.wgsl, program.fragment.wgsl, vsBuf), null);
+});
+
+test('pixel shader: a program with no oDepth export declares no frag_depth (normal depth path)', () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_CONST());
+  assert.equal(program.exportsDepth, false);
+  assert.doesNotMatch(program.fragment.wgsl, /frag_depth/);
 });
 
 test('pixel shader: texture fetch traps naming the limitation (tfetch is step 8)', () => {

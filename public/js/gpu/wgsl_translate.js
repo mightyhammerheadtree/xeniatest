@@ -404,9 +404,7 @@ function resolveExportTarget(vectorDest, shaderType, interpolatorSet) {
     if (vectorDest >= 1 && vectorDest <= 3) {
       throw new XenosTranslateError(`export: pixel color target ${vectorDest} (MRT) is not supported yet — write to oC0 only`);
     }
-    if (vectorDest === 61) {
-      throw new XenosTranslateError('export: pixel depth export is not supported yet (needs depth-stencil state in the pipeline)');
-    }
+    if (vectorDest === 61) return { kind: 'oDepth' };
     if (vectorDest >= 32 && vectorDest <= 37) {
       throw new XenosTranslateError(`export: memory exports (eA/eM${vectorDest - 33}) are not supported yet`);
     }
@@ -748,6 +746,8 @@ function collectStats(dwords, decoded, shaderType) {
   let predicateUsed = false;
   let psUsed = false;
   let writesPosition = false;
+  let exportsColor0 = false;
+  let exportsDepth = false;
   for (const block of decoded.blocks) {
     if (block.condition) {
       if (block.condition.kind === 'bool') usesBoolConstants = true;
@@ -778,6 +778,8 @@ function collectStats(dwords, decoded, shaderType) {
       if (!scalarNop) psUsed = true;
       if (alu.isExport) {
         if (alu.vectorDestTarget.kind === 'position') writesPosition = true;
+        if (alu.vectorDestTarget.kind === 'color0') exportsColor0 = true;
+        if (alu.vectorDestTarget.kind === 'oDepth') exportsDepth = true;
       } else {
         if (alu.vectorOpResultWriteMask !== 0) maxReg = Math.max(maxReg, alu.vectorDest + 1);
         if (alu.scalarOpResultWriteMask !== 0) maxReg = Math.max(maxReg, alu.scalarDest + 1);
@@ -785,7 +787,7 @@ function collectStats(dwords, decoded, shaderType) {
     }
   }
   // registerCount counts guest GPRs r0..rN-1 that the shader may touch.
-  return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition };
+  return { registerCount: maxReg, usesFloatConstants, usesBoolConstants, predicateUsed, psUsed, writesPosition, exportsColor0, exportsDepth };
 }
 
 const EXPORT_TARGET_MEMBER = Object.freeze({ position: 'pos', interpolator: (i) => `v${i}`, color0: () => 'color0' });
@@ -800,12 +802,30 @@ function emitExportTarget(alu) {
 
 /** Emit the combined export (vector + scalar halves + constant lanes). */
 function emitExportInstruction(em, alu) {
-  const target = emitExportTarget(alu);
+  const t = alu.vectorDestTarget;
   const vec = computeVectorLanes(alu, '');
   const scalar = computeScalarResult(alu);
   const push = vectorPushPredicate(alu);
   const vecMask = alu.vectorOpResultWriteMask, scalMask = alu.scalarOpResultWriteMask;
   const c0 = alu.constant0WriteMask, c1 = alu.constant1WriteMask;
+
+  if (t.kind === 'oDepth') {
+    // oDepth is single-component (X only) and clamped to [0, 1] (xenia marks the
+    // export is_clamped). Lane reconciliation is the same dual-issue rule as
+    // vector lanes, applied to lane X.
+    let lane;
+    if (c1 & 1) lane = '1.0';
+    else if (c0 & 1) lane = '0.0';
+    else if (vecMask & 1) lane = vec.exprs[0];
+    else if (scalMask & 1) lane = scalar.valueExpr;
+    else lane = '0.0';
+    em.emit(`out.depth = clamp(${lane}, 0.0, 1.0);`);
+    if (push) em.emit(`p0 = ${push};`);
+    emitScalarTail(em, alu, scalar, /*isExport*/ true);
+    return;
+  }
+
+  const target = emitExportTarget(alu);
 
   if (vecMask === 0b1111 && scalMask === 0 && c0 === 0 && c1 === 0) {
     em.emit(`${target} = vec4f(${[0, 1, 2, 3].map((l) => vec.exprs[l]).join(', ')});`);
@@ -951,7 +971,9 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
   } else {
     const psInMembers = linked.map((n) => `  @location(${n}) i${n}: vec4f,`);
     inStruct = psInMembers.length > 0 ? ['struct PsIn {', ...psInMembers, '};'].join('\n') : null;
-    outStruct = 'struct PsOut {\n  @location(0) color0: vec4f\n};';
+    outStruct = stats.exportsDepth
+      ? 'struct PsOut {\n  @location(0) color0: vec4f,\n  @builtin(frag_depth) depth: f32,\n};'
+      : 'struct PsOut {\n  @location(0) color0: vec4f\n};';
   }
 
   const em = makeEmitter();
@@ -999,6 +1021,7 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
     for (const n of linked) em.emit(`r[${n}] = in.i${n};`);
     em.emit('var out: PsOut;');
     em.emit('out.color0 = vec4f(0.0);');
+    if (stats.exportsDepth) em.emit('out.depth = 1.0;');
   }
   for (const block of decoded.blocks) {
     emitBlock(em, block, shaderType);
@@ -1013,6 +1036,8 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
     inputLocations: shaderType === 'vertex' ? inputLocations : linked,
     interpolatorLocations,
     writesPosition: shaderType === 'vertex' ? writesPosition : false,
+    exportsColor0: shaderType === 'pixel' ? stats.exportsColor0 : false,
+    exportsDepth: shaderType === 'pixel' ? stats.exportsDepth : false,
     tempRegisterCount: registerCount,
     usesFloatConstants,
     usesBoolConstants,
@@ -1077,6 +1102,8 @@ function translateShaderProgram(vsUcodeWords, psUcodeWords) {
     usesFloatConstants: mergedFloat,
     usesBoolConstants: mergedBool,
     interpolatorLocations: vertex.interpolatorLocations,
+    exportsColor0: fragment?.exportsColor0 ?? false,
+    exportsDepth: fragment?.exportsDepth ?? false,
   };
 }
 

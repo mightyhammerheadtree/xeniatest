@@ -16,6 +16,7 @@ import '../../public/js/gpu/pm4.js';
 import '../../public/js/gpu/command_processor.js';
 import '../../public/js/gpu/vertex_fetch.js';
 import '../../public/js/gpu/wgsl_translate.js';
+import '../../public/js/gpu/render_state.js';
 import '../../public/js/gpu/webgpu_backend.js';
 
 const { XenosWebGpuBackend, XenosWebGpuError } = globalThis.XenonWebGpuBackend;
@@ -128,7 +129,7 @@ function makeFakeDevice() {
       submit() { log.submits++; },
     },
     createBuffer(desc) { const b = { desc }; log.buffers.push(b); return b; },
-    createTexture() { return { destroy() {} }; },
+    createTexture() { return { destroy() {}, createView() { return { kind: 'texture-view' }; } }; },
     createShaderModule(desc) { log.modules.push(desc); return { desc }; },
     createRenderPipeline(desc) {
       const pipeline = { desc, getBindGroupLayout() { return { kind: 'fake-bgl' }; } };
@@ -142,11 +143,13 @@ function makeFakeDevice() {
         setVertexBuffer(i, b) { log.vertexBindings.push([i, b]); },
         setBindGroup(i, bg) { log.bindGroupsSet.push([i, bg]); },
         setIndexBuffer(b, fmt) { log.indexBuffer = { buffer: b, format: fmt }; },
+        setBlendConstant(c) { log.blendConstant = c; },
+        setStencilReference(ref) { log.stencilRef = ref; },
         draw(n) { log.drawCalls.push(['draw', n]); },
         drawIndexed(n) { log.drawCalls.push(['drawIndexed', n]); },
         end() {},
       };
-      return { beginRenderPass() { return pass; }, finish() { return { fake: true }; } };
+      return { beginRenderPass(desc) { log.passDesc = desc; return pass; }, finish() { return { fake: true }; } };
     },
     destroy() {},
   };
@@ -172,6 +175,7 @@ function makeBackend(guest, { placeholderShader = false } = {}) {
   const canvas = { width: 64, height: 64, getContext: () => ({ getCurrentTexture: () => ({ createView: () => ({}) }) }) };
   backend.canvas = canvas;
   backend.context = canvas.getContext('webgpu');
+  backend._recreateDepth(); // attach() would do this — the headless harness mirrors it
   return { backend, log };
 }
 
@@ -193,10 +197,25 @@ function aluConstantArray() {
   alu[4] = 0x40400000; // 3.0f (fc[1].x)
   return alu;
 }
+/** A sane zeroed-register render-target snapshot: 8_8_8_8 RT0, all writes enabled, no blend/depth/stencil. */
+const defaultRenderTargets = (overrides = {}) => ({
+  colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
+  depthInfo: 0,
+  colorMask: 0x0000FFFF, // all components of all four RTs
+  blendRed: 0, blendGreen: 0, blendBlue: 0, blendAlpha: 0,
+  stencilRefMask: 0, stencilRefMaskBf: 0,
+  depthControl: 0,
+  // RB_BLENDCONTROL=0 maps to src=ZERO/dest=ZERO/add (blend ENABLED in xenia's rule);
+  // one/zero/add for both color and alpha is what actually disables blending.
+  blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
+  colorControl: 0,
+  ...overrides,
+});
 const drawParams = (overrides = {}) => ({
   primType: 4 /* triangle list */, primTypeName: 'kTriangleList', numIndices: 3,
   isIndexed: false, indexGuestBase: 0, indexFormat: 0, indexEndianness: 0, indexLengthWords: 0,
   vertexFetchConstants: fetchConstants(),
+  renderTargets: defaultRenderTargets(),
   ...overrides,
 });
 
@@ -273,7 +292,7 @@ test('VS without attribute reads and without fetch constants draws (constants-fe
   const guest = makeGuest();
   const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: CONST_ONLY_VS, dwords: CONST_ONLY_VS.length };
-  backend.draw({ primType: 4, primTypeName: 'kTriangleList', numIndices: 3, isIndexed: false, vertexFetchConstants: undefined, aluConstants: aluConstantArray() });
+  backend.draw({ primType: 4, primTypeName: 'kTriangleList', numIndices: 3, isIndexed: false, vertexFetchConstants: undefined, aluConstants: aluConstantArray(), renderTargets: defaultRenderTargets() });
   assert.equal(log.pipelines.length, 1);
   assert.deepEqual(log.pipelines[0].desc.vertex.buffers, []);
   assert.deepEqual(log.drawCalls, [['draw', 3]]);
@@ -437,4 +456,169 @@ test('the translated modules (VS + bring-up FS) pass Dawn validation and link', 
     }]);
     assert.equal(linkError, null, `${label}: Dawn pipeline rejected the bring-up pair: ${linkError}`);
   }
+});
+
+// =================================================== render-target state (RB_*)
+test('translated draw binds an explicit write mask and blend state from RB_BLENDCONTROL0/RB_COLOR_MASK', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // src-alpha / one-minus-src-alpha for color and alpha, write RG only (0b0101? use 0b1010)
+  const blendAlpha = (6 | (0 << 5) | (7 << 8) | (6 << 16) | (0 << 21) | (7 << 24)) >>> 0;
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorMask: 0x0000000A, blendControl0: blendAlpha }) }));
+  const target = log.pipelines[0].desc.fragment.targets[0];
+  assert.equal(target.writeMask, 0xA);
+  assert.deepEqual(target.blend, {
+    color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+    alpha: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+  });
+  assert.deepEqual(log.blendConstant, [0, 0, 0, 0], 'blend constant is set on the pass');
+});
+
+test('blend disabled (one/zero/add) yields a target without a blend state, matching xenia', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  const target = log.pipelines[0].desc.fragment.targets[0];
+  assert.equal(target.blend, undefined);
+  assert.equal(target.writeMask, 0xF);
+});
+
+test('blend constants from RB_BLEND_RED..ALPHA reach the pass as floats', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({
+    renderTargets: defaultRenderTargets({ blendRed: 0x3F000000, blendGreen: 0x3F800000, blendBlue: 0x40000000, blendAlpha: 0x40400000 }), // 0.5, 1, 2, 3
+  }));
+  assert.deepEqual(log.blendConstant, [0.5, 1, 2, 3]);
+});
+
+test('z_enable + zfunc + z_write map to the pipeline depth state; depth attachment present with clear 1.0', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: 0x2 | (0x3 << 4) | 0x4 }) })); // less-equal, write on
+  const depth = log.pipelines[0].desc.depthStencil;
+  assert.equal(depth.format, 'depth24plus-stencil8');
+  assert.equal(depth.depthCompare, 'less-equal');
+  assert.equal(depth.depthWriteEnabled, true);
+  const att = log.passDesc.depthStencilAttachment;
+  assert.ok(att, 'the pass carries the depth/stencil attachment');
+  assert.equal(att.depthLoadOp, 'clear');
+  assert.equal(att.depthClearValue, 1.0);
+  assert.equal(att.stencilLoadOp, 'clear');
+  assert.deepEqual(att.view, { kind: 'texture-view' }, 'fake depth view recorded');
+});
+
+test('stencil enable maps func/ops into front/back state and sets the pass reference', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // stencil on; z on; front: func=less(1), fail=replace(2), zpass=increment-clamp(3), zfail=invert(5)
+  const dc = 0x1 | 0x2 | (0x1 << 4) | (0x1 << 8) | (0x2 << 11) | (0x3 << 14) | (0x5 << 17);
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x0000427F }) }));
+  const depth = log.pipelines[0].desc.depthStencil;
+  assert.deepEqual(depth.stencilFront, { compare: 'less', failOp: 'replace', depthFailOp: 'invert', passOp: 'increment-clamp' });
+  assert.deepEqual(depth.stencilBack, depth.stencilFront);
+  assert.equal(depth.stencilReadMask, 0x42);
+  assert.equal(depth.stencilWriteMask, 0x00);
+  assert.equal(log.stencilRef, 0x7F);
+});
+
+test('different render-target states produce distinct cached pipelines; identical states reuse', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const rtA = defaultRenderTargets({ colorMask: 0xF });
+  const rtB = defaultRenderTargets({ colorMask: 0x5 });
+  backend.draw(drawParams({ renderTargets: rtA }));
+  backend.draw(drawParams({ renderTargets: rtB }));
+  backend.draw(drawParams({ renderTargets: { ...rtA } })); // same raw values → same key → same pipeline
+  assert.equal(log.pipelines.length, 2, 'one pipeline per (shader, layout, topology, RT state)');
+  assert.equal(log.drawCalls.length, 3);
+});
+
+test('traps: alpha test enabled is refused loudly (no WGSL representation yet)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorControl: 0x9 }) })), // alpha_test_enable | alpha_func 1
+    (e) => e instanceof XenosWebGpuError && /alpha test/i.test(e.message));
+  assert.equal(log.pipelines.length, 0);
+});
+
+test('traps: GAMMA color format is refused (needs the PWL gamma pass, step 7)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })),
+    /8_8_8_8_GAMMA/);
+});
+
+test('traps: float color format is refused naming the format', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 7 << 16 }) })),
+    /k_16_16_16_16_FLOAT/);
+});
+
+test('traps: kD24FS8 float depth refused when depth testing is enabled', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x2 }) })),
+    /kD24FS8/);
+});
+
+test('traps: back-face stencil reference differing from the front face is refused (WebGPU has one reference)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const dc = 0x1 | 0x80; // stencil on + backface_enable
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }) })),
+    /STENCILREFMASK_BF/);
+});
+
+test('traps: a draw without the render-target snapshot refuses (the CP always attaches it)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const params = drawParams();
+  delete params.renderTargets;
+  assert.throws(() => backend.draw(params), /render-target register snapshot missing/);
+});
+
+test('traps are skipped when the PS does not write oC0 (RT0 format never observed)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // A PS that exports nothing yet references no interpolators: constant0 export only.
+  const PS_BLACK = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, src: [temp(1), temp(1), temp(1)] }), // dead write to r3, no exports
+  );
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  const state = backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 1 << 16 }) })); // GAMMA RT0
+  assert.equal(log.pipelines.length, 1, 'no oC0 export → no RT0 format validation');
 });

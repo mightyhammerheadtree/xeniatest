@@ -214,7 +214,6 @@
       this.boolConstantBuffer = null;    // GPUBuffer, persistent likewise
       this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
       this.boolHash = -1;
-      this.placeholderPipeline = null;
       this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0 };
       this.lastVertexFetch = null;    // set by prepareVertexFetch() (draw path) — descriptors + constants
       this.lastFetchConstants = null;
@@ -271,6 +270,7 @@
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
         label: 'xenos-depth',
       });
+      this.depthView = typeof this.depthTexture.createView === 'function' ? this.depthTexture.createView() : null;
     }
 
     /** Resize depth attachment to the canvas size (call before drawing after a resize). */
@@ -510,6 +510,69 @@
       }
     }
 
+    /** The color target descriptor for the canvas attachment (format + write mask + blend). */
+    _colorTargetDesc(rtState) {
+      const target = { format: this.format, writeMask: rtState ? rtState.writeMask : 0xF };
+      if (rtState && rtState.blend) target.blend = rtState.blend;
+      return target;
+    }
+
+    /** The depth-stencil state for every pipeline this backend builds. */
+    _depthStencilDesc(rtState) {
+      if (rtState && rtState.depthStencil) return { ...rtState.depthStencil };
+      return { format: this.depthFormat, depthWriteEnabled: false, depthCompare: 'always' };
+    }
+
+    /**
+     * Decode the render-target register snapshot for this draw. Refuses loudly
+     * when the snapshot is missing (the command processor attaches it; a host
+     * not doing so is not executing the guest's ROP state) or when the guest
+     * programmed something WebGPU cannot represent.
+     */
+    _resolveRenderTargets(params, program) {
+      const rs = globalThis.XenonGpuRenderState;
+      if (!rs) {
+        throw new XenosWebGpuError('XenonGpuRenderState is not loaded — public/js/gpu/render_state.js must be loaded before the backend builds a draw');
+      }
+      let rtState;
+      try {
+        rtState = rs.buildRenderTargetState(params.renderTargets, {
+          // No pixel shader → the bring-up FS writes the attachment unconditionally.
+          psExportsColor0: program?.fragment ? program.exportsColor0 : true,
+          psExportsDepth: program?.exportsDepth ?? false,
+        });
+      } catch (e) {
+        if (e && e.constructor && e.constructor.name === 'XenosRenderStateError') {
+          throw new XenosWebGpuError(`draw: ${e.message}`);
+        }
+        throw e;
+      }
+      return rtState;
+    }
+
+    /** Begin the render pass for a frame segment: canvas color attachment + depth/stencil attachment. */
+    _beginPass(encoder, colorView, rtState) {
+      const colorAttachments = [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }];
+      const desc = { colorAttachments };
+      if (this.depthView) {
+        desc.depthStencilAttachment = {
+          view: this.depthView,
+          depthLoadOp: 'clear',
+          depthClearValue: 1.0,
+          depthStoreOp: 'store',
+          stencilLoadOp: 'clear',
+          stencilClearValue: 0,
+          stencilStoreOp: 'store',
+        };
+      }
+      const pass = encoder.beginRenderPass(desc);
+      if (rtState) {
+        pass.setBlendConstant(rtState.blendConstant);
+        pass.setStencilReference(rtState.stencilRef);
+      }
+      return pass;
+    }
+
     /**
      * Fetch or build the { pipeline, bindGroup } for the translated shader program
      * at a given vertex-buffer layout + topology. One pipeline per
@@ -521,15 +584,20 @@
      * When no pixel shader is loaded the fragment stage is the fixed bring-up
      * FS (amber; clearly labelled, never the guest's shader). When one is
      * loaded, the translated guest pixel shader runs.
+     *
+     * Pipelines also key on the render-target register state (write mask,
+     * blend, depth/stencil) — the same shader pair drawn with different ROP
+     * state gets a different pipeline.
      */
-    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program) {
+    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program, rtState) {
       let perShader = this.translatedPipelines.get(vsCode);
       if (!perShader) {
         perShader = new Map();
         this.translatedPipelines.set(vsCode, perShader);
       }
       const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
-      const layoutKey = `${pairKey}|${topology}:${this.format}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
+      const rtKey = rtState ? rtState.key : 'rt:none';
+      const layoutKey = `${pairKey}|${topology}:${this.format}:${rtKey}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
       if (entry) return entry;
 
@@ -548,7 +616,8 @@
         label: program.fragment ? 'xenos-translated-vs-ps' : 'xenos-translated-vs',
         layout: 'auto',
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
+        depthStencil: this._depthStencilDesc(rtState),
         primitive: { topology },
       });
       let bindGroup = null;
@@ -564,8 +633,8 @@
     }
 
     /** Placeholder pipeline whose vertex stage consumes the plan's attributes (fetch bring-up). */
-    _getFetchPlaceholderPipeline(descriptors) {
-      const key = 'fetch:' + JSON.stringify(descriptors.map((d) => [d.arrayStride, d.attributes])) + ':' + this.format;
+    _getFetchPlaceholderPipeline(descriptors, rtState) {
+      const key = 'fetch:' + JSON.stringify(descriptors.map((d) => [d.arrayStride, d.attributes])) + ':' + this.format + ':' + (rtState ? rtState.key : 'rt:none');
       let p = this.pipelineCache.get(key);
       if (p) return p;
       const wgsl = buildFetchPlaceholderWGSL(descriptors);
@@ -579,7 +648,8 @@
         label: 'xenos-placeholder-fetch',
         layout: 'auto',
         vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+        fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
+        depthStencil: this._depthStencilDesc(rtState),
         primitive: { topology: 'triangle-list' },
       });
       this.pipelineCache.set(key, p);
@@ -621,17 +691,21 @@
       return buffer;
     }
 
-    _getPlaceholderPipeline() {
-      if (this.placeholderPipeline) return this.placeholderPipeline;
+    _getPlaceholderPipeline(rtState) {
+      const key = 'full-canvas:' + this.format + ':' + (rtState ? rtState.key : 'rt:none');
+      let p = this.pipelineCache.get(key);
+      if (p) return p;
       const module = this.device.createShaderModule({ code: PLACEHOLDER_WGSL, label: 'placeholder' });
-      this.placeholderPipeline = this.device.createRenderPipeline({
+      p = this.device.createRenderPipeline({
         label: 'xenos-placeholder-triangle',
         layout: 'auto',
         vertex: { module, entryPoint: 'vs_main' },
-        fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+        fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
+        depthStencil: this._depthStencilDesc(rtState),
         primitive: { topology: 'triangle-list' },
       });
-      return this.placeholderPipeline;
+      this.pipelineCache.set(key, p);
+      return p;
     }
 
     draw(params) {
@@ -679,12 +753,11 @@
         }
         const buffers = plan ? this.uploadVertexBuffers(plan) : [];
         this._uploadShaderConstants(params, program);
-        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program);
+        const rtState = this._resolveRenderTargets(params, program);
+        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
-        });
+        const pass = this._beginPass(encoder, colorView, rtState);
         pass.setPipeline(pipeline);
         if (bindGroup) pass.setBindGroup(0, bindGroup);
         for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
@@ -701,21 +774,20 @@
       // vertex shader we cannot fetch anything — the full-canvas triangle remains.
       const fetchReady = !!(this.shaders.vertex && params.vertexFetchConstants);
       if (fetchReady) {
+        const rtState = this._resolveRenderTargets(params, null);
         const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const colorView = this.context.getCurrentTexture().createView();
-        const pass = encoder.beginRenderPass({
-          colorAttachments: [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
-        });
+        const pass = this._beginPass(encoder, colorView, rtState);
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
-          pass.setPipeline((plan._pipeline ??= this._getFetchPlaceholderPipeline(plan.descriptors)));
+          pass.setPipeline((plan._pipeline ??= this._getFetchPlaceholderPipeline(plan.descriptors, rtState)));
           for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
           this._setIndexBufferAndDraw(pass, params);
         } else {
           // VS loaded but it fetches nothing — draw the full-canvas placeholder (documented).
           this.log('info', 'draw: vertex shader fetches nothing — issuing the plain bring-up triangle');
-          pass.setPipeline(this._getPlaceholderPipeline());
+          pass.setPipeline(this._getPlaceholderPipeline(rtState));
           pass.draw(3);
         }
         pass.end();
@@ -725,12 +797,11 @@
       if (this.shaders.vertex) {
         this.log('warn', 'draw: vertex shader loaded but the packet carried no fetch constants — bypassing the fetch path (full-canvas placeholder)');
       }
+      const rtState = this._resolveRenderTargets(params, null);
       const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
       const colorView = this.context.getCurrentTexture().createView();
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{ view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }],
-      });
-      pass.setPipeline(this._getPlaceholderPipeline());
+      const pass = this._beginPass(encoder, colorView, rtState);
+      pass.setPipeline(this._getPlaceholderPipeline(rtState));
       pass.draw(3);
       pass.end();
       this.device.queue.submit([encoder.finish()]);
@@ -761,7 +832,7 @@
 
     /** Call after the last frame of a session to release GPU resources. */
     destroy() {
-      if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; }
+      if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; this.depthView = null; }
       if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
       if (this.boolConstantBuffer) { this.boolConstantBuffer.destroy(); this.boolConstantBuffer = null; }
       if (this.device) { this.device.destroy(); this.device = null; }
@@ -769,7 +840,6 @@
       this.pipelineCache.clear();
       this.programMemo = new WeakMap();
       this.translatedPipelines = new WeakMap();
-      this.placeholderPipeline = null;
     }
   }
 

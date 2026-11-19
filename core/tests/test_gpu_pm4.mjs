@@ -10,6 +10,7 @@ import '../../public/js/gpu/xenos_registers.js';
 import '../../public/js/gpu/register_file.js';
 import '../../public/js/gpu/pm4.js';
 import '../../public/js/gpu/command_processor.js';
+import '../../public/js/gpu/render_state.js';
 
 const PM4 = globalThis.XenonPM4;
 const { XenosCommandProcessor, XenosGpuError } = globalThis.XenonGpuCommandProcessor;
@@ -328,4 +329,43 @@ test('draw packet snapshots ALU and bool constants from the register file', () =
   assert.equal(draw.boolConstants[4], 1 << 4);
   // Fetch constants remain attached too (regression: same snapshot path)
   assert.equal(draw.vertexFetchConstants.length, 192);
+});
+
+test('draw packet snapshots the RB_* render-target registers from the register file', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // Write the render-target registers via direct context-register writes (index base 0x2000).
+  // RB_COLOR_INFO (0x2001): format 5 (k_16_16_16_16) at +16, base 0x42.
+  // RB_COLOR_MASK (0x2104): 0xA5A5A5A5.
+  // RB_BLEND_RED/GREEN/BLUE/ALPHA (0x2105..0x2108): 0.25f / 0.5f / 0.75f / 1.0f bits.
+  // RB_DEPTHCONTROL (0x2200): z_enable|z_write|zfunc GreaterEqual(6)<<4|stencil off.
+  // RB_COLORCONTROL (0x2202): 0 (no alpha test).
+  // RB_BLENDCONTROL0 (0x2201): src=src-alpha(6), one-minus-src-alpha(7) — 0x07000506.
+  const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
+  setReg(0x2001, (5 << 16) | 0x42);
+  setReg(0x2002, 0); // kD24S8
+  setReg(0x2104, 0xA5A5A5A5);
+  setReg(0x2105, 0x3E800000);
+  setReg(0x2106, 0x3F000000);
+  setReg(0x2107, 0x3F400000);
+  setReg(0x2108, 0x3F800000);
+  setReg(0x210d, 0x0000427F); // RB_STENCILREFMASK: ref 0x7F, mask 0x42
+  setReg(0x2200, 0x2 | 0x4 | (0x6 << 4));
+  setReg(0x2201, (7 << 8) | (0 << 5) | 6);
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+  const draw = backend.calls.find((c) => c.kind === 'draw');
+  assert.ok(draw, 'draw packet reached the backend');
+  assert.ok(draw.renderTargets, 'render-target snapshot is attached');
+  assert.equal(draw.renderTargets.colorInfo0, (5 << 16) | 0x42);
+  assert.equal(draw.renderTargets.depthInfo, 0);
+  assert.equal(draw.renderTargets.colorMask, 0xA5A5A5A5);
+  assert.equal(draw.renderTargets.blendRed, 0x3E800000);
+  assert.equal(draw.renderTargets.blendAlpha, 0x3F800000);
+  assert.equal(draw.renderTargets.stencilRefMask, 0x0000427F);
+  assert.equal(draw.renderTargets.stencilRefMaskBf, 0x00FFFF00, 'hardware reset default from the generated register table');
+  assert.equal(draw.renderTargets.depthControl, 0x2 | 0x4 | (0x6 << 4));
+  assert.equal(draw.renderTargets.blendControl0, (7 << 8) | 6);
+  assert.equal(draw.renderTargets.colorControl, 0);
 });

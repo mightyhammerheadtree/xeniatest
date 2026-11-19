@@ -63,6 +63,10 @@ export async function checkProgramLinks(vsCode, fsCode, vertexBuffers = [], form
     layout: 'auto',
     vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
     fragment: { module: fsModule, entryPoint: 'fs_main', targets: [{ format }] },
+    // A fragment stage writing frag_depth is rejected without depth-stencil state (Dawn validation).
+    depthStencil: /@builtin\(frag_depth\)/.test(fsCode)
+      ? { format: 'depth24plus-stencil8', depthWriteEnabled: true, depthCompare: 'always' }
+      : undefined,
     primitive: { topology: 'triangle-list' },
   });
   const err = await device.popErrorScope();

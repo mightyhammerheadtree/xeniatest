@@ -11,6 +11,7 @@ import '../../public/js/gpu/command_processor.js';
 import '../../public/js/gpu/vertex_fetch.js';
 import '../../public/js/gpu/webgpu_backend.js';
 import '../../public/js/gpu/ring_buffer.js';
+import '../../public/js/gpu/render_state.js';
 
 const { XenosRegisterFile } = globalThis.XenonGpuRegisterFile;
 const { XenosCommandProcessor } = globalThis.XenonGpuCommandProcessor;
@@ -66,7 +67,7 @@ function makeBackend(guest) {
     createShaderModule() { return {}; },
     createRenderPipeline() { return {}; },
     createCommandEncoder() {
-      const pass = { setPipeline() {}, setVertexBuffer() {}, setIndexBuffer() {}, draw() {}, drawIndexed() {}, end() {} };
+      const pass = { setPipeline() {}, setVertexBuffer() {}, setIndexBuffer() {}, setBlendConstant() {}, setStencilReference() {}, draw() {}, drawIndexed() {}, end() {} };
       return { beginRenderPass() { return pass; }, finish() { return {}; } };
     },
     destroy() {},
@@ -80,10 +81,22 @@ function makeBackend(guest) {
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   return { backend, calls };
 }
+/** A sane zeroed render-target snapshot: 8_8_8_8 RT0, all writes, no blend/depth/stencil (xenia: RB_BLENDCONTROL=1 <<16|1 disables blending). */
+const DEFAULT_RT = {
+  colorInfo0: 0, colorInfo1: 0, colorInfo2: 0, colorInfo3: 0,
+  depthInfo: 0,
+  colorMask: 0x0000FFFF,
+  blendRed: 0, blendGreen: 0, blendBlue: 0, blendAlpha: 0,
+  stencilRefMask: 0, stencilRefMaskBf: 0,
+  depthControl: 0,
+  blendControl0: 0x00010001, blendControl1: 0x00010001, blendControl2: 0x00010001, blendControl3: 0x00010001,
+  colorControl: 0,
+};
 const drawParams = {
   primType: 4, primTypeName: 'triangle-list', numIndices: 3,
   isIndexed: true, indexGuestBase: IB_BASE, indexFormat: 0, indexEndianness: 1, indexLengthWords: 2,
   vertexFetchConstants: FETCH_CONSTS,
+  renderTargets: DEFAULT_RT,
 };
 
 test('identical draws upload each GPU buffer exactly once (cache hit thereafter)', () => {
