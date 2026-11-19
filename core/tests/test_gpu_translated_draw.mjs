@@ -736,3 +736,44 @@ test('a draw without the scissor snapshot refuses (the CP always attaches it)', 
   delete params.scissor;
   assert.throws(() => backend.draw(params), /scissor register snapshot missing/);
 });
+
+test('a PS that does not export oC0 gets writeMask 0 on the color target (no fabricated black writes)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // dead-write PS: no exports at all
+  const PS_BLACK = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }),
+  );
+  backend.shaders.pixel = { kind: 'pixel', code: PS_BLACK, dwords: PS_BLACK.length };
+  backend.draw(drawParams());
+  assert.equal(log.pipelines.length, 1);
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].writeMask, 0, 'no color writes when the PS does not export oC0');
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].blend, undefined, 'blend disabled with mask 0');
+  // same ucode with an oC0 export flips the mask — distinct pipeline
+  const PS_O = PS_ADD; // exports oC0
+  backend.shaders.pixel = { kind: 'pixel', code: PS_O, dwords: PS_O.length };
+  backend.draw(drawParams());
+  assert.equal(log.pipelines.length, 2, 'color-export bit is part of the pipeline key');
+  assert.equal(log.pipelines[1].desc.fragment.targets[0].writeMask, 0xF);
+});
+
+test('an oDepth-only PS writes depth but never color (writeMask 0, depth stays enabled)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // PS exports only oDepth (dest 61): r1.x + r1.x → oDepth
+  const PS_ODEPTH = shader(
+    cfPair(execCf(1, 2, seq(SEQ_ALU, SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 1, vectorOpcode: 0, src: [temp(0), temp(0), temp(0)] }),
+    aluWords({ isExport: 1, vectorDest: 61, vectorOpcode: 0, src: [temp(1), temp(1), temp(1)] }),
+  );
+  backend.shaders.pixel = { kind: 'pixel', code: PS_ODEPTH, dwords: PS_ODEPTH.length };
+  backend.draw(drawParams());
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].writeMask, 0, 'color writes disabled');
+  assert.ok(log.pipelines[0].desc.fragment.module.desc.code.includes('frag_depth'), 'depth export preserved');
+  assert.ok(log.pipelines[0].desc.depthStencil, 'depth-stencil state present');
+});

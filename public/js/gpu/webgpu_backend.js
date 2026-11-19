@@ -99,6 +99,12 @@
     for (let i = 0; i < bytes.length; i++) { h ^= bytes[i]; h = Math.imul(h, 0x01000193) >>> 0; }
     return h >>> 0;
   }
+  /** Cache-key fragment: alpha test compare function (translation-time decision). */
+  function alphaTestKey(program) { return program && program.alphaTest ? String(program.alphaTest.compare) : '0'; }
+  /** Cache-key fragment: gamma encode presence. */
+  function convertKey(program) { return program && program.convertColor0ToGamma ? '1' : '0'; }
+  /** Cache-key fragment: the PS statically exports oC0 (pipeline write mask depends on it). */
+  function colorExportKey(program) { return program && program.fragment && program.fragment.exportsColor0 === false ? '0' : '1'; }
 
   /** Build the WGSL source for the fetch bring-up vertex shader. Attribute 0 → position. */
   function buildFetchPlaceholderWGSL(descriptors) {
@@ -537,9 +543,9 @@
     }
 
     /** The color target descriptor for the canvas attachment (format + write mask + blend). */
-    _colorTargetDesc(rtState) {
-      const target = { format: this.format, writeMask: rtState ? rtState.writeMask : 0xF };
-      if (rtState && rtState.blend) target.blend = rtState.blend;
+    _colorTargetDesc(rtState, writesColor = true) {
+      const target = { format: this.format, writeMask: writesColor ? (rtState ? rtState.writeMask : 0xF) : 0x0 };
+      if (writesColor && rtState && rtState.blend) target.blend = rtState.blend;
       return target;
     }
 
@@ -648,7 +654,7 @@
         perShader = new Map();
         this.translatedPipelines.set(vsCode, perShader);
       }
-      const pairKey = psCode ? `ps${this._psId(psCode)}` : 'flat';
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}`;
       const rtKey = rtState ? rtState.key : 'rt:none';
       const layoutKey = `${pairKey}|${topology}:${this.format}:${rtKey}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
@@ -669,7 +675,7 @@
         label: program.fragment ? 'xenos-translated-vs-ps' : 'xenos-translated-vs',
         layout: 'auto',
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
+        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState, colorExportKey(program) === '1')] },
         depthStencil: this._depthStencilDesc(rtState),
         primitive: { topology },
       });
@@ -780,11 +786,9 @@
         const psCode = this.shaders.pixel?.code ?? null;
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
         const alphaTest = globalThis.XenonGpuRenderState?.decodeAlphaTest(params.renderTargets?.colorControl ?? 0) ?? null;
-        const convertColor0ToGamma = (() => {
-          const rs = globalThis.XenonGpuRenderState;
-          if (!rs || !params.renderTargets) return false;
-          try { return rs.decodeColorInfo(params.renderTargets.colorInfo0 ?? 0).format === 1; } catch { return false; }
-        })();
+        // format nibble of RB_COLOR_INFO at bits 16-19 (1 = k_8_8_8_8_GAMMA);
+        // read the field directly — the full decode runs (memoized) right after.
+        const convertColor0ToGamma = (((params.renderTargets?.colorInfo0 ?? 0) >>> 16) & 0xF) === 1;
         const program = this._translateProgram(code, psCode, alphaTest, convertColor0ToGamma);
 
         // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
