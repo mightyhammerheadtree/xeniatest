@@ -132,7 +132,8 @@
       format,
       formatName: COLOR_FORMAT_NAMES[format] ?? `0x${format.toString(16)} (unrecognized)`,
       componentCount: COLOR_FORMAT_COMPONENTS[format] ?? 4,
-      expBias: (v >>> 20) & 0x3F,
+      // 6-bit signed exponent (xenia's `int32_t color_exp_bias : 6`) — sign-extend.
+      expBias: (() => { const b = (v >>> 20) & 0x3F; return b & 0x20 ? b - 0x40 : b; })(),
     };
   }
 

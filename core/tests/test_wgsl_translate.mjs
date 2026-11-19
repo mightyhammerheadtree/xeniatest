@@ -1237,3 +1237,56 @@ test('pixel shader: PWL segment math (validated as WGSL, values checked by hand)
   assert.equal(pwl(512 / 1023), Math.trunc((512 / 1023) * (1023 / 8)) / 255 + 128 / 255);
   assert.equal(pwl(0.5), Math.trunc(0.5 * (1023 / 4)) / 255 + 64 / 255);
 });
+
+// ================================================================ color_exp_bias (RB_COLOR_INFO bits 20-25, signed 6-bit)
+test('pixel shader: colorExpBias emits a full-register 2^bias multiply, after the discard, Dawn-valid', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { colorExpBias: 3 });
+  assert.match(out.wgsl, /out\.color0 = out\.color0 \* vec4f\(8\.0000000000e\+0\);/);
+  assert.equal(out.colorExpBias, 3);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: negative exponent produces 1/2^|bias|', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { colorExpBias: -2 });
+  assert.match(out.wgsl, /out\.color0 = out\.color0 \* vec4f\(2\.5000000000e\-1\);/);
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: bias 0 (default) emits nothing; |bias| is clamped to [-32, 31]', async () => {
+  const plain = T.translatePixelShader(PS_CONST());
+  assert.match(plain.wgsl, /vec4f\(/); // sanity that the module built
+  assert.doesNotMatch(plain.wgsl, /out\.color0 = out\.color0 \* vec4f\(/);
+  assert.equal(plain.colorExpBias, 0);
+  const clamped = T.translatePixelShader(PS_CONST(), { colorExpBias: 77 });
+  assert.equal(clamped.colorExpBias, 31);
+  await assertValidWgsl(clamped.wgsl);
+});
+
+test('pixel shader: bias runs AFTER the alpha-test discard (xenia order) and BEFORE gamma', async () => {
+  const out = T.translatePixelShader(PS_CONST(), { colorExpBias: 2, alphaTest: { compare: 2 }, convertColor0ToGamma: true });
+  const discardIdx = out.wgsl.indexOf('discard');
+  const biasIdx = out.wgsl.indexOf('out.color0 = out.color0 * vec4f(');
+  const gammaIdx = out.wgsl.indexOf('vec4f(xenosGamma');
+  assert.ok(discardIdx >= 0 && biasIdx > discardIdx, 'bias multiply after discard');
+  assert.ok(gammaIdx > biasIdx, 'gamma encode after bias multiply');
+  // alpha is scaled too (xenia OpMul covers all lanes — the alpha test already used the unbiased alpha)
+  await assertValidWgsl(out.wgsl);
+});
+
+test('pixel shader: PS without an oC0 export ignores colorExpBias entirely', async () => {
+  const DEAD = shader(
+    cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+    aluWords({ vectorDest: 3, vectorOpcode: 2, vectorWriteMask: 0xF, src: [temp(1), temp(1), temp(1)] }),
+  );
+  const out = T.translatePixelShader(DEAD, { colorExpBias: 4 });
+  assert.equal(out.colorExpBias, 0);
+  assert.doesNotMatch(out.wgsl, /vec4f\(1\.6000000000e\+1\)/);
+});
+
+test('translateShaderProgram: colorExpBias surfaces in the program result', async () => {
+  const program = T.translateShaderProgram(VS_EXPORT_7(), PS_READ_R7(), { colorExpBias: -5 });
+  assert.equal(program.colorExpBias, -5);
+  assert.equal(program.fragment.colorExpBias, -5);
+  await assertValidWgsl(program.vertex.wgsl);
+  await assertValidWgsl(program.fragment.wgsl);
+});

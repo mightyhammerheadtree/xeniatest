@@ -822,3 +822,33 @@ test('traps: a 4x-MSAA guest render target refuses to draw (single-sampled canva
     () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
     /4x MSAA/);
 });
+
+test('color_exp_bias: the translated PS scales oC0 by 2^bias (all lanes) and the draw runs', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS_ADD, dwords: PS_ADD.length };
+  // RB_COLOR_INFO: format 0 (k_8_8_8_8), exp_bias = 3 at bits 20+
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 3 << 20 }) }));
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.match(fsModule.code, /out\.color0 = out\.color0 \* vec4f\(8\.0000000000e\+0\);/);
+
+  // distinct pipeline for bias 0 (eb is part of the cache keys)
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  assert.equal(log.pipelines.length, 2, 'bias is part of the pipeline translation key');
+  const unbiased = log.modules[log.modules.length - 1];
+  assert.doesNotMatch(unbiased.code, /out\.color0 = out\.color0 \* vec4f\(/);
+});
+
+test('color_exp_bias: negative exponent decodes signed through the whole stack (CP-format snapshot)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS_ADD, dwords: PS_ADD.length };
+  // 0b111110 << 20 = 0x3E00000 → expBias = -2 → scale 0.25
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0x3E00000 }) }));
+  const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
+  assert.match(fsModule.code, /out\.color0 = out\.color0 \* vec4f\(2\.5000000000e\-1\);/);
+});

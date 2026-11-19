@@ -101,6 +101,8 @@
   }
   /** Cache-key fragment: alpha test compare function (translation-time decision). */
   function alphaTestKey(program) { return program && program.alphaTest ? String(program.alphaTest.compare) : '0'; }
+  /** Cache-key fragment: color_exp_bias exponent (baked as a literal into the WGSL). */
+  function expBiasKey(program) { return program && Number.isFinite(program.colorExpBias) ? String(program.colorExpBias | 0) : '0'; }
   /** Cache-key fragment: gamma encode presence. */
   function convertKey(program) { return program && program.convertColor0ToGamma ? '1' : '0'; }
   /** Cache-key fragment: the PS statically exports oC0 (pipeline write mask depends on it). */
@@ -463,10 +465,11 @@
      * stage is null when no pixel shader is loaded (the caller binds the
      * bring-up FS then). Loud on any unsupported construct.
      */
-    _translateProgram(vsCode, psCode, alphaTest, convertColor0ToGamma = false) {
+    _translateProgram(vsCode, psCode, alphaTest, convertColor0ToGamma = false, colorExpBias = 0) {
       const atKey = alphaTest ? `at${alphaTest.compare}` : 'at-';
       const gKey = convertColor0ToGamma ? 'g1' : 'g0';
-      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + '|' + atKey + '|' + gKey;
+      const bKey = `eb${Math.max(-32, Math.min(31, colorExpBias | 0))}`;
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + '|' + atKey + '|' + gKey + '|' + bKey;
       let perVs = this.programMemo.get(vsCode);
       if (!perVs) {
         perVs = new Map();
@@ -477,7 +480,7 @@
       const TX = globalThis.XenonGpuTranslate;
       if (!TX) throw new XenosWebGpuError('XenonGpuTranslate is not loaded — public/js/gpu/wgsl_translate.js must be loaded before the backend builds a draw pipeline');
       try {
-        pair = TX.translateShaderProgram(vsCode, psCode, { alphaTest: alphaTest ?? undefined, convertColor0ToGamma });
+        pair = TX.translateShaderProgram(vsCode, psCode, { alphaTest: alphaTest ?? undefined, convertColor0ToGamma, colorExpBias });
       } catch (e) {
         const name = e && e.constructor && e.constructor.name ? e.constructor.name : 'Error';
         const detail = e && e.message ? e.message : String(e);
@@ -675,7 +678,7 @@
         perShader = new Map();
         this.translatedPipelines.set(vsCode, perShader);
       }
-      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}`;
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}eb${expBiasKey(program)}`;
       const rtKey = rtState ? rtState.key : 'rt:none';
       const layoutKey = `${pairKey}|${topology}:${this.format}:${rtKey}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
@@ -810,7 +813,10 @@
         // format nibble of RB_COLOR_INFO at bits 16-19 (1 = k_8_8_8_8_GAMMA);
         // read the field directly — the full decode runs (memoized) right after.
         const convertColor0ToGamma = (((params.renderTargets?.colorInfo0 ?? 0) >>> 16) & 0xF) === 1;
-        const program = this._translateProgram(code, psCode, alphaTest, convertColor0ToGamma);
+        // 6-bit signed exponent at RB_COLOR_INFO bits 20-25 (xenia's int32_t :6, sign-extended)
+        let colorExpBias = ((params.renderTargets?.colorInfo0 ?? 0) >>> 20) & 0x3F;
+        if (colorExpBias & 0x20) colorExpBias -= 0x40;
+        const program = this._translateProgram(code, psCode, alphaTest, convertColor0ToGamma, colorExpBias);
 
         // The fetch plan is memoized per (code, fetch-constants snapshot); the upload path is content-addressed.
         if (!params.vertexFetchConstants && program.vertex.inputLocations.length > 0) {

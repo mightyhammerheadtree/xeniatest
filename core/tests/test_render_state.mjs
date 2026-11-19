@@ -355,3 +355,11 @@ test('render-target snapshot without RB_SURFACE_INFO refuses to draw (MSAA decis
   delete noSurface.surfaceInfo;
   assert.throws(() => RS.buildRenderTargetState(noSurface, { psExportsColor0: true }), /RB_SURFACE_INFO/);
 });
+
+test('decodeColorInfo decodes color_exp_bias as a SIGNED 6-bit field (xenia int32_t :6)', () => {
+  const bias = (v) => RS.decodeColorInfo(v << 20).expBias;
+  assert.equal(bias(3), 3);
+  assert.equal(bias(-2 & 0x3F), -2, '0b111110 decodes as -2, not 62');
+  assert.equal(bias(0x20), -32, '0b100000 is -32');
+  assert.equal(bias(0x1F), 31);
+});
