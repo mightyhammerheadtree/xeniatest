@@ -25,7 +25,7 @@ globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
 
 // ------------------------------------------------------------ microcode fixture
 function execCf(address, count, sequence, opcode = 2) {
-  return { dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: opcode & 0xF };
+  return { dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: (opcode & 0xF) << 12 };
 }
 const NOP_CF = { dword0: 0, dword1: 0 };
 function cfPair(a, b) {

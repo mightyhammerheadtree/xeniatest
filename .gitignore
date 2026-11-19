@@ -20,3 +20,7 @@ __pycache__/
 # not part of the build, kept locally
 .xenia-ref/
 .hedge-ref/
+
+# xenia GPU-shader reference sources used to write the ucode→WGSL translator
+# (BSD-3); not part of the build, kept locally
+.ref-xenia/

@@ -11,7 +11,7 @@ const VF = globalThis.XenonGpuVertexFetch;
 
 // ---------------------------------------------------------------- ucode helpers
 function execCf(address, count, sequence, opcode = 2 /* kExecEnd */) {
-  return { dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: opcode & 0xF };
+  return { dword0: (address & 0xFFF) | ((count & 0x7) << 12) | ((sequence & 0xFFF) << 16), dword1: (opcode & 0xF) << 12 };
 }
 const NOP_CF = { dword0: 0, dword1: 0 };
 function cfPair(a, b) {
