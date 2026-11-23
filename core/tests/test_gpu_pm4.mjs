@@ -246,6 +246,53 @@ test('WAIT_REG_MEM evaluates xenia\'s comparison and refuses loudly when it woul
     0x00000010 | 0x00000003, GUEST_ADDR, 0xdeadbeef, 0xffffffff, 0x00000000]));
 });
 
+test('COND_WRITE performs xenia\'s conditional write to a register', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2104, 1), 0x00001234]));
+  // wait_info = 0x03 (equal), poll register 0x2104, reference 0x1234, mask all.
+  const packet = (ref, dest, data) => beWords([
+    PM4.makePacketType3(PM4.PM4_OPCODE.PM4_COND_WRITE, 6),
+    0x00000003, 0x00002104, ref >>> 0, 0xffffffff, dest >>> 0, data >>> 0,
+  ]);
+  // The condition holds → the register is written.
+  cp.executeCommandBuffer(packet(0x00001234, 0x00002110, 0xdeadbeef));
+  assert.equal(cp.registers.read(0x2110), 0xdeadbeef);
+  // The condition does not hold → nothing is written (xenia's "if (matched)").
+  cp.executeCommandBuffer(packet(0x00005678, 0x00002110, 0xfeedface));
+  assert.equal(cp.registers.read(0x2110), 0xdeadbeef, 'the register kept its value');
+});
+
+test('COND_WRITE performs xenia\'s conditional write to memory', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  guest.writeU32BE(GUEST_ADDR, 0x00001234);
+  // Poll memory (wait_info bit 4), write memory (wait_info bit 8).
+  // The *poll* address carries the endianness of the polled value (kNone
+  // here: the plain dword), the *write* address the endianness of the
+  // stored value (k8in32 = 2: the bytes are swapped).
+  cp.executeCommandBuffer(beWords([
+    PM4.makePacketType3(PM4.PM4_OPCODE.PM4_COND_WRITE, 6),
+    0x00000010 | 0x00000100 | 0x00000003, GUEST_ADDR, 0x1234, 0xffffffff, GUEST_ADDR | 2, 0xdeadbeef,
+  ]));
+  const write = backend.calls.find((c) => c.kind === 'memWrite');
+  assert.ok(write, 'the memory was written');
+  assert.equal(write.addr, GUEST_ADDR);
+  // xenia: GpuSwap(write_data, k8in32) then a plain store → byte-swapped.
+  assert.equal(new DataView(write.bytes.buffer).getUint32(0, false), 0xefbeadde);
+});
+
+test('COND_EXEC still traps loudly (xenia has no case for it either — its default asserts)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_COND_EXEC, 6), 0, 0, 0, 0, 0, 0])),
+    /conditional execution is not implemented/);
+});
+
 test('EVENT_WRITE_EXT writes xenia\'s screen extent (six 16-bit values) to guest memory', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);

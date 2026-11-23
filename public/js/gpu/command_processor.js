@@ -399,9 +399,8 @@
           // conditional execution based on a register/memory compare — not yet modeled; trap loudly
           throw new XenosGpuError('PM4_COND_EXEC: conditional execution is not implemented (xenia models it; port the compare logic before enabling)');
         }
-        case op.PM4_COND_WRITE: {
-          throw new XenosGpuError('PM4_COND_WRITE: conditional write is not implemented');
-        }
+        case op.PM4_COND_WRITE:
+          return this._condWrite(u32s, start, end, parsed.opcodeName);
         case op.PM4_WAIT_REG_MEM:
           return this._waitRegMem(u32s, start, end, parsed.opcodeName);
         case op.PM4_WAIT_REG_EQ:
@@ -465,50 +464,105 @@
       const addrWord = u32s[start + 1] >>> 0;
       const ref = u32s[start + 2] >>> 0;
       const mask = u32s[start + 3] >>> 0;
-      let value;
-      let source;
+      const value = this._readWaitValue(waitInfo, addrWord, opcodeName);
+      const source = (waitInfo & 0x10)
+        ? `memory 0x${((addrWord & ~0x3) >>> 0).toString(16)}`
+        : `register 0x${(addrWord >>> 0).toString(16)}`;
+      const matched = this._compareWaitValue(waitInfo, value, ref, mask);
+      if (!matched) {
+        throw new XenosGpuError(
+          `${opcodeName}: the wait condition is not met — ${source} holds 0x${value.toString(16).toUpperCase()} ` +
+          `(masked 0x${((value & mask) >>> 0).toString(16).toUpperCase()}), the reference is 0x${ref.toString(16).toUpperCase()} ` +
+          `(compare 0x${(waitInfo & 0x7).toString(16)}). xenia polls in a loop and blocks until it matches; this port ` +
+          'cannot block (the command ring is consumed inline), so it refuses instead of pretending the wait succeeded');
+      }
+      return end;
+    }
+
+    /**
+     * xenia's wait comparison (WAIT_REG_MEM and COND_WRITE share it):
+     * wait_info bits 0:2 select never/less/less-equal/equal/not-equal/
+     * greater-equal/greater/always, and the reference is compared against the
+     * *masked* value.
+     */
+    _compareWaitValue(waitInfo, value, ref, mask) {
+      const masked = (value & mask) >>> 0;
+      switch (waitInfo & 0x7) {
+        case 0x0: return false; // never
+        case 0x1: return masked < ref; // less than
+        case 0x2: return masked <= ref; // less than or equal
+        case 0x3: return masked === ref; // equal
+        case 0x4: return masked !== ref; // not equal
+        case 0x5: return masked >= ref; // greater than or equal
+        case 0x6: return masked > ref; // greater than
+        case 0x7: return true; // always
+        default: return false;
+      }
+    }
+
+    /**
+     * Read the value xenia's WAIT_REG_MEM/COND_WRITE poll: a register, or a
+     * memory location (wait_info bit 4) whose address's low 2 bits carry the
+     * GpuSwap endianness.
+     */
+    _readWaitValue(waitInfo, addrWord, opcodeName) {
       if (waitInfo & 0x10) {
-        // Memory: the address's low 2 bits carry the endianness (xenia).
         const endianness = addrWord & 0x3;
         const address = (addrWord & ~0x3) >>> 0;
         if (!this.readGuestMemory) {
-          throw new XenosGpuError(`${opcodeName}: waiting on a memory location needs readGuestMemory() to be wired to guest physical memory`);
+          throw new XenosGpuError(`${opcodeName}: reading memory needs readGuestMemory() to be wired to guest physical memory`);
         }
         const view = this.readGuestMemory(address);
         if (!view || view.byteLength < 4) {
           throw new XenosGpuError(`${opcodeName}: memory location 0x${address.toString(16)} is not readable`);
         }
-        value = pm4().gpuSwap32(view.getUint32(0, false), endianness);
-        source = `memory 0x${address.toString(16)}`;
+        return pm4().gpuSwap32(view.getUint32(0, false), endianness);
+      }
+      const index = addrWord >>> 0;
+      // xenia: assert_true(poll_reg_addr < RegisterFile::kRegisterCount = 0x5003).
+      if (index >= 0x5003) {
+        throw new XenosGpuError(`${opcodeName}: register index 0x${index.toString(16)} is outside the register file`);
+      }
+      return this.registers.read(index) >>> 0;
+    }
+
+    /**
+     * xenia's PM4_COND_WRITE: a conditional write to a register or to memory.
+     * The value is polled (a register, or a memory location when wait_info
+     * bit 4 is set) and compared with xenia's rules; when it matches, the
+     * payload is written to the destination (memory when wait_info bit 8 is
+     * set, a register otherwise).
+     */
+    _condWrite(u32s, start, end, opcodeName) {
+      if (end - start < 6) {
+        throw new XenosGpuError(`${opcodeName}: expected 6 payload dwords (wait_info, address, reference, mask, destination, data)`);
+      }
+      const waitInfo = u32s[start] >>> 0;
+      const pollAddr = u32s[start + 1] >>> 0;
+      const ref = u32s[start + 2] >>> 0;
+      const mask = u32s[start + 3] >>> 0;
+      const destAddrWord = u32s[start + 4] >>> 0;
+      const data = u32s[start + 5] >>> 0;
+      const value = this._readWaitValue(waitInfo, pollAddr, opcodeName);
+      if (!this._compareWaitValue(waitInfo, value, ref, mask)) return end;
+      if (waitInfo & 0x100) {
+        // Memory destination; the address's low 2 bits carry the endianness
+        // (xenia: GpuSwap(write_data, endianness) then a plain store).
+        const endianness = destAddrWord & 0x3;
+        const address = (destAddrWord & ~0x3) >>> 0;
+        const bytes = new Uint8Array(4);
+        new DataView(bytes.buffer).setUint32(0, pm4().gpuSwap32(data >>> 0, endianness), false);
+        backendOrTrap(this.backend, 'memWrite', opcodeName)(address >>> 0, bytes);
+        this.stats.memWriteBytes += 4;
       } else {
-        // Register.
-        const index = addrWord >>> 0;
-        // xenia: assert_true(poll_reg_addr < RegisterFile::kRegisterCount = 0x5003).
+        // Register destination. xenia's WriteRegister drops an out-of-range
+        // index with a warning instead of writing it.
+        const index = destAddrWord >>> 0;
         if (index >= 0x5003) {
-          throw new XenosGpuError(`${opcodeName}: register index 0x${index.toString(16)} is outside the register file`);
+          this.log('warn', `${opcodeName}: register index 0x${index.toString(16)} is outside the register file — the write is dropped`);
+        } else {
+          this._writeRegister(index, data >>> 0);
         }
-        value = this.registers.read(index) >>> 0;
-        source = `register 0x${index.toString(16)}`;
-      }
-      const masked = (value & mask) >>> 0;
-      let matched;
-      switch (waitInfo & 0x7) {
-        case 0x0: matched = false; break; // never
-        case 0x1: matched = masked < ref; break; // less than
-        case 0x2: matched = masked <= ref; break; // less than or equal
-        case 0x3: matched = masked === ref; break; // equal
-        case 0x4: matched = masked !== ref; break; // not equal
-        case 0x5: matched = masked >= ref; break; // greater than or equal
-        case 0x6: matched = masked > ref; break; // greater than
-        case 0x7: matched = true; break; // always
-        default: matched = false; break;
-      }
-      if (!matched) {
-        throw new XenosGpuError(
-          `${opcodeName}: the wait condition is not met — ${source} holds 0x${value.toString(16).toUpperCase()} ` +
-          `(masked 0x${masked.toString(16).toUpperCase()}), the reference is 0x${ref.toString(16).toUpperCase()} ` +
-          `(compare 0x${(waitInfo & 0x7).toString(16)}). xenia polls in a loop and blocks until it matches; this port ` +
-          'cannot block (the command ring is consumed inline), so it refuses instead of pretending the wait succeeded');
       }
       return end;
     }
