@@ -65,7 +65,13 @@ test('end-to-end: command processor + backend without a GPU — registers update
   // program register 0x2104 via a properly encoded type-0 packet
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   {
-    const words = [PM4.makePacketType0(0x2104, 1), 0xffffffff];
+    // RB_MODECONTROL = kColorDepth and a non-zero RB_SURFACE_INFO.surface_pitch
+    // so the draw is not ignored (xenia's IssueDraw gate).
+    const words = [
+      PM4.makePacketType0(0x2208, 1), 0x00000004,
+      PM4.makePacketType0(0x2000, 1), 0x00001000,
+      PM4.makePacketType0(0x2104, 1), 0xffffffff,
+    ];
     const buf = new Uint8Array(words.length * 4);
     const view = new DataView(buf.buffer);
     words.forEach((w, i) => view.setUint32(i * 4, w >>> 0, false));

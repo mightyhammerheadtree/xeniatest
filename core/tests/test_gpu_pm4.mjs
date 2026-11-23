@@ -46,6 +46,19 @@ function makeCP(guest, backend) {
   return new XenosCommandProcessor({ backend, readGuestMemory: guest.readGuestMemory, writeGuestMemory: guest.writeGuestMemory });
 }
 
+/**
+ * Put the command processor into xenia's ordinary color+depth draw mode.
+ * xenia's IssueDraw ignores a draw while RB_MODECONTROL.edram_mode is
+ * kIgnore (0 — the reset value) and while RB_SURFACE_INFO.surface_pitch is 0
+ * ("doesn't actually draw"), so a guest that wants its draws rasterized
+ * programs both registers.
+ */
+function enableDraws(cp) {
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000004])); // RB_MODECONTROL = kColorDepth
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2000, 1), 0x00001000])); // RB_SURFACE_INFO.surface_pitch = 0x1000
+  return cp;
+}
+
 /** Encode padded list of dwords as BE bytes. */
 function beWords(words) {
   const buf = new Uint8Array(words.length * 4);
@@ -182,7 +195,7 @@ test('REG_RMW supports immediate and register operands', () => {
   assert.equal(cp.registers.read(0x0040), 0x0f0fffff);
 });
 
-test('EVENT_WRITE with address writes the payload and increments the counter', () => {
+test('EVENT_WRITE_SHD writes the payload; the counter bit writes the GPU frame counter', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
   const cp = makeCP(guest, backend);
@@ -192,7 +205,112 @@ test('EVENT_WRITE with address writes the payload and increments the counter', (
   assert.equal(cp.registers.read(0x21f9), 0x00000005, 'VGT_EVENT_INITIATOR written');
   // counter bit: initiator with 0x80000000 writes the GPU counter instead of the payload
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_SHD, 2), 0x80000000 | 0x05, GUEST_ADDR]));
-  assert.equal(guest.readU32BE(GUEST_ADDR), 1, 'counter value written back after first event');
+  assert.equal(guest.readU32BE(GUEST_ADDR), 0, 'the frame counter starts at 0');
+});
+
+test('the GPU frame counter is bumped by the swap (xenia: ++counter_ in PM4_XE_SWAP)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // xenia's swap packet starts with the 'SWAP' magic.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_XE_SWAP, 4), 0x53574150, 0, 0, 0]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'swap').length, 1);
+  // The counter bit of EVENT_WRITE_SHD now writes 1.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_SHD, 2), 0x80000000 | 0x05, GUEST_ADDR]));
+  assert.equal(guest.readU32BE(GUEST_ADDR), 1, 'the counter was bumped by the swap');
+  // A second swap bumps it again.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_XE_SWAP, 4), 0x53574150, 0, 0, 0]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_SHD, 2), 0x80000000 | 0x05, GUEST_ADDR]));
+  assert.equal(guest.readU32BE(GUEST_ADDR), 2);
+});
+
+test('WAIT_REG_MEM evaluates xenia\'s comparison and refuses loudly when it would have to block', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // Register case: wait until register 0x2104 (RB_COLOR_MASK) == 0x1234.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2104, 1), 0x00001234]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+    0x00000003 /* compare: equal */, 0x00002104, 0x00001234, 0xffffffff, 0x00000000]));
+  // The comparison is not met → xenia would block; this port refuses loudly.
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+      0x00000003, 0x00002104, 0x00005678, 0xffffffff, 0x00000000])),
+    /wait condition is not met/);
+  // ... and a satisfied condition passes.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+    0x00000003, 0x00002104, 0x00001234, 0xffffffff, 0x00000000]));
+  // The memory case reads guest memory with the address's endianness.
+  guest.writeU32BE(GUEST_ADDR, 0xdeadbeef);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+    0x00000010 | 0x00000003, GUEST_ADDR, 0xdeadbeef, 0xffffffff, 0x00000000]));
+});
+
+test('COND_WRITE performs xenia\'s conditional write to a register', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2104, 1), 0x00001234]));
+  // wait_info = 0x03 (equal), poll register 0x2104, reference 0x1234, mask all.
+  const packet = (ref, dest, data) => beWords([
+    PM4.makePacketType3(PM4.PM4_OPCODE.PM4_COND_WRITE, 6),
+    0x00000003, 0x00002104, ref >>> 0, 0xffffffff, dest >>> 0, data >>> 0,
+  ]);
+  // The condition holds → the register is written.
+  cp.executeCommandBuffer(packet(0x00001234, 0x00002110, 0xdeadbeef));
+  assert.equal(cp.registers.read(0x2110), 0xdeadbeef);
+  // The condition does not hold → nothing is written (xenia's "if (matched)").
+  cp.executeCommandBuffer(packet(0x00005678, 0x00002110, 0xfeedface));
+  assert.equal(cp.registers.read(0x2110), 0xdeadbeef, 'the register kept its value');
+});
+
+test('COND_WRITE performs xenia\'s conditional write to memory', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  guest.writeU32BE(GUEST_ADDR, 0x00001234);
+  // Poll memory (wait_info bit 4), write memory (wait_info bit 8).
+  // The *poll* address carries the endianness of the polled value (kNone
+  // here: the plain dword), the *write* address the endianness of the
+  // stored value (k8in32 = 2: the bytes are swapped).
+  cp.executeCommandBuffer(beWords([
+    PM4.makePacketType3(PM4.PM4_OPCODE.PM4_COND_WRITE, 6),
+    0x00000010 | 0x00000100 | 0x00000003, GUEST_ADDR, 0x1234, 0xffffffff, GUEST_ADDR | 2, 0xdeadbeef,
+  ]));
+  const write = backend.calls.find((c) => c.kind === 'memWrite');
+  assert.ok(write, 'the memory was written');
+  assert.equal(write.addr, GUEST_ADDR);
+  // xenia: GpuSwap(write_data, k8in32) then a plain store → byte-swapped.
+  assert.equal(new DataView(write.bytes.buffer).getUint32(0, false), 0xefbeadde);
+});
+
+test('COND_EXEC still traps loudly (xenia has no case for it either — its default asserts)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_COND_EXEC, 6), 0, 0, 0, 0, 0, 0])),
+    /conditional execution is not implemented/);
+});
+
+test('EVENT_WRITE_EXT writes xenia\'s screen extent (six 16-bit values) to guest memory', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // The address carries the k8in16 endianness (xenia asserts it).
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_EXT, 2), 0x00000005, GUEST_ADDR | 1]));
+  assert.equal(cp.registers.read(0x21f9), 0x00000005, 'VGT_EVENT_INITIATOR written');
+  const write = backend.calls.find((c) => c.kind === 'memWrite');
+  assert.ok(write, 'the screen extent was written to guest memory');
+  assert.equal(write.addr, GUEST_ADDR);
+  // xenia: {0>>3, 2560>>3, 0>>3, 2560>>3, 0, 1} with the bytes of each half
+  // word swapped (k8in16).
+  const expected = new Uint8Array(12);
+  [0, 320, 0, 320, 0, 1].forEach((v, i) => {
+    expected[i * 2] = (v >>> 8) & 0xff;
+    expected[i * 2 + 1] = v & 0xff;
+  });
+  assert.deepEqual(Array.from(write.bytes), Array.from(expected));
 });
 
 test('EVENT_WRITE maps the writeback window through WRITEBACK_START/SIZE', () => {
@@ -211,29 +329,48 @@ test('EVENT_WRITE maps the writeback window through WRITEBACK_START/SIZE', () =>
 test('DRAW_INDX (indexed, DMA) decodes the initiator and notifies the backend', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   const numIndices = 0x00f0;
   const primType = PM4.PRIMITIVE_TYPE.kTriangleList;
   const sourceSelect = PM4.SOURCE_SELECT.kDMA;
   const initiator = ((numIndices & 0xffff) << 16) | (0 << 12) | (0 << 11) | (sourceSelect << 6) | primType;
   const dmaBase = 0x00c00000; // GPU bus (29 bits)
-  const dmaSize = (6 & 0x00ffffff) | (2 << 30); // 6 words, k8in32
+  // xenia counts the declared index buffer in elements (index_buffer_info.length
+  // = num_words * index_size_bytes), so 0xF0 words cover the 0xF0 indices.
+  const dmaSize = (0xf0 & 0x00ffffff) | (2 << 30); // 0xF0 words, k8in32
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX, 4), 0x00000000 /* viz */, initiator, dmaBase, dmaSize]));
   const draws = backend.calls.filter((c) => c.kind === 'draw');
   assert.equal(draws.length, 1);
   assert.deepEqual(
     { primType: draws[0].primType, numIndices: draws[0].numIndices, isIndexed: draws[0].isIndexed, indexGuestBase: draws[0].indexGuestBase, indexFormat: draws[0].indexFormat, indexEndianness: draws[0].indexEndianness, indexLengthWords: draws[0].indexLengthWords, majorModeExplicit: draws[0].majorModeExplicit },
-    { primType: 4, numIndices: 0x00f0, isIndexed: true, indexGuestBase: 0x00c00000, indexFormat: 0, indexEndianness: 2, indexLengthWords: 6, majorModeExplicit: false },
+    { primType: 4, numIndices: 0x00f0, isIndexed: true, indexGuestBase: 0x00c00000, indexFormat: 0, indexEndianness: 2, indexLengthWords: 0xf0, majorModeExplicit: false },
   );
   assert.equal(cp.registers.read(0x21fc), initiator >>> 0, 'VGT_DRAW_INITIATOR written');
   assert.equal(cp.registers.read(0x21fa), 0x00c00000, 'VGT_DMA_BASE written');
   assert.equal(cp.stats.draws, 1);
 });
 
+test('DRAW_INDX clamps the index count to the declared VGT_DMA_SIZE range (xenia)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = enableDraws(makeCP(guest, backend));
+  const numIndices = 0x00f0;
+  const initiator = ((numIndices & 0xffff) << 16) | (PM4.SOURCE_SELECT.kDMA << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  // The index buffer only declares 6 elements, the draw asks for 0xF0.
+  const dmaSize = (6 & 0x00ffffff) | (0 << 30);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX, 4), 0x00000000 /* viz */, initiator, 0x00c00000, dmaSize]));
+  const draws = backend.calls.filter((c) => c.kind === 'draw');
+  assert.equal(draws.length, 1);
+  // xenia's primitive processor: "N vertices attempted to be drawn with an
+  // index buffer only containing M ... " -> the count is clamped to M.
+  assert.equal(draws[0].numIndices, 6, 'the draw is clamped to the declared index count');
+  assert.equal(draws[0].indexLengthWords, 6);
+});
+
 test('DRAW_INDX_2 (auto-index) draws without an index DMA', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleStrip;
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
   const draws = backend.calls.filter((c) => c.kind === 'draw');
@@ -245,7 +382,7 @@ test('DRAW_INDX_2 (auto-index) draws without an index DMA', () => {
 test('predicated packets are skipped while the bin predicate fails and execute when it passes', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   // mask = 0 → predicate fails
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_MASK, 2), 0x00000000, 0x00000000]));
@@ -257,6 +394,27 @@ test('predicated packets are skipped while the bin predicate fails and execute w
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_SELECT, 2), 0x00000000, 0x00000001]));
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1, /* predicate */ true), initiator]));
   assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 1, 'predicated draw executed');
+});
+
+test('a predicated swap is skipped even when the bin predicate passes (xenia: predicated swaps are never valid)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // mask = 1, select = 1 → the predicate passes
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_MASK, 2), 0x00000000, 0x00000001]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_SELECT, 2), 0x00000000, 0x00000001]));
+  const swapsBefore = backend.calls.filter((c) => c.kind === 'swap').length;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_XE_SWAP, 1, /* predicate */ true), 0x00000000]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'swap').length, swapsBefore, 'the predicated swap was skipped');
+});
+
+test('PM4_CONTEXT_UPDATE with a 0 payload is a no-op (xenia); a non-zero payload traps', () => {
+  const guest = makeGuest();
+  const cp = makeCP(guest, makeBackend(guest));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_CONTEXT_UPDATE, 1), 0x00000000]));
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_CONTEXT_UPDATE, 1), 0x00000001])),
+    /CONTEXT_UPDATE/);
 });
 
 test('IM_LOAD_IMMEDIATE loads a shader and reports it to the backend', () => {
@@ -305,7 +463,7 @@ test('PM4_XE_SWAP calls backend.swap (frame boundary)', () => {
 
 test('draw without a backend trap: clear error naming the missing method', () => {
   const guest = makeGuest();
-  const cp = new XenosCommandProcessor({ readGuestMemory: guest.readGuestMemory }); // no backend
+  const cp = enableDraws(new XenosCommandProcessor({ readGuestMemory: guest.readGuestMemory })); // no backend
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   assert.throws(() => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator])), (e) => /backend does not implement draw\(\)/.test(e.message));
 });
@@ -313,7 +471,7 @@ test('draw without a backend trap: clear error naming the missing method', () =>
 test('draw packet snapshots ALU and bool constants from the register file', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   // SET_CONSTANT ALU index 0: two dwords (1.0f, 2.0f bits) — packet has 3 payload dwords (index + 2)
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_CONSTANT, 3), 0, 0x3f800000, 0x40000000]));
   // SET_CONSTANT BOOL index 4: value with bit for bool 4
@@ -334,7 +492,7 @@ test('draw packet snapshots ALU and bool constants from the register file', () =
 test('draw packet snapshots the RB_* render-target registers from the register file', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   // Write the render-target registers via direct context-register writes (index base 0x2000).
   // RB_COLOR_INFO (0x2001): format 5 (k_16_16_16_16) at +16, base 0x42.
   // RB_COLOR_MASK (0x2104): 0xA5A5A5A5.
@@ -402,13 +560,97 @@ test('PA_SC_VIZ_QUERY ena without kill (or kill without ena) still draws (xenia 
   for (const viz of [0x01, 0x80, 0x00]) {
     const guest = makeGuest();
     const backend = makeBackend(guest);
-    const cp = makeCP(guest, backend);
+    const cp = enableDraws(makeCP(guest, backend));
     const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
     setReg(0x2293, viz);
     const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
     cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
     assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 1, `PA_SC_VIZ_QUERY=0x${viz.toString(16)} must still draw`);
   }
+});
+
+test('RB_MODECONTROL gates the draw exactly like xenia (kIgnore / kCopy / kDepth)', () => {
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  // kIgnore (0, the reset value) → the draw is ignored (no fragments).
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000000]));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'a kIgnore draw never reaches the backend');
+  }
+  // kCopy (6) → the guest wants a render-target copy: this port cannot do it.
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000006]));
+    assert.throws(
+      () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator])),
+      /render-target copy/);
+  }
+  // kDepth (5) → depth only: the draw reaches the backend flagged as such.
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000005]));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    const draw = backend.calls.find((c) => c.kind === 'draw');
+    assert.ok(draw, 'the depth-only draw reached the backend');
+    assert.equal(draw.depthOnly, true);
+  }
+  // kColorDepth (4) → an ordinary draw.
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    const draw = backend.calls.find((c) => c.kind === 'draw');
+    assert.ok(draw);
+    assert.equal(draw.depthOnly, false);
+  }
+});
+
+test('a draw with RB_SURFACE_INFO.surface_pitch == 0 does not draw (xenia: "doesn\'t actually draw")', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = enableDraws(makeCP(guest, backend));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2000, 1), 0x00000000])); // surface_pitch = 0
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'the draw never reaches the backend');
+});
+
+test('the binned draw opcodes refuse loudly (tiled rendering is not implemented)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = enableDraws(makeCP(guest, backend));
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  // PM4_DRAW_INDX_BIN: viz query, draw indicator, bin base, bin size, dma base, dma size.
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([
+      PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_BIN, 6),
+      0x00000000, initiator, 0x00000000, 0x00000003, 0x00000000, 0x00000006,
+    ])),
+    /tiled rendering/);
+  // PM4_DRAW_INDX_2_BIN: draw indicator, bin base, bin size, dma base, dma size.
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([
+      PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2_BIN, 5),
+      initiator, 0x00000000, 0x00000003, 0x00000000, 0x00000006,
+    ])),
+    /tiled rendering/);
+  assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'no bin draw reached the backend');
+});
+
+test('SET_BIN_BASE_OFFSET is recorded (xenia does not implement the opcode either)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_BASE_OFFSET, 1), 0x00001234]));
+  assert.equal(cp.binBaseOffset, 0x1234);
 });
 
 test('PM4_VIZ_QUERY traps loudly (occlusion queries unimplemented — step 9)', () => {

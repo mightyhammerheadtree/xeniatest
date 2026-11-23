@@ -38,10 +38,19 @@
  *     loudly (they need the EDRAM render-target cache, step 7). k_8_8_8_8_GAMMA
  *     is honored by gamma-encoding oC0's RGB in the translated PS (xenia's RTV
  *     path); blending then happens on gamma-encoded values (same caveat as xenia).
- *   - kD24S8 depth maps to WebGPU depth24plus-stencil8. kD24FS8 (20e4 float
- *     depth) is not representable and traps.
- *   - RB_SURFACE_INFO.msaa_samples must be k1X — the canvas/depth attachments are
- *     single-sampled; 2x/4x guest MSAA traps (needs the EDRAM render-target cache, step 7).
+ *   - kD24S8 depth maps to WebGPU depth24plus-stencil8; kD24FS8 (20e4 float
+ *     depth) maps to depth32float — WebGPU's float depth format, which has no
+ *     stencil, so a guest that wants stencil with a float depth traps. The
+ *     precision differs (float32 vs the guest's float24); the compare/write
+ *     semantics and the z remap are the guest's.
+ *   - RB_SURFACE_INFO.msaa_samples selects the sample count of the frame's
+ *     attachments: k1X renders single-sampled, k4X renders into a multisampled
+ *     color and depth attachment whose resolve (a box filter over the samples)
+ *     produces the single-sample target — the same box filter xenia's EDRAM
+ *     resolve applies for "all samples". WebGPU's 4x sample positions are the
+ *     standard D3D ones (the spec mandates them), which are the positions
+ *     xenia's D3D12 host uses too. k2X TRAPS: WebGPU's sample count must be 1
+ *     or 4 (the spec's sample-count validation), and xenia's host supports 2x.
  *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST): xenia implements it in the
  *     pixel shader (OpDiscard), so it is honored exactly when the translated
  *     guest PS statically exports oC0 — discard against RB_ALPHA_REF (IEEE-754
@@ -117,6 +126,45 @@
   // Components that exist in each format (xenia GetColorRenderTargetFormatComponentCount).
   const COLOR_FORMAT_COMPONENTS = {
     0: 4, 1: 4, 2: 4, 3: 4, 4: 2, 5: 4, 6: 2, 7: 4, 10: 4, 12: 4, 14: 1, 15: 2,
+  };
+  // Guest color format → the WebGPU color target, following xenia's own host
+  // mapping (RenderTargetCache::GetColorDXGIFormat + GetBaseColorFormat):
+  //   k_8_8_8_8 / k_8_8_8_8_GAMMA → R8G8B8A8_UNORM (8-bit unorm RGBA)
+  //   k_2_10_10_10                  → R10G10B10A2_UNORM
+  //   k_2_10_10_10_FLOAT            → R16G16B16A16_FLOAT
+  //   k_16_16                       → R16G16_SNORM
+  //   k_16_16_16_16                 → R16G16B16A16_SNORM
+  //   k_16_16_FLOAT                 → R16G16_FLOAT
+  //   k_16_16_16_16_FLOAT           → R16G16B16A16_FLOAT
+  //   k_2_10_10_10_AS_10_10_10_10   → base k_2_10_10_10 (the extra alpha
+  //                                   planes are MRT — oC1..oC3, which the
+  //                                   translator traps on)
+  //   k_2_10_10_10_FLOAT_AS_16_16_16_16 → base k_2_10_10_10_FLOAT
+  //   k_32_FLOAT                    → R32_FLOAT
+  //   k_32_32_FLOAT                 → R32G32_FLOAT
+  // `webgpu: null` means the canvas format itself (the canvas is 8-bit unorm
+  // RGBA, so k_8_8_8_8 and k_8_8_8_8_GAMMA render straight into it).
+  // `channels` is the WebGPU channel mask (R=1, G=2, B=4, A=8) the format has —
+  // the guest's write mask is restricted to it (the absent channels do not
+  // exist on the hardware either).
+  // `blendable` follows the WebGPU texture-format table: r32float/rg32float
+  // are only blendable with the optional "float32-blendable" feature, which
+  // this port does not request (xenia's D3D12 host cannot blend them either).
+  // `tier1` marks the 16-bit snorm formats — WebGPU exposes them only with
+  // the optional "texture-formats-tier1" feature.
+  const COLOR_FORMAT_TARGET = {
+    0: { webgpu: null, channels: 0xF, blendable: true },
+    1: { webgpu: null, channels: 0xF, blendable: true },
+    2: { webgpu: 'rgb10a2unorm', channels: 0xF, blendable: true },
+    3: { webgpu: 'rgba16float', channels: 0xF, blendable: true },
+    4: { webgpu: 'rg16snorm', channels: 0x3, blendable: true, tier1: true },
+    5: { webgpu: 'rgba16snorm', channels: 0xF, blendable: true, tier1: true },
+    6: { webgpu: 'rg16float', channels: 0x3, blendable: true },
+    7: { webgpu: 'rgba16float', channels: 0xF, blendable: true },
+    10: { webgpu: 'rgb10a2unorm', channels: 0xF, blendable: true },
+    12: { webgpu: 'rgba16float', channels: 0xF, blendable: true },
+    14: { webgpu: 'r32float', channels: 0x1, blendable: false },
+    15: { webgpu: 'rg32float', channels: 0x3, blendable: false },
   };
 
   // xenos::BlendFactor → GPUBlendFactor (32 slots; unlisted values are zero,
@@ -301,7 +349,13 @@
     const depthBias = offset < 0 ? -bias : bias;
     const depthBiasSlopeScale = scale * K_POLY_OFFSET_SCALE_SUBPIXEL_UNIT;
 
-    return { cullMode, frontFace, depthBias, depthBiasSlopeScale, depthBiasClamp: 0, bothCull };
+    return {
+      cullMode, frontFace, depthBias, depthBiasSlopeScale, depthBiasClamp: 0, bothCull,
+      // xenia gates the culling (and therefore the back-face stencil state) on
+      // the primitive being two-faced; points/lines are never culled.
+      cullFront: primitivePolygonal ? cullFront : false,
+      cullBack: primitivePolygonal ? cullBack : false,
+    };
   }
 
   const PA_CL_CLIP_CNTL = 0x2204, PA_CL_VTE_CNTL = 0x2206, PA_SU_VTX_CNTL = 0x2302;
@@ -408,6 +462,7 @@
     h = fpMix(h, raw.paSuScModeCntl);
     h = fpMix(h, raw.paSuPolyOffsetFrontScale); h = fpMix(h, raw.paSuPolyOffsetFrontOffset);
     h = fpMix(h, raw.paSuPolyOffsetBackScale); h = fpMix(h, raw.paSuPolyOffsetBackOffset);
+    h = fpMix(h, raw.paClClipCntl === undefined ? -1 : raw.paClClipCntl);
     return h >>> 0;
   }
   // Exact field-by-field verification against the stored snapshot of normalized values.
@@ -426,7 +481,8 @@
       && a.paSuPolyOffsetFrontScale === (b.paSuPolyOffsetFrontScale >>> 0)
       && a.paSuPolyOffsetFrontOffset === (b.paSuPolyOffsetFrontOffset >>> 0)
       && a.paSuPolyOffsetBackScale === (b.paSuPolyOffsetBackScale >>> 0)
-      && a.paSuPolyOffsetBackOffset === (b.paSuPolyOffsetBackOffset >>> 0);
+      && a.paSuPolyOffsetBackOffset === (b.paSuPolyOffsetBackOffset >>> 0)
+      && a.paClClipCntl === (b.paClClipCntl === undefined ? -1 : b.paClClipCntl >>> 0);
   }
   /**
    * Build the WebGPU render-target state for one draw.
@@ -449,10 +505,13 @@
         'RB_STENCILREFMASK[_BF]/RB_BLEND_* at draw time; refusing to draw with fabricated render state');
     }
     const { psExportsColor0 = true, psExportsDepth = false, primitivePolygonal = false } = opts;
-    // --- RB_SURFACE_INFO: MSAA must be off (canvas/depth targets are single-sampled) ----
-    // msaa_samples at bits +16:2 (k1X=0, k2X=1, k4X=2) — xenia's RB_SURFACE_INFO.
-    // The scanout canvas and the depth24plus-stencil8 attachment are 1x; rendering
-    // guest-4x-MSAA state into them would silently drop sample shading/resolve, so trap.
+    // --- RB_SURFACE_INFO: the guest's MSAA sample count --------------------
+    // msaa_samples at bits +16:2 — xenia's RB_SURFACE_INFO (xenos::MsaaSamples:
+    // k1X=0, k2X=1, k4X=2; the field has no k8X, so 3 is invalid).
+    // The frame renders into a multisampled attachment of the same size as
+    // the target, and WebGPU's resolve (a box filter over the samples) writes
+    // the single-sample target — xenia's EDRAM resolve for "all samples" is a
+    // box filter over the sample planes too.
     const surfaceInfo = raw.surfaceInfo;
     if (surfaceInfo === undefined) {
       throw new XenosRenderStateError(
@@ -460,11 +519,19 @@
         'the command processor snapshots it at draw time; refusing to draw without the MSAA decision');
     }
     const msaaSamples = (surfaceInfo >>> 16) & 0x3;
-    if (msaaSamples !== 0) {
+    if (msaaSamples === 3) {
       throw new XenosRenderStateError(
-        `guest render target is configured for ${msaaSamples === 1 ? '2x' : '4x'} MSAA (RB_SURFACE_INFO.msaa_samples=${msaaSamples}) — ` +
-        'the canvas and the depth24plus-stencil8 attachment are single-sampled; MSAA needs the EDRAM render-target cache (step 7). Refusing to draw');
+        "RB_SURFACE_INFO.msaa_samples=3 — xenia's MsaaSamples has only k1X/k2X/k4X, so this is not a " +
+        'guest MSAA mode. Refusing to draw');
     }
+    if (msaaSamples === 1) {
+      // WebGPU's multisample count must be 1 or 4 (the spec's sample-count
+      // validation) — there is no 2x. xenia's D3D12 host supports k2X.
+      throw new XenosRenderStateError(
+        'guest render target is configured for 2x MSAA (RB_SURFACE_INFO.msaa_samples=1) — WebGPU only ' +
+        'supports a sample count of 1 or 4, so 2x coverage cannot be reproduced. Refusing to draw');
+    }
+    const sampleCount = msaaSamples === 0 ? 1 : 4;
     const flags = (psExportsColor0 ? 1 : 0) | ((psExportsDepth ? 1 : 0) << 1) | ((primitivePolygonal ? 1 : 0) << 2);
     const fp = fingerprintRaw(raw, flags);
     const bucket = rtFpCache.get(fp);
@@ -482,6 +549,7 @@
       raw.paSuScModeCntl >>> 0,
       raw.paSuPolyOffsetFrontScale >>> 0, raw.paSuPolyOffsetFrontOffset >>> 0,
       raw.paSuPolyOffsetBackScale >>> 0, raw.paSuPolyOffsetBackOffset >>> 0,
+      raw.paClClipCntl === undefined ? -1 : (raw.paClClipCntl >>> 0),
     ].join(',');
     const cached = rtDecodeCache.get(cacheKey);
     if (cached) return cached;
@@ -510,67 +578,83 @@
       alphaTest = { compare: alphaFunc, referenceDword: alphaRef >>> 0 };
     }
 
-    // --- RB_COLOR_INFO RT0: format must be representable when written ------
-    // k_8_8_8_8 (0) is the canvas format; k_8_8_8_8_GAMMA (1) is honored by
-    // gamma-encoding in the translated PS (xenia's RTV path; blending then
-    // happens on gamma-encoded values — same caveat as xenia). Everything else
-    // needs the EDRAM render-target cache (step 7) and traps.
+    // --- RB_COLOR_INFO RT0: the format decides the color attachment -------
+    // The guest's color format maps to a WebGPU color target exactly like
+    // xenia's host mapping (COLOR_FORMAT_TARGET above). k_8_8_8_8 and
+    // k_8_8_8_8_GAMMA are 8-bit unorm RGBA — the canvas format itself, so
+    // they render straight into the canvas; every other representable format
+    // renders into an offscreen texture with exactly that format (so the
+    // guest's writes are quantized and ranged like the hardware's), which the
+    // backend presents to the canvas with a blit at swap().
     const colorInfo0 = decodeColorInfo(raw.colorInfo0);
+    const colorTarget = COLOR_FORMAT_TARGET[colorInfo0.format] ?? null;
     if (psExportsColor0) {
-      if (colorInfo0.format !== 0 && colorInfo0.format !== 1) {
+      if (!colorTarget) {
         throw new XenosRenderStateError(
-          `render target 0 has format ${colorInfo0.formatName} — the only formats representable on the ` +
-          'scanout target today are k_8_8_8_8 and k_8_8_8_8_GAMMA; other formats need the EDRAM render-target cache (step 7). Refusing to draw');
+          `render target 0 has format ${colorInfo0.formatName} — no WebGPU color target represents it ` +
+          '(the 16-bit snorm formats need WebGPU\'s optional "texture-formats-tier1" feature, and the ' +
+          'remaining formats are not guest color formats at all). Refusing to draw');
+      }
+      if (colorTarget.tier1) {
+        throw new XenosRenderStateError(
+          `render target 0 has format ${colorInfo0.formatName} — WebGPU's ${colorTarget.webgpu} is an optional ` +
+          'format ("texture-formats-tier1") that this port does not request. Refusing to draw');
       }
     }
+    // The color attachment format: null = the canvas format (8-bit unorm RGBA).
+    const colorFormat = (colorTarget && !colorTarget.tier1) ? colorTarget.webgpu : null;
     // The gamma encode is a no-op unless the PS statically exports oC0 (the
     // translator enforces that itself); the flag records the RT's format.
     const convertColor0ToGamma = colorInfo0.format === 1;
 
-    // --- RB_DEPTH_INFO: D24S8 maps to depth24plus-stencil8; D24FS8 traps ----
+    // --- RB_DEPTH_INFO: D24S8 maps to depth24plus-stencil8; D24FS8 → depth32float ----
+    // xenia's D3D12 host uses a float depth format for the 20e4 depth target
+    // (the EDRAM clear/load/store shaders for kD24FS8 are float ones); WebGPU's
+    // float depth format (depth32float) has no stencil, so a guest that wants
+    // stencil with a float depth traps loudly.
     const depthInfo = decodeDepthInfo(raw.depthInfo);
     const depthControl = raw.depthControl >>> 0;
     const zEnable = (depthControl & 0x2) !== 0;
     const zWriteEnable = (depthControl & 0x4) !== 0;
     const stencilEnable = (depthControl & 0x1) !== 0;
     const backfaceEnable = (depthControl & 0x80) !== 0;
-    if (depthInfo.format === 1 && (zEnable || stencilEnable || psExportsDepth)) {
+    const floatDepth = depthInfo.format === 1;
+    if (floatDepth && stencilEnable) {
       throw new XenosRenderStateError(
-        'depth render target has format kD24FS8 (20e4 float depth) — not representable as depth24plus-stencil8; ' +
-        'the float24 depth path is part of the EDRAM render-target cache work (step 7). Refusing to draw');
+        'depth render target has format kD24FS8 (20e4 float depth) with stencil enabled — WebGPU has no float ' +
+        'depth format with a stencil plane (depth32float has none). Refusing to draw');
     }
 
     // --- stencil reference + masks (one pair per pass in WebGPU) -------------
+    // The guest has a separate reference/mask pair per face (RB_STENCILREFMASK
+    // and RB_STENCILREFMASK_BF); WebGPU (like D3D12 and Vulkan) has one per
+    // render pass. xenia's D3D12 host picks the pair that applies to the faces
+    // actually drawn: the back-face pair when the back-face stencil is enabled
+    // and the front faces are culled, the front pair otherwise.
     const stencilRefMask = raw.stencilRefMask >>> 0;
     const stencilRefMaskBf = raw.stencilRefMaskBf >>> 0;
-    const ref = stencilRefMask & 0xFF;
-    const refBf = stencilRefMaskBf & 0xFF;
-    if (stencilEnable && backfaceEnable) {
-      if (refBf !== ref) {
-        throw new XenosRenderStateError(
-          `stencil reference differs between front (0x${ref.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
-          `(0x${refBf.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — WebGPU has one stencil reference per render pass, ` +
-          'so the back faces would test against the wrong value. Refusing to draw');
-      }
-      const readMaskF = (stencilRefMask >>> 8) & 0xFF, readMaskB = (stencilRefMaskBf >>> 8) & 0xFF;
-      const writeMaskF = (stencilRefMask >>> 16) & 0xFF, writeMaskB = (stencilRefMaskBf >>> 16) & 0xFF;
-      if (readMaskB !== readMaskF || writeMaskB !== writeMaskF) {
-        throw new XenosRenderStateError(
-          `stencil read/write mask differs between front (stencilmask 0x${readMaskF.toString(16).padStart(2, '0')}, ` +
-          `writemask 0x${writeMaskF.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
-          `(stencilmask 0x${readMaskB.toString(16).padStart(2, '0')}, writemask 0x${writeMaskB.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — ` +
-          'WebGPU has one stencil read/write mask pair per render pass. Refusing to draw');
-      }
-    }
-
+    // The stencil reference for the pass (WebGPU has one per render pass).
+    let stencilRef = stencilRefMask & 0xFF;
     // --- write mask ---------------------------------------------------------
     const colorMask = raw.colorMask >>> 0;
-    const writeMask = normalizeWriteMask((colorMask >>> 0) & 0xF, colorInfo0.componentCount);
+    // The guest's mask, restricted to the channels the format actually has
+    // (the absent channels do not exist on the hardware either — xenia hands
+    // the raw nibble to D3D12, which ignores the bits the format lacks).
+    const writeMask = (normalizeWriteMask((colorMask >>> 0) & 0xF, colorInfo0.componentCount) &
+      (colorTarget ? colorTarget.channels : 0xF)) >>> 0;
 
     // --- blend --------------------------------------------------------------
     const blend0 = decodeBlendControl(raw.blendControl0);
     let blend = null;
     if (blendEnabled(blend0)) {
+      if (colorTarget && !colorTarget.blendable) {
+        // WebGPU: r32float/rg32float are only blendable with the optional
+        // "float32-blendable" feature. xenia's D3D12 host cannot blend these
+        // formats either (D3D12 requires a blendable format).
+        throw new XenosRenderStateError(
+          `render target 0 has format ${colorInfo0.formatName} — WebGPU cannot blend a ${colorTarget.webgpu} ` +
+          'target (it needs the optional "float32-blendable" feature, which this port does not request). Refusing to draw');
+      }
       blend = { color: { ...blend0.color }, alpha: { ...blend0.alpha } };
     }
     const blendConstant = [
@@ -578,13 +662,21 @@
     ];
 
     // --- rasterizer state (cull/winding/depth bias) --------------------------
+    // xenia gates the culling (and therefore the back-face stencil state) on
+    // the primitive being two-faced: IsPrimitiveTwoFaced covers the triangle
+    // list/fan/strip/W-flags, quad list/strip and polygon types.
+    const primitiveTwoFaced = primitivePolygonal;
     const raster = decodeRasterState(raw, { primitivePolygonal, isFloat24Depth: depthInfo.format === 1 });
 
     // --- depth/stencil state ------------------------------------------------
     const depthStencil = {
-      format: 'depth24plus-stencil8',
+      // The attachment format follows the guest's depth format.
+      format: floatDepth ? 'depth32float' : 'depth24plus-stencil8',
       depthWriteEnabled: zEnable && zWriteEnable,
       depthCompare: zEnable ? cmp(depthControl >>> 4) : 'always',
+      // xenia: depth_clip = !PA_CL_CLIP_CNTL.clip_disable (bit 16) — the guest
+      // can disable z clipping; WebGPU's depthClipEnabled does the same.
+      depthClipEnabled: !(((raw.paClClipCntl ?? 0) >>> 16) & 0x1),
     };
     if (stencilEnable) {
       const front = {
@@ -593,7 +685,11 @@
         depthFailOp: sOp(depthControl >>> 17),
         passOp: sOp(depthControl >>> 14),
       };
-      const back = backfaceEnable ? {
+      // xenia: the back-face stencil ops apply only when the primitive is
+      // two-faced and the guest enabled the back-face stencil; otherwise both
+      // faces use the front-face ops.
+      const stencilBackfaceEnable = primitiveTwoFaced && backfaceEnable;
+      const back = stencilBackfaceEnable ? {
         compare: cmp(depthControl >>> 20),
         failOp: sOp(depthControl >>> 23),
         depthFailOp: sOp(depthControl >>> 29),
@@ -601,12 +697,21 @@
       } : { ...front };
       depthStencil.stencilFront = front;
       depthStencil.stencilBack = back;
-      depthStencil.stencilReadMask = (stencilRefMask >>> 8) & 0xFF;
-      depthStencil.stencilWriteMask = (stencilRefMask >>> 16) & 0xFF;
+      // xenia's D3D12 host: the back-face reference/mask pair is used when the
+      // back-face stencil is enabled and the front faces are culled (only back
+      // faces are rasterized then); otherwise the front-face pair is used.
+      const useBackfacePair = stencilBackfaceEnable && raster.cullFront;
+      const stencilPair = useBackfacePair ? stencilRefMaskBf : stencilRefMask;
+      stencilRef = stencilPair & 0xFF;
+      depthStencil.stencilReadMask = (stencilPair >>> 8) & 0xFF;
+      depthStencil.stencilWriteMask = (stencilPair >>> 16) & 0xFF;
     }
 
-    // Cache key: raw values fully determine the decode.
+    // Cache key: raw values fully determine the decode. RB_SURFACE_INFO is
+    // part of it — it carries the MSAA sample count, which the pipeline
+    // descriptor depends on (the backend keys its pipeline cache on this).
     const key = [
+      raw.surfaceInfo === undefined ? -1 : (raw.surfaceInfo >>> 0),
       raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, colorMask, raw.depthControl >>> 0,
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
@@ -614,6 +719,9 @@
       raw.paSuScModeCntl >>> 0,
       raw.paSuPolyOffsetFrontScale >>> 0, raw.paSuPolyOffsetFrontOffset >>> 0,
       raw.paSuPolyOffsetBackScale >>> 0, raw.paSuPolyOffsetBackOffset >>> 0,
+      // PA_CL_CLIP_CNTL carries clip_disable (bit 16) → the pipeline's
+      // depthClipEnabled.
+      raw.paClClipCntl === undefined ? -1 : (raw.paClClipCntl >>> 0),
       primitivePolygonal ? 1 : 0,
     ].join(',');
 
@@ -623,12 +731,17 @@
       blend,
       blendConstant,
       depthStencil,
-      stencilRef: ref,
+      stencilRef,
       alphaTest,
       raster,
       surfacePitch: surfaceInfo & 0x3FFF,
       convertColor0ToGamma,
       colorFormatName: colorInfo0.formatName,
+      // The WebGPU color target format for this draw (null = the canvas
+      // format — the guest's format is 8-bit unorm RGBA).
+      colorFormat,
+      // The guest's MSAA sample count (1, 2 or 4) — xenia's MsaaSamples.
+      sampleCount,
       depthFormatName: depthInfo.formatName,
     };
     if (rtDecodeCache.size >= RT_DECODE_CACHE_LIMIT) rtDecodeCache.clear();
@@ -644,6 +757,7 @@
       paSuScModeCntl: raw.paSuScModeCntl >>> 0,
       paSuPolyOffsetFrontScale: raw.paSuPolyOffsetFrontScale >>> 0, paSuPolyOffsetFrontOffset: raw.paSuPolyOffsetFrontOffset >>> 0,
       paSuPolyOffsetBackScale: raw.paSuPolyOffsetBackScale >>> 0, paSuPolyOffsetBackOffset: raw.paSuPolyOffsetBackOffset >>> 0,
+      paClClipCntl: raw.paClClipCntl === undefined ? -1 : raw.paClClipCntl >>> 0,
     };
     const bucket2 = rtFpCache.get(fp);
     if (bucket2) bucket2.push({ raw: snap, flags, state });

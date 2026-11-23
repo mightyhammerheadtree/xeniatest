@@ -77,12 +77,22 @@
       const dword0 = readDword(i * 2) >>> 0;
       const dword1 = readDword(i * 2 + 1) >>> 0;
       const type = dword0 & 0x3;
+      // xenia's xe_gpu_vertex_fetch_t:
+      //   FetchConstantType type : 2;   // +0
+      //   uint32_t address : 30;        // +2 address in dwords
+      // The guest address is "vfetch_constant.address << 2" (xenia
+      // d3d12_command_processor.cc: shared_memory_->RequestRange(
+      // vfetch_constant.address << 2, vfetch_constant.size << 2)), so the
+      // address field counts *dwords* and has to be shifted left by two to
+      // become a byte address. It is kept inside the 29-bit Xenos physical
+      // address space (512 MiB).
+      const addressDwords = (dword0 >>> 2) & 0x07ffffff;
       out[i] = {
         index: i,
         type,
         typeName: FETCH_CONSTANT_TYPE[type],
-        /** Byte address of the buffer on the GPU bus (29 bits, dword aligned). */
-        baseAddress: dword0 & 0x1FFFFFFC,
+        /** Byte address of the buffer in the guest's physical memory (29 bits, dword aligned). */
+        baseAddress: (addressDwords << 2) >>> 0,
         /** GpuSwap endianness of the buffer data (Endian: 0 none, 1 k8in16, 2 k8in32, 3 k16in32). */
         endian: dword1 & 0x3,
         endianName: ENDIAN_NAMES[dword1 & 0x3],

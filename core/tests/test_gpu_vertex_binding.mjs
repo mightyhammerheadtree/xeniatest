@@ -24,6 +24,7 @@ const { XenosCommandProcessor } = globalThis.XenonGpuCommandProcessor;
 const { XenosWebGpuBackend } = globalThis.XenonWebGpuBackend;
 
 globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
+globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
 
 // ------------------------------------------------------------ microcode fixture
 function execCf(address, count, sequence, opcode = 2) {
@@ -189,6 +190,27 @@ test('fetch draw uploads the guest vertex buffer with BE→LE dword swap and bin
   assert.equal(pass.ib, null);
 });
 
+test('the fetch constant address counts dwords — a non-round address selects the right buffer (xenia)', () => {
+  // xenia's xe_gpu_vertex_fetch_t.address counts *dwords* and the guest
+  // address is "vfetch_constant.address << 2" (xenia
+  // d3d12_command_processor.cc: shared_memory_->RequestRange(
+  // vfetch_constant.address << 2, ...)). The address below (0x00100004) is not
+  // a multiple of 16 bytes, so an implementation that read the field as a byte
+  // address would upload a different buffer.
+  const guest = makeGuest();
+  const view = new DataView(guest.arena.buffer);
+  const VB2 = 0x00100004;
+  for (let i = 0; i < 9; i++) view.setFloat32(VB2 + i * 4, 100 + i, false);
+  const backend = makeBackend(guest);
+  const consts = new Uint32Array(192);
+  consts[0] = ((VB2 >> 2) << 2) | 3; // type=vertex, address field = 0x00040001 dwords
+  consts[1] = 9 << 2;                // sizeWords 9 (36 bytes), endian kNone
+  backend.draw({ ...baseParams, vertexFetchConstants: consts });
+  const wb = backend.device.calls.writeBuffer[0];
+  const floats = new Float32Array(wb.data.buffer, wb.data.byteOffset, 9);
+  assert.deepEqual([...floats], [100, 101, 102, 103, 104, 105, 106, 107, 108]);
+});
+
 test('fetch draw declares the descriptor layout on the placeholder pipeline', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
@@ -290,6 +312,10 @@ test('VETEX constants flow from the register file through the CP into the draw p
   // vertex shader via IM_LOAD_IMMEDIATE (type 0 = vertex, 9 dwords inline)
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_IM_LOAD_IMMEDIATE, 11), 0, 9, ...FETCH_VS]));
   // draw, source = kAutoIndex (no index DMA), 3 vertices
+  // (RB_MODECONTROL = kColorDepth and a non-zero surface_pitch, so the draw is
+  // not ignored — xenia's IssueDraw gate).
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000004]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2000, 1), 0x00001000]));
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
   assert.equal(calls.length, 1);

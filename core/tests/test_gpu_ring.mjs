@@ -165,7 +165,13 @@ test('end-to-end: ring -> command processor -> draw packet reaches the backend',
   ring.initializeRingBuffer(RING_BASE, 4);
   // VGT_DRAW_INITIATOR: auto-indexed triangle list, 3 indices
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
-  const words = [PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator];
+  const words = [
+    // RB_MODECONTROL = kColorDepth and a non-zero RB_SURFACE_INFO.surface_pitch,
+    // so the draw is not ignored (xenia's IssueDraw gate).
+    PM4.makePacketType0(0x2208, 1), 0x00000004,
+    PM4.makePacketType0(0x2000, 1), 0x00001000,
+    PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator,
+  ];
   words.forEach((w, i) => guest.writeU32BE(RING_BASE + i * 4, w));
   const result = ring.updateWritePointer(words.length);
   assert.equal(result.executed, true);

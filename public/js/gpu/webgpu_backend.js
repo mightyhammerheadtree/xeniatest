@@ -159,6 +159,41 @@
 }
 `;
 
+  // The depth-only fragment stage (xenia's RB_MODECONTROL.edram_mode = kDepth):
+  // no guest pixel shader runs, nothing is written to the color attachment
+  // (the pipeline's color target carries a zero write mask) and the depth
+  // comes from the rasterizer — the stage exists only because WebGPU requires
+  // a fragment stage for a pipeline that is used in a pass with a color
+  // attachment (all the draws of a frame share one pass).
+  const DEPTH_ONLY_FRAGMENT_WGSL = `// Depth-only draw (xenia kDepth mode) — no guest pixel shader, no color output.
+@fragment fn fs_main() {
+}
+`;
+
+  /**
+   * The present blit: a fullscreen triangle that copies the offscreen
+   * render target into the canvas texture. The guest's render-target format
+   * is not the canvas format (8-bit unorm RGBA), so the frame is drawn into a
+   * texture with the guest's format and copied here — textureLoad, so the
+   * copy is exact (no filtering, no colour-space conversion beyond what the
+   * canvas format does on write).
+   */
+  const PRESENT_BLIT_WGSL = `
+@group(0) @binding(0) var src: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+  // One oversized triangle covering the whole target.
+  var pos = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(pos[index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  return textureLoad(src, vec2i(pos.xy), 0);
+}
+`;
+
   /** Integer-component GPUVertexFormat strings (need vec4<u32>/vec4<i32> shader locations, not vec4<f32>). */
   function isIntegerGpuVertexFormat(format) {
     return format.startsWith('uint') || format.startsWith('sint');
@@ -182,8 +217,9 @@
   // Host-side index conversion for the primitives WebGPU has no topology for.
   // Mirrors xenia's primitive_processor.cc conversion paths (used there when
   // the host lacks the primitive natively — WebGPU always lacks these):
-  //   kTriangleFan → triangle-list: triangles (i0, i1, i2), (i0, i2, i3), …
-  //                  (cyclic rotation of xenia's (i-1, i, i0) — same winding)
+  //   kTriangleFan → triangle-list: triangles (i-1, i, i0) — xenia's
+  //                  TriangleFanToList order: the previous index, the current
+  //                  one and the fan's first index close every triangle.
   //   kLineLoop    → line-strip with the loop closed (first index re-appended)
   //   kQuadList    → triangle-list: (v0,v1,v2), (v0,v2,v3) per quad (xenia order)
   // Leftover indices that do not complete a primitive are dropped, matching
@@ -194,34 +230,104 @@
     [0x0C /* kLineLoop */, { topology: 'line-strip', kind: 'loop' }],
     [0x0D /* kQuadList */, { topology: 'triangle-list', kind: 'quads' }],
   ]);
+  // The primitive types for which xenia's primitive processor honors the
+  // guest's primitive reset index (VGT_MULTI_PRIM_IB_RESET_INDX). The list
+  // topologies are deliberately excluded: "Vulkan explicitly disallows
+  // primitive restart index for 'list' topologies. In Direct3D 12, it's valid
+  // for non-strips, but has implementation-defined behavior." (xenia
+  // primitive_processor.cc).
+  const PRIM_TYPE_RESETTABLE = new Set([
+    0x03 /* kLineStrip */, 0x05 /* kTriangleFan */, 0x06 /* kTriangleStrip */,
+    0x0C /* kLineLoop */, 0x0E /* kQuadStrip */, 0x0F /* kPolygon */,
+    0x15 /* k2DLineStrip */, 0x16 /* k2DTriStrip */,
+  ]);
+  // The resettable topologies WebGPU has natively. The guest's reset index
+  // terminates the strip, so every range between two reset markers is a strip
+  // of its own — xenia hands the whole buffer to the host with the host's
+  // primitive restart enabled; WebGPU's restart index is fixed at
+  // 0xFFFF/0xFFFFFFFF, so the same result is produced by drawing each range
+  // separately. The remaining resettable topologies (quad strip, polygon, the
+  // 2D copies) are not encodable in WebGPU at all and trap before this point.
+  const PRIM_TYPE_STRIP_RESETTABLE = new Set([
+    0x03 /* kLineStrip */, 0x06 /* kTriangleStrip */,
+  ]);
+  // Split an index buffer at the guest's primitive reset index; the marker
+  // itself is dropped and every range is drawn on its own. Mirrors xenia's
+  // GetMultiPrimitiveHostIndexCountAndRanges range gathering.
+  function splitResetRanges(indices, isResetIndex) {
+    const ranges = [];
+    let start = 0;
+    for (let i = 0; i < indices.length; i++) {
+      if (!isResetIndex(indices[i])) continue;
+      if (i > start) ranges.push([start, i - start]);
+      start = i + 1;
+    }
+    if (start < indices.length) ranges.push([start, indices.length - start]);
+    return ranges;
+  }
   // Expand a decoded (little-endian, in-register typed array) index buffer for
   // a converted primitive type. Returns null when there is nothing to draw.
-  function expandConvertedIndices(indices, kind) {
+  // When isResetIndex is given, the index buffer is split at the guest's
+  // primitive reset index and every range is converted on its own — xenia's
+  // GetMultiPrimitiveHostIndexCountAndRanges + ConvertSinglePrimitiveRanges.
+  function expandConvertedIndices(indices, kind, isResetIndex = null) {
     const n = indices.length;
-    if (kind === 'fan') {
-      if (n < 3) return null;
-      const out = new indices.constructor((n - 2) * 3);
-      const v0 = indices[0];
+    // xenia's index-count getters: GetTriangleFanListIndexCount,
+    // GetLineLoopStripIndexCount, GetQuadListTriangleListIndexCount.
+    const convertedCount = (count) => {
+      if (kind === 'fan') return count > 2 ? (count - 2) * 3 : 0;
+      if (kind === 'loop') return count > 1 ? count + 1 : 0;
+      return Math.floor(count / 4) * 6;
+    };
+    const convertRange = (src, count) => {
+      const out = new src.constructor(convertedCount(count));
+      // xenia's converters bail out when the range cannot complete a primitive
+      // ("if (source_index_count <= 2) return;" / "<= 1" / a whole number of
+      // quads) — the destination stays empty and the range contributes nothing.
+      if (out.length === 0) return out;
+      if (kind === 'fan') {
+        // xenia's TriangleFanToList (primitive_processor.h): every triangle is
+        // (previous, current, first) — the fan's first index closes each
+        // triangle. The winding matches the hardware's fan assembly.
+        let o = 0;
+        for (let i = 2; i < count; i++) { out[o++] = src[i - 1]; out[o++] = src[i]; out[o++] = src[0]; }
+        return out;
+      }
+      if (kind === 'loop') {
+        // xenia's LineLoopToStrip: the source, with the first index re-appended.
+        out.set(src.subarray(0, count), 0);
+        out[count] = src[0];
+        return out;
+      }
+      // quads: two triangles per quad, xenia's order (v0,v1,v2), (v0,v2,v3)
       let o = 0;
-      for (let i = 2; i < n; i++) { out[o++] = v0; out[o++] = indices[i - 1]; out[o++] = indices[i]; }
+      for (let q = 0; q < Math.floor(count / 4); q++) {
+        const b = q * 4, i0 = src[b], i1 = src[b + 1], i2 = src[b + 2], i3 = src[b + 3];
+        out[o++] = i0; out[o++] = i1; out[o++] = i2;
+        out[o++] = i0; out[o++] = i2; out[o++] = i3;
+      }
       return out;
+    };
+    if (!isResetIndex) {
+      if (convertedCount(n) === 0) return null;
+      return convertRange(indices, n);
     }
-    if (kind === 'loop') {
-      if (n < 2) return null;
-      const out = new indices.constructor(n + 1);
-      out.set(indices, 0);
-      out[n] = indices[0];
-      return out;
+    // Split at the reset index; the reset value itself is dropped.
+    const ranges = [];
+    let start = 0;
+    for (let i = 0; i < n; i++) {
+      if (isResetIndex(indices[i])) { ranges.push([start, i - start]); start = i + 1; }
     }
-    // quads: two triangles per quad, xenia's order (v0,v1,v2), (v0,v2,v3)
-    const quads = Math.floor(n / 4);
-    if (quads === 0) return null;
-    const out = new indices.constructor(quads * 6);
+    ranges.push([start, n - start]);
+    let total = 0;
+    for (const [, count] of ranges) total += convertedCount(count);
+    if (total === 0) return null;
+    const out = new indices.constructor(total);
     let o = 0;
-    for (let q = 0; q < quads; q++) {
-      const b = q * 4, i0 = indices[b], i1 = indices[b + 1], i2 = indices[b + 2], i3 = indices[b + 3];
-      out[o++] = i0; out[o++] = i1; out[o++] = i2;
-      out[o++] = i0; out[o++] = i2; out[o++] = i3;
+    for (const [off, count] of ranges) {
+      const part = convertRange(indices.subarray(off, off + count), count);
+      out.set(part, o);
+      o += part.length;
     }
     return out;
   }
@@ -292,7 +398,10 @@
       this.boolConstantBuffer = null;    // GPUBuffer, persistent likewise
       this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
       this.boolHash = -1;
-      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0 };
+      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0, presents: 0 };
+      this._colorTargets = new Map(); // `${format}:${samples}:${w}x${h}` -> { texture, format, sampleCount }
+      this._presentPending = false; // an offscreen frame is waiting to be blitted to the canvas
+      this._presentPipeline = new Map(); // source format -> { pipeline, bindGroup } for the present blit
       this.implicitIndexCache = new Map();
       this.implicitIndexBytes = 0;
       this.implicitIndexClock = 0;
@@ -347,17 +456,60 @@
       if (this.depthTexture) this.depthTexture.destroy();
       this._frameClearColor = false;
       this._frameClearDepth = false;
+      this.depthSampleCount = 1;
+      this.depthAttachmentFormat = this.depthFormat;
       this.depthTexture = this.device.createTexture({
         size: [width, height, 1],
         format: this.depthFormat,
+        sampleCount: 1,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
         label: 'xenos-depth',
       });
       this.depthView = typeof this.depthTexture.createView === 'function' ? this.depthTexture.createView() : null;
     }
 
+    /**
+     * The depth attachment must have the frame's sample count (a WebGPU
+     * render pass requires the depth attachment's sample count to match the
+     * color attachment's), so the depth texture is recreated when the guest
+     * switches between 1x and multisampled rendering.
+     */
+    _ensureDepthTexture(sampleCount, format = this.depthFormat) {
+      if (this.depthTexture && this.depthSampleCount === sampleCount && this.depthAttachmentFormat === format) return;
+      if (!this.device || !this.canvas) return;
+      const width = Math.max(1, this.canvas.width | 0);
+      const height = Math.max(1, this.canvas.height | 0);
+      if (this.depthTexture) this.depthTexture.destroy();
+      this.depthSampleCount = sampleCount;
+      this.depthAttachmentFormat = format;
+      this._frameClearDepth = false; // the new attachment starts undefined
+      this.depthTexture = this.device.createTexture({
+        size: [width, height, 1],
+        format,
+        sampleCount,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        label: 'xenos-depth',
+      });
+      this.depthView = typeof this.depthTexture.createView === 'function' ? this.depthTexture.createView() : null;
+    }
+
+    /** Release every color target texture (resize / destroy). */
+    _destroyColorTargets() {
+      for (const entry of this._colorTargets.values()) entry.texture.destroy();
+      this._colorTargets.clear();
+      this._presentPipeline.clear();
+      this._presentPending = false;
+      this._presentKey = null;
+    }
+
     /** Resize depth attachment to the canvas size (call before drawing after a resize). */
-    resize() { this._flushFrame(); this._recreateDepth(); }
+    resize() {
+      this._flushFrame();
+      // The color targets are sized like the canvas (the guest's RT extent is
+      // assumed to be the canvas extent) — drop them so they are recreated.
+      this._destroyColorTargets();
+      this._recreateDepth();
+    }
 
     // --- IXenosGpuBackend ----------------------------------------------------
 
@@ -626,7 +778,11 @@
 
     /** The color target descriptor for the canvas attachment (format + write mask + blend). */
     _colorTargetDesc(rtState, writesColor = true) {
-      const target = { format: this.format, writeMask: writesColor ? (rtState ? rtState.writeMask : 0xF) : 0x0 };
+      // The target format is the guest's render-target format (render_state.js
+      // maps it exactly like xenia maps it to a host format); null means the
+      // canvas format (8-bit unorm RGBA — k_8_8_8_8 / k_8_8_8_8_GAMMA).
+      const format = (rtState && rtState.colorFormat) ? rtState.colorFormat : this.format;
+      const target = { format, writeMask: writesColor ? (rtState ? rtState.writeMask : 0xF) : 0x0 };
       if (writesColor && rtState && rtState.blend) target.blend = rtState.blend;
       return target;
     }
@@ -660,7 +816,7 @@
       try {
         rtState = rs.buildRenderTargetState(params.renderTargets, {
           // No pixel shader → the bring-up FS writes the attachment unconditionally.
-          psExportsColor0: program?.fragment ? program.exportsColor0 : true,
+          psExportsColor0: params.depthOnly ? false : (program?.fragment ? program.exportsColor0 : true),
           psExportsDepth: program?.exportsDepth ?? false,
           // xenia IsPrimitivePolygonal — culling/wireframe/polygon offset only for polygonal prims.
           primitivePolygonal: isPrimitivePolygonal(params.primType),
@@ -719,48 +875,140 @@
 
     _flushFrame() {
       if (!this._frame) return;
-      const { encoder, pass } = this._frame;
+      const { encoder, pass, offscreen, presentKey } = this._frame;
       this._frame = null; // release before submit so a re-entrant draw starts a fresh frame
       pass.end();
       this.device.queue.submit([encoder.finish()]);
+      // A frame that rendered into the offscreen target has not reached the
+      // canvas yet — swap() presents it.
+      if (offscreen) {
+        this._presentPending = true;
+        this._presentKey = presentKey;
+      }
+    }
+
+    /**
+     * The color attachment for the frame's pass. The guest's render-target
+     * format decides where the frame is drawn:
+     *   - k_8_8_8_8 / k_8_8_8_8_GAMMA (8-bit unorm RGBA) go straight into the
+     *     canvas texture — the same format the canvas is.
+     *   - every other representable format goes into an offscreen texture with
+     *     exactly that format, so the guest's writes are quantized and ranged
+     *     like the hardware's; the offscreen target is presented to the canvas
+     *     by a blit at swap() (_presentOffscreen).
+     */
+    _colorAttachment(rtState) {
+      const format = rtState?.colorFormat ?? null;   // null = the canvas format
+      const samples = rtState?.sampleCount ?? 1;
+      // The single-sample target: the canvas texture, or an offscreen texture
+      // with the guest's format (the canvas cannot carry it).
+      let single = null;
+      if (format) {
+        single = this._colorTargetTexture(format, 1);
+      } else {
+        single = { texture: this.context.getCurrentTexture(), format: this.format, sampleCount: 1, key: null };
+      }
+      if (samples === 1) {
+        return { view: single.texture.createView(), format: single.format, sampleCount: 1, offscreen: format !== null, resolveTarget: null, sourceKey: single.key ?? null };
+      }
+      // Multisampled: the frame renders into a multisampled attachment of the
+      // same format, and WebGPU's resolve (a box filter over the samples)
+      // writes the single-sample target — the same box filter xenia's EDRAM
+      // resolve applies for "all samples".
+      const msaa = this._colorTargetTexture(single.format, samples);
+      return {
+        view: msaa.texture.createView(),
+        format: single.format,
+        sampleCount: samples,
+        offscreen: format !== null,
+        resolveTarget: single.texture.createView(),
+        sourceKey: single.key ?? null,
+      };
+    }
+
+    /**
+     * A color target texture: the guest's render-target format (offscreen) or
+     * the canvas format, single- or multisampled. Keyed by format, sample
+     * count and size (the guest's RT extent is assumed to be the canvas
+     * extent, like the viewport decode assumes).
+     */
+    _colorTargetTexture(format, sampleCount) {
+      const width = Math.max(1, (this.canvas?.width ?? 1) | 0);
+      const height = Math.max(1, (this.canvas?.height ?? 1) | 0);
+      const key = `${format}:${sampleCount}:${width}x${height}`;
+      const existing = this._colorTargets.get(key);
+      if (existing) return existing;
+      if (typeof GPUTextureUsage === 'undefined') throw new XenosWebGpuError('GPUTextureUsage is not defined in this environment');
+      const texture = this.device.createTexture({
+        label: sampleCount > 1 ? `xenos-msaa-${format}` : `xenos-rt-${format}`,
+        size: [width, height, 1],
+        format,
+        sampleCount,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | (sampleCount > 1 ? 0 : GPUTextureUsage.TEXTURE_BINDING),
+      });
+      const entry = { texture, format, sampleCount, key };
+      this._colorTargets.set(key, entry);
+      return entry;
     }
 
     /** Open (or reuse) the batched frame's pass. Returns the pass — never ends it per draw. */
-    _openFrame() {
+    _openFrame(rtState = null) {
       if (this._frame && this._frame.draws >= XenosWebGpuBackend.MAX_DRAWS_PER_SUBMIT) this._flushFrame();
+      // A render pass has one color attachment format: if the guest changed the
+      // render-target format mid-frame, end the pass and start a new one. The
+      // old frame's canvas update is dropped (its offscreen content is
+      // superseded by the new frame — a guest that changes the render-target
+      // format mid-frame is not a shape this port reproduces faithfully).
+      const wantFormat = (rtState?.colorFormat) ?? this.format;
+      const wantSamples = rtState?.sampleCount ?? 1;
+      if (this._frame && (this._frame.colorFormat !== wantFormat || this._frame.sampleCount !== wantSamples)) {
+        this._flushFrame();
+        this._presentPending = false;
+        this._frameClearColor = false;
+        this._frameClearDepth = false;
+      }
       if (!this._frame) {
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
-        const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginFramePass(encoder, colorView);
-        this._frame = { encoder, pass, colorView, draws: 0 };
+        const attachment = this._colorAttachment(rtState);
+        this._ensureDepthTexture(attachment.sampleCount, rtState?.depthStencil?.format ?? this.depthFormat);
+        const pass = this._beginFramePass(encoder, attachment);
+        this._frame = {
+          encoder, pass, colorView: attachment.view, draws: 0,
+          colorFormat: attachment.format, sampleCount: attachment.sampleCount, offscreen: attachment.offscreen,
+          presentKey: attachment.sourceKey,
+        };
       }
       return this._frame.pass;
     }
 
     /** The frame pass descriptor: defined image on the first pass of a frame, load after. */
-    _beginFramePass(encoder, colorView) {
+    _beginFramePass(encoder, attachment) {
+      const colorView = attachment.view;
+      // With MSAA the frame renders into the multisampled attachment and the
+      // resolve writes the single-sample target — the multisample content
+      // itself is not needed afterwards.
       const colorAttachment = this._frameClearColor
-        ? { view: colorView, loadOp: 'load', storeOp: 'store' }
-        : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' };
+        ? { view: colorView, loadOp: 'load', storeOp: attachment.resolveTarget ? 'discard' : 'store', resolveTarget: attachment.resolveTarget ?? undefined }
+        : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: attachment.resolveTarget ? 'discard' : 'store', resolveTarget: attachment.resolveTarget ?? undefined };
       this._frameClearColor = true;
       const desc = { colorAttachments: [colorAttachment] };
       if (this.depthView) {
+        // A float depth attachment (depth32float) has no stencil plane — the
+        // stencil load/store ops must be omitted for it.
+        const hasStencil = this.depthAttachmentFormat !== 'depth32float';
         desc.depthStencilAttachment = this._frameClearDepth
           ? {
             view: this.depthView,
             depthLoadOp: 'load',
             depthStoreOp: 'store',
-            stencilLoadOp: 'load',
-            stencilStoreOp: 'store',
+            ...(hasStencil ? { stencilLoadOp: 'load', stencilStoreOp: 'store' } : {}),
           }
           : {
             view: this.depthView,
             depthLoadOp: 'clear',
             depthClearValue: 1.0,
             depthStoreOp: 'store',
-            stencilLoadOp: 'clear',
-            stencilClearValue: 0,
-            stencilStoreOp: 'store',
+            ...(hasStencil ? { stencilLoadOp: 'clear', stencilClearValue: 0, stencilStoreOp: 'store' } : {}),
           };
         this._frameClearDepth = true;
       }
@@ -802,13 +1050,13 @@
      * blend, depth/stencil) — the same shader pair drawn with different ROP
      * state gets a different pipeline.
      */
-    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program, rtState) {
+    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program, rtState, depthOnly = false) {
       let perShader = this.translatedPipelines.get(vsCode);
       if (!perShader) {
         perShader = new Map();
         this.translatedPipelines.set(vsCode, perShader);
       }
-      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}eb${expBiasKey(program)}`;
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}eb${expBiasKey(program)}` + (depthOnly ? '|depth' : '');
       const rtKey = rtState ? rtState.key : 'rt:none';
       const layoutKey = `${pairKey}|${topology}:${this.format}:${rtKey}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
@@ -816,9 +1064,12 @@
 
       if (!program) program = this._translateProgram(vsCode, psCode);
       const vsModule = this.device.createShaderModule({ code: program.vertex.wgsl, label: 'xenos-translated-vs' });
+      // xenia's kDepth mode runs no guest pixel shader at all (the depth comes
+      // from the rasterizer): the pipeline gets a stage that writes nothing,
+      // and the color target carries a zero write mask.
       const fsModule = this.device.createShaderModule({
-        code: program.fragment ? program.fragment.wgsl : FLAT_FRAGMENT_WGSL,
-        label: program.fragment ? 'xenos-translated-ps' : 'xenos-bringup-fs',
+        code: depthOnly ? DEPTH_ONLY_FRAGMENT_WGSL : (program.fragment ? program.fragment.wgsl : FLAT_FRAGMENT_WGSL),
+        label: depthOnly ? 'xenos-depth-only-fs' : (program.fragment ? 'xenos-translated-ps' : 'xenos-bringup-fs'),
       });
       const vertexBuffers = (plan?.descriptors ?? []).map((d) => ({
         arrayStride: d.arrayStride,
@@ -829,8 +1080,13 @@
         label: program.fragment ? 'xenos-translated-vs-ps' : 'xenos-translated-vs',
         layout: 'auto',
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState, colorExportKey(program) === '1')] },
+        fragment: {
+          module: fsModule,
+          entryPoint: 'fs_main',
+          targets: [this._colorTargetDesc(rtState, depthOnly ? false : colorExportKey(program) === '1')],
+        },
         depthStencil: this._depthStencilDesc(rtState),
+        multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology, cullMode: rtState.raster.cullMode, frontFace: rtState.raster.frontFace },
       });
       let bindGroup = null;
@@ -910,6 +1166,7 @@
         vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
         fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
         depthStencil: this._depthStencilDesc(rtState),
+        multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology: 'triangle-list', cullMode: rtState?.raster?.cullMode ?? 'none', frontFace: rtState?.raster?.frontFace ?? 'ccw' },
       });
       this.pipelineCache.set(key, p);
@@ -925,10 +1182,19 @@
      * object carries the effective index format and the (possibly expanded) count —
      * 0 means fewer guest indices than one primitive; the caller skips the draw.
      */
-    uploadIndexBuffer({ indexGuestBase, numIndices, indexFormat /* 0=int16, 1=int32 */, indexEndianness /* swap_mode 0..3 from VGT_DMA_SIZE */, primType = 0 }) {
+    uploadIndexBuffer({ indexGuestBase, numIndices, indexFormat /* 0=int16, 1=int32 */, indexEndianness /* swap_mode 0..3 from VGT_DMA_SIZE */, primType = 0, multiPrimIbEnable = false, multiPrimResetIndex = 0 }) {
       if (!this.device) throw new XenosWebGpuError('uploadIndexBuffer before attach()');
       const bytesPerIndex = indexFormat === 1 ? 4 : 2;
       const total = numIndices * bytesPerIndex;
+      // xenia's primitive processor normalizes the swap mode for 16-bit
+      // indices: "32-bit endian swap mode {} is used for 16-bit indices ...
+      // Currently disabling the swap for 16-and-32 and replacing 8-in-32 with
+      // 8-in-16."
+      let swapMode = indexEndianness | 0;
+      if (indexFormat === 0 && swapMode !== 0 && swapMode !== 1) {
+        this.log('warn', `draw: 32-bit endian swap mode ${swapMode} is used for 16-bit indices — xenia replaces 8-in-32 with 8-in-16 and disables the other 32-bit modes`);
+        swapMode = swapMode === 2 ? 1 : 0;
+      }
       const view = this.readGuestMemory(indexGuestBase >>> 0);
       if (!view) throw new XenosWebGpuError(`index buffer at guest physical 0x${(indexGuestBase >>> 0).toString(16)} is not mapped`);
       const paddedTotal = Math.ceil(total / 4) * 4;
@@ -936,17 +1202,51 @@
       const src = view instanceof Uint8Array ? view : new Uint8Array(view.buffer, view.byteOffset ?? 0, view.byteLength ?? view.buffer.byteLength);
       be.set(src.subarray(0, total));
       // The GPU fetch path applies the VGT_DMA_SIZE swap_mode to raw guest bytes; we mirror that on upload:
-      // read each 32-bit word big-endian, apply GpuSwap(swap_mode), write it little-endian for the LE GPU.
+      // read the guest words big-endian, apply GpuSwap(swap_mode), write them little-endian for the LE GPU.
+      // The swap width follows the index width: 16-bit indices are swapped with
+      // GpuSwap16 (xenia's xenos.h uint16 overload — the 32-bit-only modes are
+      // normalized away above), 32-bit indices with GpuSwap32.
       const gpuSwap32 = pm4().gpuSwap32;
+      const gpuSwap16 = pm4().gpuSwap16;
       const base = indexGuestBase >>> 0;
       const decode = () => {
         // The swap is only forced for primitive conversion — the plain path swaps lazily
         // on cache miss, so identical repeated index buffers cost only the hash below.
         const decoded = new Uint8Array(paddedTotal);
         const s = new DataView(be.buffer), d = new DataView(decoded.buffer);
-        for (let i = 0; i < paddedTotal; i += 4) d.setUint32(i, gpuSwap32(s.getUint32(i, false), indexEndianness | 0), true);
+        if (indexFormat === 1) {
+          for (let i = 0; i + 3 < paddedTotal; i += 4) d.setUint32(i, gpuSwap32(s.getUint32(i, false), swapMode), true);
+        } else {
+          for (let i = 0; i + 1 < paddedTotal; i += 2) d.setUint16(i, gpuSwap16(s.getUint16(i, false), swapMode), true);
+        }
         return decoded;
       };
+      // xenia's primitive reset index: it applies only when the guest enables
+      // multi-primitive index buffers (PA_SU_SC_MODE_CNTL.multi_prim_ib_ena)
+      // and only to the strip-like primitive types. The reset value is
+      // compared in the guest's index endianness (xenia:
+      // "guest_primitive_reset_index_guest_endian = GpuSwap(reset_indx,
+      // guest_index_endian)"), so the same swap the indices went through is
+      // applied to the reset index before the comparison; 16-bit indices
+      // compare all 16 bits, 32-bit indices only the low 24 (xenia's vertex
+      // index mask).
+      let resetMatcher = null;
+      if (multiPrimIbEnable && PRIM_TYPE_RESETTABLE.has((primType ?? 0) & 0x3f)) {
+        const resetIndex = multiPrimResetIndex >>> 0;
+        if (indexFormat === 0) {
+          // xenia only enables the reset for 16-bit indices when the reset
+          // index fits into 16 bits ("guest_primitive_reset_index_guest_endian
+          // <= UINT16_MAX"); a wider guest value cannot be represented and
+          // would silently alias a real index.
+          if ((resetIndex >>> 16) === 0) {
+            const value = gpuSwap16(resetIndex, swapMode);
+            resetMatcher = (i) => i === value;
+          }
+        } else {
+          const value = gpuSwap32(resetIndex, swapMode) & 0xffffff;
+          resetMatcher = (i) => (i & 0xffffff) === value;
+        }
+      }
       // Host-side primitive conversion (fan/loop/quad-list → list/strip).
       const convert = PRIM_TYPE_CONVERT.get((primType ?? 0) & 0x3f);
       if (convert) {
@@ -955,13 +1255,13 @@
           this.log('warn', `draw: ${numIndices} indices do not complete ${Math.floor(numIndices / 4)} quad(s) — the ${numIndices & 3} leftover index value(s) are dropped (hardware primitive assembly behaves the same)`);
         }
         const typed = new (indexFormat === 1 ? Uint32Array : Uint16Array)(decoded.buffer, decoded.byteOffset, numIndices);
-        const expanded = expandConvertedIndices(typed, convert.kind);
+        const expanded = expandConvertedIndices(typed, convert.kind, resetMatcher);
         if (!expanded) {
           return { buffer: null, numIndices: 0, indexFormat }; // fewer indices than one primitive — nothing to draw
         }
         const finalBytes = new Uint8Array(expanded.buffer, expanded.byteOffset, expanded.byteLength);
         // salt the cache key so the converted buffer at the same guest base never aliases the raw one
-        const salt = ((indexEndianness | 0) | ((primType & 0x3f) << 4)) >>> 0;
+        const salt = ((swapMode | 0) | ((primType & 0x3f) << 4) | (resetMatcher ? 0x40 : 0) | ((multiPrimResetIndex & 0xffffff) << 8)) >>> 0;
         const { buffer, hit } = this._cachedBuffer('ib', base, finalBytes.byteLength, salt, finalBytes, () => {
           const buf = this.device.createBuffer({ size: Math.ceil(finalBytes.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: 'xenos-index' });
           const padded = new Uint8Array(Math.ceil(finalBytes.byteLength / 4) * 4);
@@ -975,7 +1275,7 @@
         }
         return { buffer, numIndices: expanded.length, indexFormat };
       }
-      const { buffer, hit } = this._cachedBuffer('ib', base, total, indexEndianness | 0, be, () => {
+      const { buffer, hit } = this._cachedBuffer('ib', base, total, swapMode | 0, be, () => {
         const buf = this.device.createBuffer({ size: paddedTotal, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: 'xenos-index' });
         this.device.queue.writeBuffer(buf, 0, decode());
         return buf;
@@ -984,7 +1284,15 @@
         this.uploads.indexBuffers++;
         this.uploads.indexBytes += total;
       }
-      return { buffer, numIndices, indexFormat };
+      // The guest's primitive reset index ends a strip: the markers are not
+      // vertices, and every range between two markers is a separate strip.
+      let ranges = null;
+      if (resetMatcher && PRIM_TYPE_STRIP_RESETTABLE.has((primType ?? 0) & 0x3f)) {
+        const decoded = decode();
+        const typed = new (indexFormat === 1 ? Uint32Array : Uint16Array)(decoded.buffer, decoded.byteOffset, numIndices);
+        ranges = splitResetRanges(typed, resetMatcher);
+      }
+      return { buffer, numIndices, indexFormat, ranges };
     }
 
     /**
@@ -1035,6 +1343,7 @@
         vertex: { module, entryPoint: 'vs_main' },
         fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
         depthStencil: this._depthStencilDesc(rtState),
+        multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology: 'triangle-list', cullMode: rtState?.raster?.cullMode ?? 'none', frontFace: rtState?.raster?.frontFace ?? 'ccw' },
       });
       this.pipelineCache.set(key, p);
@@ -1066,7 +1375,8 @@
             'refusing to fabricate geometry. Pass { placeholderShader: true } to attach() to render the bring-up triangle instead.');
         }
         // A pixel shader, when loaded, IS translated and run — no guessed fragment stage anywhere.
-        const psCode = this.shaders.pixel?.code ?? null;
+        // xenia's kDepth mode (RB_MODECONTROL.edram_mode) runs no pixel shader.
+        const psCode = params.depthOnly ? null : (this.shaders.pixel?.code ?? null);
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
         const alphaTest = globalThis.XenonGpuRenderState?.decodeAlphaTest(params.renderTargets?.colorControl ?? 0) ?? null;
         // format nibble of RB_COLOR_INFO at bits 16-19 (1 = k_8_8_8_8_GAMMA);
@@ -1109,8 +1419,8 @@
         const rtState = this._resolveRenderTargets(params, program);
         if (!rtState) return;
         const scissor = this._resolveScissor(params);
-        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
-        const pass = this._openFrame();
+        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState, !!params.depthOnly);
+        const pass = this._openFrame(rtState);
         this._frameDrawState(pass, rtState, scissor);
         pass.setPipeline(pipeline);
         if (bindGroup) pass.setBindGroup(0, bindGroup);
@@ -1131,7 +1441,7 @@
         if (!rtState) return;
         const scissor = this._resolveScissor(params);
         const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
-        const pass = this._openFrame();
+        const pass = this._openFrame(rtState);
         this._frameDrawState(pass, rtState, scissor);
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
@@ -1153,7 +1463,7 @@
       const rtState = this._resolveRenderTargets(params, null);
       if (!rtState) return;
       const scissor = this._resolveScissor(params);
-      const pass = this._openFrame();
+      const pass = this._openFrame(rtState);
       this._frameDrawState(pass, rtState, scissor);
       pass.setPipeline(this._getPlaceholderPipeline(rtState));
       pass.draw(3);
@@ -1171,9 +1481,19 @@
           indexFormat: params.indexFormat,
           indexEndianness: params.indexEndianness,
           primType,
+          multiPrimIbEnable: !!params.multiPrimIbEnable,
+          multiPrimResetIndex: params.multiPrimResetIndex >>> 0,
         });
         if (ib.numIndices === 0) { this.log('info', `draw: prim 0x${primType.toString(16)} with fewer indices than one primitive — nothing to draw`); return; }
         pass.setIndexBuffer(ib.buffer, ib.indexFormat === 1 ? 'uint32' : 'uint16');
+        // A guest primitive reset splits the strip into several strips — one
+        // draw per range (the reset markers themselves are not vertices).
+        if (ib.ranges && ib.ranges.length > 1) {
+          for (const [first, count] of ib.ranges) {
+            if (count > 0) pass.drawIndexed(count, 1, first, 0, 0);
+          }
+          return;
+        }
         pass.drawIndexed(ib.numIndices, 1, 0, 0, 0);
         return;
       }
@@ -1187,9 +1507,55 @@
       pass.draw(params.numIndices);
     }
 
+    /**
+     * Present the offscreen color target to the canvas (the guest's
+     * render-target format is not the canvas format). One blit per frame; the
+     * pipeline and bind group are cached per source format.
+     */
+    _presentOffscreen() {
+      if (!this._presentPending) return;
+      this._presentPending = false;
+      const source = this._presentKey ? this._colorTargets.get(this._presentKey) : null;
+      if (!source) return;
+      const canvasTexture = this.context.getCurrentTexture();
+      let entry = this._presentPipeline.get(source.format);
+      if (!entry) {
+        const module = this.device.createShaderModule({ code: PRESENT_BLIT_WGSL, label: 'xenos-present-blit' });
+        const pipeline = this.device.createRenderPipeline({
+          label: 'xenos-present-blit',
+          layout: 'auto',
+          vertex: { module, entryPoint: 'vs_main' },
+          fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+          primitive: { topology: 'triangle-list' },
+        });
+        const bindGroup = this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: source.texture.createView() }],
+        });
+        entry = { pipeline, bindGroup };
+        this._presentPipeline.set(source.format, entry);
+      }
+      const encoder = this.device.createCommandEncoder({ label: 'xenos-present' });
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: canvasTexture.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(entry.pipeline);
+      pass.setBindGroup(0, entry.bindGroup);
+      pass.draw(3);
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+      this.uploads.presents++;
+    }
+
     /** Frame boundary from PM4_XE_SWAP — xenia uses this to trigger present/swap on the host. */
     swap() {
       this._flushFrame();
+      this._presentOffscreen();
       this._frameClearColor = false;
       this._frameClearDepth = false;
       this.lastFrame = { at: (typeof performance !== 'undefined' ? performance.now() : Date.now()) };
@@ -1202,6 +1568,7 @@
       if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; this.depthView = null; }
       if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
       if (this.viewportBuffer) { this.viewportBuffer.destroy(); this.viewportBuffer = null; this._viewportLast = null; }
+      this._destroyColorTargets();
       for (const entry of this.implicitIndexCache.values()) if (entry.buffer.destroy) entry.buffer.destroy();
       this.implicitIndexCache.clear();
       this.implicitIndexBytes = 0;
@@ -1215,7 +1582,7 @@
   }
 
   // Internals exposed for unit tests only — unstable shapes, not public API.
-  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
+  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, DEPTH_ONLY_FRAGMENT_WGSL, PRESENT_BLIT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
 
   const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL, _internal };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

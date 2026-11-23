@@ -56,6 +56,16 @@ test('decodeVertexFetchConstants decodes type, address, endian and size', () => 
   assert.equal(constants[7].endianName, '8in16');
 });
 
+test('the fetch constant address counts dwords — the byte address is address << 2 (xenia)', () => {
+  // xenia: xe_gpu_vertex_fetch_t.address is "address in dwords" and the guest
+  // address is "vfetch_constant.address << 2" (xenia
+  // d3d12_command_processor.cc). 0x00040001 dwords = 0x00100004 bytes.
+  const regs = new Uint32Array(192);
+  regs[0] = ((0x00040001 << 2) | 3) >>> 0; // type=vertex, address 0x00040001 dwords
+  const constants = VF.decodeVertexFetchConstants((i) => regs[i]);
+  assert.equal(constants[0].baseAddress, 0x00100004);
+});
+
 test('decodeVertexFetchConstants requires readDword', () => {
   assert.throws(() => VF.decodeVertexFetchConstants(null), TypeError);
 });

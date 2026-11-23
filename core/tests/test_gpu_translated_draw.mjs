@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertValidWgsl, checkProgramLinks } from './helpers/dawn_validate.mjs';
+import { assertValidWgsl, checkProgramLinks, checkAttachmentFormats } from './helpers/dawn_validate.mjs';
 import '../../public/js/gpu/xenos_registers.js';
 import '../../public/js/gpu/register_file.js';
 import '../../public/js/gpu/pm4.js';
@@ -129,7 +129,11 @@ function makeFakeDevice() {
       submit() { log.submits++; },
     },
     createBuffer(desc) { const b = { desc }; log.buffers.push(b); return b; },
-    createTexture() { return { destroy() {}, createView() { return { kind: 'texture-view' }; } }; },
+    createTexture(desc) {
+      const tex = { desc, destroy() { tex.destroyed = true; }, createView() { return { kind: 'texture-view' }; } };
+      (log.textures ??= []).push(tex);
+      return tex;
+    },
     createShaderModule(desc) { log.modules.push(desc); return { desc }; },
     createRenderPipeline(desc) {
       const pipeline = { desc, getBindGroupLayout() { return { kind: 'fake-bgl' }; } };
@@ -655,35 +659,190 @@ test('GAMMA RT0: the translated PS is gamma-encoded (xenia PWL); the draw runs, 
   assert.doesNotMatch(fsModule2.code, /fn xenosGamma/);
 });
 
-test('traps: float color format is refused naming the format', () => {
+test('traps: a color format WebGPU only has behind an optional feature is refused naming the format', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 7 << 16 }) })),
-    /k_16_16_16_16_FLOAT/);
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 5 << 16 }) })),
+    /k_16_16_16_16/);
 });
 
-test('traps: kD24FS8 float depth refused when depth testing is enabled', () => {
+test('a guest color format the canvas cannot carry renders into an offscreen target of that format', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // k_2_10_10_10 → rgb10a2unorm (xenia's GetColorDXGIFormat)
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  // the pipeline's color target carries the guest's format
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].format, 'rgb10a2unorm');
+  // the frame renders into an offscreen texture of that format, not the canvas
+  const rt = log.textures.find((t) => t.desc.label === 'xenos-rt-rgb10a2unorm');
+  assert.ok(rt, 'the offscreen render target exists');
+  assert.equal(rt.desc.format, 'rgb10a2unorm');
+  assert.equal(rt.desc.size[0], 64);
+  assert.equal(rt.desc.size[1], 64);
+  // ... and the canvas is NOT the pass's color attachment (the frame renders offscreen)
+  assert.equal(log.passes.length, 1);
+  assert.ok(log.textures.some((t) => t.desc.label === 'xenos-rt-rgb10a2unorm'));
+});
+
+test('the present blit shader compiles with Dawn', async () => {
+  await assertValidWgsl(INTERNAL.PRESENT_BLIT_WGSL);
+});
+
+test('a frame that rendered into the canvas is not overwritten by a stale offscreen target', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // frame 1: an offscreen format → the canvas is only updated at swap()
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  backend.swap();
+  const drawsAfterFirstSwap = log.drawCalls.length;
+  // frame 2: the canvas format → the frame goes straight to the canvas
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  backend.swap();
+  assert.equal(log.drawCalls.length, drawsAfterFirstSwap + 1, 'only the guest draw — no stale blit over the canvas');
+});
+
+test('the offscreen target is presented to the canvas with a blit at swap()', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  const submitsBefore = log.submits;
+  const passesBefore = log.passes.length;
+  backend.swap();
+  assert.equal(log.submits, submitsBefore + 2, 'the frame flush and the present pass are submitted');
+  assert.equal(log.passes.length, passesBefore + 1, 'the present pass is a new pass');
+  // the blit is a fullscreen triangle into the canvas texture
+  const blit = log.drawCalls.at(-1);
+  assert.deepEqual(blit, ['draw', 3]);
+  // the blit pipeline targets the canvas format and samples the offscreen texture
+  const blitPipeline = log.pipelines.at(-1);
+  assert.equal(blitPipeline.desc.fragment.targets[0].format, 'bgra8unorm');
+  assert.match(blitPipeline.desc.label, /present/);
+});
+
+test('k_8_8_8_8 still renders straight into the canvas (no offscreen target, no blit)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].format, 'bgra8unorm');
+  assert.equal(log.textures.filter((t) => t.desc.label?.startsWith('xenos-rt-')).length, 0, 'no offscreen target');
+  const drawsBefore = log.drawCalls.length;
+  backend.swap();
+  assert.equal(log.drawCalls.length, drawsBefore, 'no present blit — the canvas already holds the frame');
+});
+
+test('the guest changing the render-target format mid-frame ends the pass and starts a new one', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  assert.equal(log.passes.length, 2, 'a render pass has one color attachment format');
+});
+
+test('the offscreen target is released on resize() and destroy()', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  const rt = log.textures.find((t) => t.desc.label === 'xenos-rt-rgb10a2unorm');
+  assert.ok(rt);
+  let destroyed = false;
+  rt.destroy = () => { destroyed = true; };
+  backend.resize();
+  assert.equal(destroyed, true, 'the stale offscreen target is destroyed on resize');
+});
+
+test('kD24FS8 float depth uses a depth32float attachment (xenia uses a float depth target for 20e4)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x2 | 0x4 }) }));
+  const depth = log.textures.filter((t) => t.desc.label === 'xenos-depth').at(-1);
+  assert.ok(depth, 'the depth attachment was created');
+  assert.equal(depth.desc.format, 'depth32float');
+  const pass = log.passes.at(-1);
+  assert.ok(pass, 'a render pass was recorded');
+  assert.ok(pass.depthStencilAttachment, 'the pass has a depth attachment');
+  assert.equal(pass.depthStencilAttachment.stencilLoadOp, undefined, 'a stencil-less depth attachment has no stencil ops');
+  assert.equal(pass.depthStencilAttachment.depthLoadOp, 'clear');
+});
+
+test('Dawn accepts the depth attachment formats this port chooses (depth24plus-stencil8, depth32float)', async () => {
+  assert.equal(await checkAttachmentFormats({ depthFormat: 'depth24plus-stencil8', stencil: true }), null);
+  assert.equal(await checkAttachmentFormats({ depthFormat: 'depth32float' }), null);
+  // A depth-only pipeline (xenia's kDepth mode) has no fragment stage and a
+  // zero color write mask — Dawn must accept that combination.
+  assert.equal(await checkAttachmentFormats({ depthFormat: 'depth24plus-stencil8', depthOnly: true }), null);
+});
+
+test('a depth-only draw (xenia kDepth) runs no pixel shader and writes no color', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS_CONST_VS, dwords: PS_CONST_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets(), depthOnly: true }));
+  const pipeline = log.pipelines.at(-1);
+  assert.ok(pipeline, 'a pipeline was created');
+  assert.equal(pipeline.desc.depthStencil.format, 'depth24plus-stencil8');
+  // The color target writes nothing and no guest pixel shader is bound.
+  assert.equal(pipeline.desc.fragment.targets[0].writeMask, 0, 'the color target writes nothing');
+  assert.match(pipeline.desc.fragment.module.desc.code, /Depth-only draw/);
+  assert.doesNotMatch(pipeline.desc.fragment.module.desc.code, /Xenos pixel shader/);
+  // The guest pixel shader was not translated at all for this draw.
+  assert.equal(log.modules.filter((m) => /Xenos pixel shader/.test(m.code)).length, 0);
+});
+
+test('traps: kD24FS8 float depth with stencil is refused (WebGPU has no float depth format with a stencil plane)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x2 }) })),
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x1 | 0x2 }) })),
     /kD24FS8/);
 });
 
-test('traps: back-face stencil reference differing from the front face is refused (WebGPU has one reference)', () => {
+test('the pipeline honors the guest z-clipping (xenia depth_clip = !PA_CL_CLIP_CNTL.clip_disable)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
-  const { backend } = makeBackend(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets() }));
+  assert.equal(log.pipelines.at(-1).desc.depthStencil.depthClipEnabled, true);
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paClClipCntl: 1 << 16 }) }));
+  assert.equal(log.pipelines.at(-1).desc.depthStencil.depthClipEnabled, false);
+});
+
+test('the stencil reference follows xenia (the front pair, or the BF pair when the front faces are culled)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   const dc = 0x1 | 0x80; // stencil on + backface_enable
-  assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }) })),
-    /STENCILREFMASK_BF/);
+  // Both faces drawn → the front pair (RB_STENCILREFMASK), like xenia's hosts.
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }) }));
+  assert.equal(log.stencilRef, 0x01);
+  // Front faces culled (only back faces are rasterized) → the BF pair.
+  log.stencilRef = undefined;
+  backend.draw(drawParams({
+    renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02, paSuScModeCntl: 0x1 }),
+  }));
+  assert.equal(log.stencilRef, 0x02);
 });
 
 test('traps: a draw without the render-target snapshot refuses (the CP always attaches it)', () => {
@@ -836,10 +995,11 @@ test('batched frame: a trap mid-frame drops the pending frame unsubmitted — no
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   backend.draw(drawParams());
   assert.equal(log.submits, 0, 'pending');
-  // a 4x-MSAA render target refuses to draw — the trap drops the WHOLE pending frame
+  // a color format WebGPU only has behind an optional feature refuses to draw —
+  // the trap drops the WHOLE pending frame
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
-    /4x MSAA/);
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 5 << 16 }) })),
+    /k_16_16_16_16/);
   assert.equal(log.submits, 0, 'no partial frame is submitted after a trap');
   backend.swap(); // nothing pending — swap has nothing to flush
   assert.equal(log.submits, 0);
@@ -863,14 +1023,69 @@ test('resize() forces a defined-target frame (resize of the canvas = new frame)'
   assert.equal(log.passes[1].colorAttachments[0].loadOp, 'clear');
 });
 
-test('traps: a 4x-MSAA guest render target refuses to draw (single-sampled canvas)', () => {
+test('a 4x-MSAA guest render target renders into a multisampled attachment and resolves', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  // the pipeline declares the sample count
+  assert.equal(log.pipelines[0].desc.multisample.count, 4);
+  // the frame renders into a 4x multisampled texture of the canvas format
+  const msaa = log.textures.find((t) => t.desc.sampleCount === 4);
+  assert.ok(msaa, 'the multisampled color attachment exists');
+  assert.equal(msaa.desc.format, 'bgra8unorm');
+  // ... and the pass resolves it into the single-sample target
+  const pass = log.passes[0];
+  assert.ok(pass.colorAttachments[0].resolveTarget, 'the pass has a resolve target');
+  assert.equal(pass.colorAttachments[0].storeOp, 'discard', 'the multisample content is not kept');
+  // the depth attachment follows the sample count (it is recreated for it)
+  const depth = log.textures.filter((t) => t.desc.label === 'xenos-depth').at(-1);
+  assert.equal(depth.desc.sampleCount, 4);
+  // ... and the pass uses the NEW depth view (the old one was destroyed)
+  const depthViews = log.passes[0].depthStencilAttachment;
+  assert.ok(depthViews, 'the pass has a depth attachment');
+});
+
+test('the bring-up placeholder pipelines carry the sample count too', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest, { placeholderShader: true });
+  // no vertex shader → the full-canvas placeholder path
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  assert.equal(log.pipelines.at(-1).desc.multisample.count, 4);
+});
+
+test('a 2x-MSAA guest render target traps (WebGPU only has a sample count of 1 or 4)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
-    /4x MSAA/);
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 1 << 16 }) })),
+    /2x MSAA/);
+});
+
+test('the MSAA sample count is part of the pipeline key (a 1x pipeline is never reused for 4x)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 0 << 16 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  const counts = log.pipelines.map((p) => p.desc.multisample.count);
+  assert.deepEqual(counts, [1, 4], 'two pipelines, one per sample count');
+});
+
+test('the guest switching the sample count mid-frame ends the pass (attachments must match)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 0 << 16 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  assert.equal(log.passes.length, 2);
+  assert.ok(log.textures.find((t) => t.desc.sampleCount === 4));
 });
 
 test('color_exp_bias: the translated PS scales oC0 by 2^bias (all lanes) and the draw runs', () => {
@@ -1049,11 +1264,11 @@ test('triangle-fan (indexed): guest indices expand fan→list, pipeline uses tri
   backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3 /* k16in32: swap 16-bit lanes in each 32-bit word — BE uint16 -> LE */, numIndices: 5 }));
   assert.equal(log.pipelines[0].desc.primitive.topology, 'triangle-list');
   assert.equal(log.vertexBindings.length, 1);
-  assert.deepEqual(log.drawCalls, [['drawIndexed', 9]]); // (7,8,9),(7,9,10),(7,10,11)
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 9]]); // (8,9,7),(9,10,7),(10,11,7) — xenia's TriangleFanToList order
   assert.equal(log.indexBuffer.format, 'uint16');
   const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
   const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 9);
-  assert.deepEqual([...out], [7, 8, 9, 7, 9, 10, 7, 10, 11]);
+  assert.deepEqual([...out], [8, 9, 7, 9, 10, 7, 10, 11, 7]);
 });
 
 test('triangle-fan: the converted index buffer is content-cached across draws (one upload)', () => {
@@ -1113,7 +1328,7 @@ test('triangle-fan (implicit vertices, non-indexed): a synthetic index buffer is
   assert.equal(log.indexBuffer.format, 'uint16');
   const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
   const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 6);
-  assert.deepEqual([...out], [0, 1, 2, 0, 2, 3]);
+  assert.deepEqual([...out], [1, 2, 0, 2, 3, 0]);
   // and the synthetic buffer is memoized
   backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', numIndices: 4, isIndexed: false }));
   const ibWrites = log.writes.filter((w) => w.buffer === log.indexBuffer.buffer);
@@ -1162,8 +1377,8 @@ test('degenerate fan/loop draws (fewer indices than one primitive) skip the draw
 
 test('expandConvertedIndices unit semantics (fan/loop/quads, widths preserved, degenerates)', () => {
   const { expandConvertedIndices } = INTERNAL;
-  assert.deepEqual([...expandConvertedIndices(new Uint16Array([0, 1, 2, 3, 4]), 'fan')], [0, 1, 2, 0, 2, 3, 0, 3, 4]);
-  assert.deepEqual([...expandConvertedIndices(new Uint32Array([9, 8, 7]), 'fan')], [9, 8, 7]);
+  assert.deepEqual([...expandConvertedIndices(new Uint16Array([0, 1, 2, 3, 4]), 'fan')], [1, 2, 0, 2, 3, 0, 3, 4, 0]);
+  assert.deepEqual([...expandConvertedIndices(new Uint32Array([9, 8, 7]), 'fan')], [8, 7, 9]);
   assert.equal(expandConvertedIndices(new Uint16Array([0, 1]), 'fan'), null);
   assert.deepEqual([...expandConvertedIndices(new Uint16Array([5, 6]), 'loop')], [5, 6, 5]);
   assert.equal(expandConvertedIndices(new Uint16Array([5]), 'loop'), null);

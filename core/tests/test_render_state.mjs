@@ -46,15 +46,61 @@ test('unknown color-format nibbles decode to a named, unrecognized value (and tr
   }
 });
 
-test('every other color format traps with its xenia name when the PS writes oC0', () => {
+test('every guest color format maps to a WebGPU color target exactly like xenia maps it', () => {
+  // xenia: RenderTargetCache::GetColorDXGIFormat + GetBaseColorFormat.
+  // null = the canvas format itself (8-bit unorm RGBA).
   const cases = [
-    [2, 'k_2_10_10_10'], [3, 'k_2_10_10_10_FLOAT'], [4, 'k_16_16'], [5, 'k_16_16_16_16'],
-    [6, 'k_16_16_FLOAT'], [7, 'k_16_16_16_16_FLOAT'], [10, 'k_2_10_10_10_AS_10_10_10_10'],
-    [12, 'k_2_10_10_10_FLOAT_AS_16_16_16_16'], [14, 'k_32_FLOAT'], [15, 'k_32_32_FLOAT'],
+    [0, 'k_8_8_8_8', null],
+    [1, 'k_8_8_8_8_GAMMA', null],
+    [2, 'k_2_10_10_10', 'rgb10a2unorm'],
+    [3, 'k_2_10_10_10_FLOAT', 'rgba16float'],
+    [6, 'k_16_16_FLOAT', 'rg16float'],
+    [7, 'k_16_16_16_16_FLOAT', 'rgba16float'],
+    [10, 'k_2_10_10_10_AS_10_10_10_10', 'rgb10a2unorm'], // xenia's base format
+    [12, 'k_2_10_10_10_FLOAT_AS_16_16_16_16', 'rgba16float'], // xenia's base format
+    [14, 'k_32_FLOAT', 'r32float'],
+    [15, 'k_32_32_FLOAT', 'rg32float'],
   ];
-  for (const [format, name] of cases) {
-    assert.throws(() => rtState({ colorInfo0: format << 16 }), (e) => e instanceof RS.XenosRenderStateError && e.message.includes(name));
+  for (const [format, name, webgpu] of cases) {
+    const state = rtState({ colorInfo0: format << 16 });
+    assert.equal(state.colorFormatName, name, name);
+    assert.equal(state.colorFormat, webgpu, name);
   }
+});
+
+test('the 16-bit snorm color formats trap: WebGPU exposes them only with an optional feature', () => {
+  for (const [format, name] of [[4, 'k_16_16'], [5, 'k_16_16_16_16']]) {
+    assert.throws(
+      () => rtState({ colorInfo0: format << 16 }),
+      (e) => e instanceof RS.XenosRenderStateError && e.message.includes(name) && /texture-formats-tier1/.test(e.message),
+      name);
+  }
+});
+
+test('an unknown color format traps with its xenia name', () => {
+  assert.throws(
+    () => rtState({ colorInfo0: 9 << 16 }),
+    (e) => e instanceof RS.XenosRenderStateError && /unrecognized/.test(e.message));
+});
+
+test('blending a format WebGPU cannot blend traps (r32float/rg32float need an optional feature)', () => {
+  // blendControl0 = 0x00010001 is the "enabled" pattern the harness uses; a
+  // real blend needs a non-trivial factor.
+  assert.throws(
+    () => rtState({ colorInfo0: 14 << 16, blendControl0: 0x00040001 }),
+    (e) => e instanceof RS.XenosRenderStateError && /float32-blendable/.test(e.message));
+  // the same format without blending is fine
+  const state = rtState({ colorInfo0: 14 << 16 });
+  assert.equal(state.colorFormat, 'r32float');
+});
+
+test('the write mask is restricted to the channels the format has', () => {
+  // k_32_FLOAT has one channel: only RED can be written.
+  assert.equal(rtState({ colorInfo0: 14 << 16, colorMask: 0x0000000F }).writeMask, 0x1);
+  // k_16_16_FLOAT has two: RED|GREEN.
+  assert.equal(rtState({ colorInfo0: 6 << 16, colorMask: 0x0000000F }).writeMask, 0x3);
+  // four-channel formats keep the guest's mask as-is.
+  assert.equal(rtState({ colorInfo0: 0, colorMask: 0x00000005 }).writeMask, 0x5);
 });
 
 test('k_8_8_8_8_GAMMA decodes (the PWL gamma encode happens in the translated PS, not here)', () => {
@@ -196,18 +242,36 @@ test('stencil enable maps func/fail/zpass/zfail for both faces (BF off → same 
   assert.equal(s.stencilRef, 0x7F);
 });
 
-test('back-face stencil uses the BF fields when backface_enable is set', () => {
+test('back-face stencil uses the BF fields when backface_enable is set (xenia: only for two-faced primitives)', () => {
   const dc = 0x1 | 0x80 /* backface_enable */
     | (1 << 8) | (2 << 11) | (3 << 14) | (4 << 17)      // front: less/replace/incr-clamp/decr-clamp
     | (7 << 20) | (6 << 23) | (5 << 26) | (7 << 29);    // back: always/increment-wrap/invert/decrement-wrap
-  const s = rtState({ depthControl: dc, stencilRefMask: 0x11, stencilRefMaskBf: 0x11 });
+  const s = rtState({ depthControl: dc, stencilRefMask: 0x11, stencilRefMaskBf: 0x11 }, { primitivePolygonal: true });
   assert.deepEqual(s.depthStencil.stencilFront, { compare: 'less', failOp: 'replace', depthFailOp: 'decrement-clamp', passOp: 'increment-clamp' });
   assert.deepEqual(s.depthStencil.stencilBack, { compare: 'always', failOp: 'increment-wrap', depthFailOp: 'decrement-wrap', passOp: 'invert' });
+  // xenia: the back-face stencil ops apply only to two-faced primitives
+  // (IsPrimitiveTwoFaced) — points/lines use the front-face ops for both faces.
+  const lines = rtState({ depthControl: dc, stencilRefMask: 0x11, stencilRefMaskBf: 0x11 }, { primitivePolygonal: false });
+  assert.deepEqual(lines.depthStencil.stencilBack, s.depthStencil.stencilFront);
 });
 
-test('back-face stencil reference may not differ from the front one (WebGPU has one reference per pass)', () => {
-  const dc = 0x1 | 0x80;
-  assert.throws(() => rtState({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }), /RB_STENCILREFMASK_BF/);
+test('the stencil reference/mask pair follows xenia (front pair, or the BF pair when the front faces are culled)', () => {
+  const dc = 0x1 | 0x80; // stencil_enable | backface_enable
+  // Both faces drawn → the front pair (RB_STENCILREFMASK), like xenia's hosts.
+  const s = rtState({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }, { primitivePolygonal: true });
+  assert.equal(s.stencilRef, 0x01);
+  assert.equal(s.depthStencil.stencilReadMask, 0x00);
+  assert.equal(s.depthStencil.stencilWriteMask, 0x00);
+  // Front faces culled (only back faces are rasterized) → the BF pair.
+  const bf = rtState(
+    { depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02, paSuScModeCntl: 0x1 },
+    { primitivePolygonal: true });
+  assert.equal(bf.stencilRef, 0x02);
+  // ... and the back faces are not culled → the front pair again.
+  const backCulled = rtState(
+    { depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02, paSuScModeCntl: 0x2 },
+    { primitivePolygonal: true });
+  assert.equal(backCulled.stencilRef, 0x01);
 });
 
 test('equal BF reference is fine', () => {
@@ -217,15 +281,33 @@ test('equal BF reference is fine', () => {
 });
 
 // ------------------------------------------------------------ traps
-test('kD24FS8 depth traps when depth/stencil is active', () => {
+test('kD24FS8 depth maps to WebGPU depth32float (xenia uses a float depth target for 20e4)', () => {
   const fs8 = 1 << 16;
-  assert.throws(() => rtState({ depthInfo: fs8, depthControl: 0x2 }), /kD24FS8/);
+  const st = rtState({ depthInfo: fs8, depthControl: 0x2 | 0x4 | 0x10 }); // z_enable | z_write | zfunc=less
+  assert.equal(st.depthStencil.format, 'depth32float');
+  assert.equal(st.depthStencil.depthWriteEnabled, true);
+  assert.equal(st.depthStencil.depthCompare, 'less');
+  assert.equal(st.depthFormatName, 'kD24FS8');
+});
+
+test('kD24FS8 depth with stencil traps (WebGPU has no float depth format with a stencil plane)', () => {
+  const fs8 = 1 << 16;
   assert.throws(() => rtState({ depthInfo: fs8, depthControl: 0x1 }), /kD24FS8/);
+  assert.throws(() => rtState({ depthInfo: fs8, depthControl: 0x1 | 0x2 }), /kD24FS8/);
   assert.doesNotThrow(() => rtState({ depthInfo: fs8, depthControl: 0 }), 'inactive depth state is not decoded');
 });
 
-test('kD24FS8 depth traps when the PS exports oDepth', () => {
-  assert.throws(() => rtState({ depthInfo: 1 << 16 }, { psExportsDepth: true }), /kD24FS8/);
+test('kD24S8 depth maps to WebGPU depth24plus-stencil8', () => {
+  const st = rtState({ depthInfo: 0, depthControl: 0x2 | 0x4 | 0x10 });
+  assert.equal(st.depthStencil.format, 'depth24plus-stencil8');
+  assert.equal(st.depthFormatName, 'kD24S8');
+});
+
+test('z clipping follows xenia (depth_clip = !PA_CL_CLIP_CNTL.clip_disable)', () => {
+  // PA_CL_CLIP_CNTL.clip_disable is bit 16 (xenia registers.h).
+  assert.equal(rtState({}).depthStencil.depthClipEnabled, true);
+  assert.equal(rtState({ paClClipCntl: 0 }).depthStencil.depthClipEnabled, true);
+  assert.equal(rtState({ paClClipCntl: 1 << 16 }).depthStencil.depthClipEnabled, false);
 });
 
 test('alpha test decodes (applied by the translated PS, not pipeline state)', () => {
@@ -254,11 +336,11 @@ test('a missing snapshot traps with a named reason (no fabricated ROP state)', (
 
 test('the error class is stable and carries the message', () => {
   try {
-    rtState({ colorInfo0: 7 << 16 });
+    rtState({ colorInfo0: 5 << 16 }); // k_16_16_16_16 — the optional-format trap
     assert.fail('should have thrown');
   } catch (e) {
     assert.ok(e instanceof RS.XenosRenderStateError);
-    assert.match(e.message, /k_16_16_16_16_FLOAT/);
+    assert.match(e.message, /k_16_16_16_16/);
   }
 });
 
@@ -337,12 +419,14 @@ test('a missing snapshot traps with a named reason (no fabricated raster state)'
 });
 
 // ------------------------------------------------------------ MSAA (RB_SURFACE_INFO)
-test('RB_SURFACE_INFO msaa_samples 2x/4x trap loudly naming MSAA (canvas/depth are single-sampled)', () => {
-  for (const [samples, label] of [[1, '2x'], [2, '4x']]) {
-    assert.throws(() => rtState({ surfaceInfo: samples << 16 }), new RegExp(label + ' MSAA'));
-  }
-  // 3 (k3X, "this value is not supported on hardware" but must still not pass) — also traps
-  assert.throws(() => rtState({ surfaceInfo: 3 << 16 }), /MSAA/);
+test('RB_SURFACE_INFO msaa_samples decodes the guest sample count (xenia MsaaSamples)', () => {
+  assert.equal(rtState({ surfaceInfo: 0 << 16 }).sampleCount, 1, 'k1X');
+  assert.equal(rtState({ surfaceInfo: 2 << 16 }).sampleCount, 4, 'k4X');
+  // 2x: WebGPU's multisample count must be 1 or 4 (the spec's sample-count
+  // validation) — xenia's D3D12 host supports k2X, WebGPU cannot.
+  assert.throws(() => rtState({ surfaceInfo: 1 << 16 }), /2x MSAA/);
+  // 3 is not a guest MSAA mode (xenia's enum has only k1X/k2X/k4X) — it traps.
+  assert.throws(() => rtState({ surfaceInfo: 3 << 16 }), /msaa_samples=3/);
 });
 
 test('RB_SURFACE_INFO k1X renders (default reset state) and exposes the surface pitch', () => {
@@ -365,13 +449,21 @@ test('decodeColorInfo decodes color_exp_bias as a SIGNED 6-bit field (xenia int3
 });
 
 // ------------------------------------------- back-face stencil masks / alpha-to-coverage
-test('BF stencil read/write mask mismatch traps naming both masks (WebGPU shares one pair)', () => {
-  const front = 0x4255007F; // ref 0x7F, stencilmask 0x55, writemask 0x42
-  assert.throws(() => rtState({ stencilRefMask: front, stencilRefMaskBf: (0x66 << 8) | 0x7F, depthControl: 0x1 | 0x80 }), /stencil read\/write mask differs/);
-  assert.throws(() => rtState({ stencilRefMask: front, stencilRefMaskBf: (0x42 << 16) | 0x7F & ((0x77 << 8) | 0) | 0, depthControl: 0x1 | 0x80 }), /stencil read\/write mask differs|front/);
+test('the stencil read/write mask pair follows xenia (the front pair, or the BF pair when the front faces are culled)', () => {
+  const front = 0x4255007F; // ref 0x7F, stencilmask 0x00, writemask 0x55
+  const bf = (0x66 << 8) | 0x7F; // ref 0x7F, stencilmask 0x66, writemask 0x00
+  // Both faces drawn → the front pair (like xenia's hosts).
+  const s = rtState({ stencilRefMask: front, stencilRefMaskBf: bf, depthControl: 0x1 | 0x80 }, { primitivePolygonal: true });
+  assert.equal(s.depthStencil.stencilReadMask, 0x00);
+  assert.equal(s.depthStencil.stencilWriteMask, 0x55);
+  // Front faces culled → the BF pair.
+  const culled = rtState(
+    { stencilRefMask: front, stencilRefMaskBf: bf, depthControl: 0x1 | 0x80, paSuScModeCntl: 0x1 },
+    { primitivePolygonal: true });
+  assert.equal(culled.depthStencil.stencilReadMask, 0x66);
   // matching ref and masks — renders
   assert.doesNotThrow(() => rtState({ stencilRefMask: front, stencilRefMaskBf: front, depthControl: 0x1 | 0x80 }));
-  // mismatch only matters with stencil + backface enabled
+  // a mismatch only matters with stencil + backface enabled
   assert.doesNotThrow(() => rtState({ stencilRefMask: front, stencilRefMaskBf: 0x007F, depthControl: 0x2 }));
 });
 
@@ -382,7 +474,10 @@ const bits = (x) => new Uint32Array(new Float32Array([x]).buffer)[0];
 
 test('rasterizer state defaults (registers zeroed): no culling, CCW front faces, no depth bias, no drop', () => {
   const s = rtState({});
-  assert.deepEqual(s.raster, { cullMode: 'none', frontFace: 'ccw', depthBias: 0, depthBiasSlopeScale: 0, depthBiasClamp: 0, bothCull: false });
+  assert.deepEqual(s.raster, {
+    cullMode: 'none', frontFace: 'ccw', depthBias: 0, depthBiasSlopeScale: 0, depthBiasClamp: 0,
+    bothCull: false, cullFront: false, cullBack: false,
+  });
 });
 
 test('rasterizer state: face bit (bit 2) selects CW front faces', () => {
@@ -502,7 +597,7 @@ test('rasterizer state: para polygon offset (points/lines) uses the FRONT regist
 
 test('rasterizer state: kD24FS8 depth uses the float24-ULP offset factor (xenia GetD3D10IntegerPolygonOffset)', () => {
   const s = rtState({
-    depthInfo: 1 << 16, // kD24FS8 (but no depth writes/tests → the D24FS8 trap does not fire)
+    depthInfo: 1 << 16, // kD24FS8 (float depth → depth32float)
     paSuScModeCntl: 0x800,
     paSuPolyOffsetFrontScale: bits(0.0),
     paSuPolyOffsetFrontOffset: bits(1.0),

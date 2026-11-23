@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, multiPrimIbEnable /* PA_SU_SC_MODE_CNTL.multi_prim_ib_ena *\/, multiPrimResetIndex /* VGT_MULTI_PRIM_IB_RESET_INDX *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/, depthOnly /* RB_MODECONTROL.edram_mode = kDepth: depth only, no color output *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -88,6 +88,8 @@
       /** @type {bigint} 64-bit bin mask/select for predicated (tiled) rendering */
       this.binMask = 0n;
       this.binSelect = 0n;
+      /** Bin base offset programmed by PM4_SET_BIN_BASE_OFFSET (tiled rendering; recorded only). */
+      this.binBaseOffset = 0;
       /** Shaders loaded via IM_LOAD*; opaque descriptors owned by the backend. */
       this.vertexShader = null;
       this.pixelShader = null;
@@ -162,8 +164,11 @@
         if (offset + parsed.count > stop) throw new XenosGpuError(`${parsed.opcodeName} at word ${offset - 1}: truncated (${parsed.count} dwords needed, ${stop - offset} available)`);
         const payloadStart = offset;
         if (parsed.predicate) {
+          // xenia: a predicated type-3 packet is skipped when the bin
+          // predicate fails — and a predicated swap is skipped unconditionally
+          // ("we also skip predicated swaps, as they are never valid").
           const anyPass = (this.binSelect & this.binMask) !== 0n;
-          if (!anyPass && parsed.opcode !== pm4().PM4_OPCODE.PM4_XE_SWAP) {
+          if (!anyPass || parsed.opcode === pm4().PM4_OPCODE.PM4_XE_SWAP) {
             offset += parsed.count; // skipped by the bin predicate
             continue;
           }
@@ -196,6 +201,18 @@
       const opcode = parsed.opcode;
       const count = parsed.count;
       switch (opcode) {
+        case op.PM4_CONTEXT_UPDATE: {
+          // xenia: PM4_CONTEXT_UPDATE asserts a single dword payload of 0 and
+          // continues (it is a no-op); anything else asserts in xenia too.
+          if (count !== 1) throw new XenosGpuError('PM4_CONTEXT_UPDATE: expected 1 payload dword');
+          const value = u32s[start] >>> 0;
+          if (value !== 0) {
+            throw new XenosGpuError(
+              `PM4_CONTEXT_UPDATE: value 0x${value.toString(16).toUpperCase()} is not 0 — xenia asserts on any ` +
+              'other context-update value. Refusing to continue');
+          }
+          return end;
+        }
         case op.PM4_NOP:
           return end;
 
@@ -307,12 +324,27 @@
         }
         case op.PM4_DRAW_INDX_2:
           return this._draw(u32s, start, end, parsed.opcodeName, 0, false);
-        case op.PM4_DRAW_INDX_BIN: {
-          const vizQueryCondition = u32s[start];
-          return this._draw(u32s, start + 1, end, parsed.opcodeName, vizQueryCondition, true);
-        }
+        case op.PM4_DRAW_INDX_BIN:
         case op.PM4_DRAW_INDX_2_BIN:
-          return this._draw(u32s, start, end, parsed.opcodeName, 0, false);
+          // Tiled (binned) rendering. The binned draw packets carry the bin
+          // base and the bin size *ahead of* the index-buffer DMA base/size
+          // (the R6xx/R7xx tiled layout the Xenos inherits):
+          //   PM4_DRAW_INDX_BIN   : viz query, draw indicator, bin base, bin
+          //                          size, dma base, dma size
+          //   PM4_DRAW_INDX_2_BIN : draw indicator, bin base, bin size,
+          //                          dma base, dma size
+          // xenia implements neither: its switch has no case for them, so the
+          // packet falls into the default branch — "Unimplemented GPU OPCODE"
+          // and an assert (in a release build the assert is compiled out and
+          // the packet is skipped). This port cannot honor a bin draw either
+          // (there is no bin/EDRAM tiling here), and decoding one as an
+          // ordinary draw would read the bin base and bin size as the
+          // index-buffer DMA base and size — a silent miscompile. Refuse.
+          throw new XenosGpuError(
+            `${parsed.opcodeName}: tiled rendering (a binned draw) is not implemented in this port — the packet ` +
+            'carries a bin base and bin size that an ordinary draw cannot honor, and xenia does not implement ' +
+            'the opcode either (its switch logs "Unimplemented GPU OPCODE" and asserts). Refusing rather than ' +
+            'rasterizing the bin draw as a normal draw');
 
         // --- events / synchronization ----------------------------------------
         case op.PM4_EVENT_WRITE:
@@ -320,10 +352,17 @@
           this._eventWriteToMemory(u32s, start, end, parsed.opcodeName);
           return end;
         }
+        case op.PM4_EVENT_WRITE_EXT: {
+          // xenia writes the screen extent (six 16-bit values) to guest memory.
+          this._eventWriteScreenExtent(u32s, start, end, parsed.opcodeName);
+          return end;
+        }
         case op.PM4_EVENT_WRITE_CFL:
-        case op.PM4_EVENT_WRITE_EXT:
         case op.PM4_EVENT_WRITE_ZPD: {
-          // cache-flush / screen-extent / z-pass events: initiator recorded; memory writeback formats differ per event — forwarded to the backend, never silently dropped
+          // cache-flush / z-pass events: the initiator is recorded and the event
+          // is forwarded to the backend — xenia implements neither writeback
+          // (the z-pass counter is a TODO there), so nothing is written to guest
+          // memory.
           const initiator = u32s[start];
           if (this.backend && typeof this.backend.eventWrite === 'function') this.backend.eventWrite({ eventType: initiator & 0x3f, address: 0, data: null, opcode: parsed.opcodeName });
           else this.log('info', `${parsed.opcodeName} initiator 0x${initiator.toString(16)} (no backend sink)`);
@@ -348,8 +387,17 @@
           return end;
         }
         case op.PM4_XE_SWAP: {
+          // xenia: the swap packet starts with the 'SWAP' magic (asserted there)
+          // and bumps the GPU frame counter that EVENT_WRITE_SHD writes back.
+          if (end - start >= 1) {
+            const magic = u32s[start] >>> 0;
+            if (magic !== 0x53574150 /* 'SWAP' */) {
+              this.log('warn', `XE_SWAP: unexpected magic 0x${magic.toString(16).toUpperCase()} (xenia asserts 'SWAP' here)`);
+            }
+          }
           if (this.backend && typeof this.backend.swap === 'function') this.backend.swap();
           else this.log('info', 'XE_SWAP (present) — no backend sink');
+          this.counter = (this.counter + 1) >>> 0;
           return end;
         }
 
@@ -365,23 +413,28 @@
           return end;
         }
         case op.PM4_COND_EXEC: {
-          // conditional execution based on a register/memory compare — not yet modeled; trap loudly
-          throw new XenosGpuError('PM4_COND_EXEC: conditional execution is not implemented (xenia models it; port the compare logic before enabling)');
+          // A conditional block of packets. xenia does not implement this
+          // opcode either (its switch has no case for it — the default branch
+          // logs "Unimplemented GPU OPCODE" and skips the packet, which would
+          // run the conditional block unconditionally). This port refuses
+          // loudly instead of running a block the guest meant to be
+          // conditional.
+          throw new XenosGpuError(
+            'PM4_COND_EXEC: conditional execution is not implemented — xenia does not implement the opcode either ' +
+            '(its command processor logs "Unimplemented GPU OPCODE" and skips the packet, which would run the ' +
+            'conditional block unconditionally). Refusing rather than running a block the guest meant to be conditional');
         }
-        case op.PM4_COND_WRITE: {
-          throw new XenosGpuError('PM4_COND_WRITE: conditional write is not implemented');
-        }
+        case op.PM4_COND_WRITE:
+          return this._condWrite(u32s, start, end, parsed.opcodeName);
         case op.PM4_WAIT_REG_MEM:
+          return this._waitRegMem(u32s, start, end, parsed.opcodeName);
         case op.PM4_WAIT_REG_EQ:
         case op.PM4_WAIT_REG_GTE:
         case op.PM4_WAIT_FOR_IDLE:
         case op.PM4_WAIT_UNTIL_READ:
         case op.PM4_WAIT_IB_PFD_COMPLETE:
-          // Genuinely synchronous in our model — the ring is consumed inline, so waits succeed trivially.
-          // WAIT_REG_MEM with a memory location polls a value; xenia blocks until it matches.
-          if (opcode === op.PM4_WAIT_REG_MEM) {
-            throw new XenosGpuError('PM4_WAIT_REG_MEM: polling memory/register is not implemented; waits complete immediately only for WAIT_FOR_IDLE/WAIT_IB_PFD_COMPLETE');
-          }
+          // xenia does not implement these opcodes either — its command
+          // processor logs "Unimplemented GPU OPCODE" and skips the packet.
           return end;
 
         // --- binning (predication) ------------------------------------------
@@ -408,14 +461,140 @@
           return end;
         }
         case op.PM4_SET_BIN_BASE_OFFSET:
-          // bin base offset for tiled rendering — records into registers like xenia would via RB path; no sink yet
-          this.log('debug', `SET_BIN_BASE_OFFSET 0x${u32s[start].toString(16)} (no tiled-rendering sink yet)`);
+          // The offset added to the bin base of a DRAW_INDX_BIN packet.
+          // xenia does not implement this opcode either (its switch has no
+          // case for it), so it is only meaningful for the binned draws —
+          // which this port refuses. It is recorded for diagnostics and the
+          // packet is skipped.
+          this.binBaseOffset = u32s[start] >>> 0;
+          this.log('debug', `SET_BIN_BASE_OFFSET 0x${this.binBaseOffset.toString(16)} (recorded; tiled rendering is not implemented)`);
           return end;
 
         default:
           this.stats.unimplementedTraps++;
           throw new XenosGpuError(`${parsed.opcodeName}: unimplemented GPU opcode 0x${opcode.toString(16).toUpperCase().padStart(2, '0')} (count ${count}) — see docs/XENOS_GPU.md`);
       }
+    }
+
+    /**
+     * xenia's PM4_WAIT_REG_MEM: wait until a register or a memory location
+     * satisfies a comparison.
+     *
+     * xenia polls in a loop and blocks until the condition matches (sleeping
+     * wait/256 ms between polls when wait >= 0x100). This port cannot block —
+     * the command ring is consumed inline — so the comparison is evaluated
+     * once with xenia's exact rules; if it does not match, xenia would sleep
+     * and re-poll forever, and refusing loudly is the only honest answer.
+     */
+    _waitRegMem(u32s, start, end, opcodeName) {
+      if (end - start < 5) {
+        throw new XenosGpuError(`${opcodeName}: expected 5 payload dwords (wait_info, address, reference, mask, wait)`);
+      }
+      const waitInfo = u32s[start] >>> 0;
+      const addrWord = u32s[start + 1] >>> 0;
+      const ref = u32s[start + 2] >>> 0;
+      const mask = u32s[start + 3] >>> 0;
+      const value = this._readWaitValue(waitInfo, addrWord, opcodeName);
+      const source = (waitInfo & 0x10)
+        ? `memory 0x${((addrWord & ~0x3) >>> 0).toString(16)}`
+        : `register 0x${(addrWord >>> 0).toString(16)}`;
+      const matched = this._compareWaitValue(waitInfo, value, ref, mask);
+      if (!matched) {
+        throw new XenosGpuError(
+          `${opcodeName}: the wait condition is not met — ${source} holds 0x${value.toString(16).toUpperCase()} ` +
+          `(masked 0x${((value & mask) >>> 0).toString(16).toUpperCase()}), the reference is 0x${ref.toString(16).toUpperCase()} ` +
+          `(compare 0x${(waitInfo & 0x7).toString(16)}). xenia polls in a loop and blocks until it matches; this port ` +
+          'cannot block (the command ring is consumed inline), so it refuses instead of pretending the wait succeeded');
+      }
+      return end;
+    }
+
+    /**
+     * xenia's wait comparison (WAIT_REG_MEM and COND_WRITE share it):
+     * wait_info bits 0:2 select never/less/less-equal/equal/not-equal/
+     * greater-equal/greater/always, and the reference is compared against the
+     * *masked* value.
+     */
+    _compareWaitValue(waitInfo, value, ref, mask) {
+      const masked = (value & mask) >>> 0;
+      switch (waitInfo & 0x7) {
+        case 0x0: return false; // never
+        case 0x1: return masked < ref; // less than
+        case 0x2: return masked <= ref; // less than or equal
+        case 0x3: return masked === ref; // equal
+        case 0x4: return masked !== ref; // not equal
+        case 0x5: return masked >= ref; // greater than or equal
+        case 0x6: return masked > ref; // greater than
+        case 0x7: return true; // always
+        default: return false;
+      }
+    }
+
+    /**
+     * Read the value xenia's WAIT_REG_MEM/COND_WRITE poll: a register, or a
+     * memory location (wait_info bit 4) whose address's low 2 bits carry the
+     * GpuSwap endianness.
+     */
+    _readWaitValue(waitInfo, addrWord, opcodeName) {
+      if (waitInfo & 0x10) {
+        const endianness = addrWord & 0x3;
+        const address = (addrWord & ~0x3) >>> 0;
+        if (!this.readGuestMemory) {
+          throw new XenosGpuError(`${opcodeName}: reading memory needs readGuestMemory() to be wired to guest physical memory`);
+        }
+        const view = this.readGuestMemory(address);
+        if (!view || view.byteLength < 4) {
+          throw new XenosGpuError(`${opcodeName}: memory location 0x${address.toString(16)} is not readable`);
+        }
+        return pm4().gpuSwap32(view.getUint32(0, false), endianness);
+      }
+      const index = addrWord >>> 0;
+      // xenia: assert_true(poll_reg_addr < RegisterFile::kRegisterCount = 0x5003).
+      if (index >= 0x5003) {
+        throw new XenosGpuError(`${opcodeName}: register index 0x${index.toString(16)} is outside the register file`);
+      }
+      return this.registers.read(index) >>> 0;
+    }
+
+    /**
+     * xenia's PM4_COND_WRITE: a conditional write to a register or to memory.
+     * The value is polled (a register, or a memory location when wait_info
+     * bit 4 is set) and compared with xenia's rules; when it matches, the
+     * payload is written to the destination (memory when wait_info bit 8 is
+     * set, a register otherwise).
+     */
+    _condWrite(u32s, start, end, opcodeName) {
+      if (end - start < 6) {
+        throw new XenosGpuError(`${opcodeName}: expected 6 payload dwords (wait_info, address, reference, mask, destination, data)`);
+      }
+      const waitInfo = u32s[start] >>> 0;
+      const pollAddr = u32s[start + 1] >>> 0;
+      const ref = u32s[start + 2] >>> 0;
+      const mask = u32s[start + 3] >>> 0;
+      const destAddrWord = u32s[start + 4] >>> 0;
+      const data = u32s[start + 5] >>> 0;
+      const value = this._readWaitValue(waitInfo, pollAddr, opcodeName);
+      if (!this._compareWaitValue(waitInfo, value, ref, mask)) return end;
+      if (waitInfo & 0x100) {
+        // Memory destination; the address's low 2 bits carry the endianness
+        // (xenia: GpuSwap(write_data, endianness) then a plain store).
+        const endianness = destAddrWord & 0x3;
+        const address = (destAddrWord & ~0x3) >>> 0;
+        const bytes = new Uint8Array(4);
+        new DataView(bytes.buffer).setUint32(0, pm4().gpuSwap32(data >>> 0, endianness), false);
+        backendOrTrap(this.backend, 'memWrite', opcodeName)(address >>> 0, bytes);
+        this.stats.memWriteBytes += 4;
+      } else {
+        // Register destination. xenia's WriteRegister drops an out-of-range
+        // index with a warning instead of writing it.
+        const index = destAddrWord >>> 0;
+        if (index >= 0x5003) {
+          this.log('warn', `${opcodeName}: register index 0x${index.toString(16)} is outside the register file — the write is dropped`);
+        } else {
+          this._writeRegister(index, data >>> 0);
+        }
+      }
+      return end;
     }
 
     _eventWriteToMemory(u32s, start, end, opcodeName) {
@@ -443,7 +622,53 @@
       new DataView(bytes.buffer).setUint32(0, pm4().gpuSwap32(value >>> 0, endianness), false);
       backendOrTrap(this.backend, 'memWrite', opcodeName)(address >>> 0, bytes);
       this.stats.memWriteBytes += 4;
-      this.counter = (this.counter + 1) >>> 0;
+    }
+
+    /**
+     * xenia's PM4_EVENT_WRITE_EXT: a screen-extent writeback.
+     * xenia writes six 16-bit values — {min x, max x, min y, max y, min z,
+     * max z} = {0, 2560>>3, 0, 2560>>3, 0, 1} — to the guest address, with the
+     * bytes of each half word swapped when the address carries the k8in16
+     * endianness (xenia asserts that it does).
+     */
+    _eventWriteScreenExtent(u32s, start, end, opcodeName) {
+      const initiator = u32s[start] >>> 0;
+      this._writeRegister(regFile().XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3f);
+      if (this.backend && typeof this.backend.eventWrite === 'function') {
+        this.backend.eventWrite({ eventType: initiator & 0x3f, address: 0, data: null, opcode: opcodeName });
+      }
+      if (end - start < 2) {
+        // xenia reads the address unconditionally (the packet always has one).
+        this.log('debug', `${opcodeName}: no writeback address in the packet`);
+        return;
+      }
+      const addrWord = u32s[start + 1] >>> 0;
+      const endianness = addrWord & 0x3;
+      let address = (addrWord & ~0x3) >>> 0;
+      if (address > 0x1fffffff) {
+        const wbBase = this.registers.read(this.writebackStartIndex);
+        const wbSize = this.registers.read(this.writebackSizeIndex);
+        const off = (address - wbBase) >>> 0;
+        if (wbBase !== 0 && off < wbSize) address = (0x7f000000 + off) >>> 0;
+      }
+      // xenia: 0 >> 3, 2560 >> 3, 0 >> 3, 2560 >> 3, 0, 1
+      const extents = [0, 2560 >> 3, 0, 2560 >> 3, 0, 1];
+      const bytes = new Uint8Array(extents.length * 2);
+      for (let i = 0; i < extents.length; i++) {
+        const v = extents[i] & 0xffff;
+        // xenia's GpuSwap(uint16): kNone leaves it, k8in16 swaps the bytes in
+        // the half word; the other endiannesses are unhandled in xenia (the
+        // value is written unchanged there).
+        if (endianness === 1) {
+          bytes[i * 2] = (v >>> 8) & 0xff;
+          bytes[i * 2 + 1] = v & 0xff;
+        } else {
+          bytes[i * 2] = v & 0xff;
+          bytes[i * 2 + 1] = (v >>> 8) & 0xff;
+        }
+      }
+      backendOrTrap(this.backend, 'memWrite', opcodeName)(address >>> 0, bytes);
+      this.stats.memWriteBytes += bytes.length;
     }
 
     _loadConstantType(type, index, data, opcodeName) {
@@ -488,11 +713,25 @@
       let consumed = start + 1;
       if (source === pm4().SOURCE_SELECT.kDMA) {
         if (consumed + 2 > end) throw new XenosGpuError(`${opcodeName}: indexed draw packet too small for VGT_DMA_BASE/SIZE`);
-        indexGuestBase = u32s[consumed] & 0x1fffffff; // xenia CpuToGpu: GPU bus is 29 bits
+        // xenia's primitive processor: "The base should already be aligned
+        // according to the R6xx documentation, but aligning here too for
+        // safety" — the base is aligned down to the index element size and
+        // kept as the full 32-bit guest physical address.
+        indexGuestBase = (u32s[consumed] & ~((di.indexSize === 1 ? 4 : 2) - 1)) >>> 0;
         const dmaSizeWord = u32s[consumed + 1];
         const dmaSize = pm4().parseVgtDmaSize(dmaSizeWord);
         indexEndianness = dmaSize.swapMode;
         indexLengthWords = dmaSize.numWords;
+        // xenia's primitive processor clamps the drawn vertex count to the
+        // index buffer's declared size: "N vertices attempted to be drawn with
+        // an index buffer only containing M. Should be fetching zero indices
+        // instead of overflowing ones, but this is a rare situation, so not
+        // handled yet." (xenia primitive_processor.cc) — the draw fetches
+        // min(num_indices, num_words) indices.
+        if (di.numIndices > indexLengthWords) {
+          this.log('warn', `${opcodeName}: ${di.numIndices} indices requested but the index buffer only declares ${indexLengthWords} — the draw is clamped to the declared range (xenia clamps it the same way)`);
+          indexCount = indexLengthWords;
+        }
         this._writeRegister(regFile().XE_GPU_REG_VGT_DMA_BASE, indexGuestBase);
         this._writeRegister(regFile().XE_GPU_REG_VGT_DMA_SIZE, dmaSizeWord);
         consumed += 2;
@@ -526,11 +765,13 @@
       const RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
       const RB_COLOR1_INFO = 0x2003, RB_COLOR2_INFO = 0x2004, RB_COLOR3_INFO = 0x2005;
       const RB_COLOR_MASK = 0x2104, RB_ALPHA_REF = 0x210e;
+      const RB_MODECONTROL = 0x2208;
       const RB_BLEND_RED = 0x2105, RB_BLEND_GREEN = 0x2106, RB_BLEND_BLUE = 0x2107, RB_BLEND_ALPHA = 0x2108;
       const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
       const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
       const PA_SC_VIZ_QUERY = 0x2293;
+      const VGT_MULTI_PRIM_IB_RESET_INDX = 0x2103;
       const PA_SU_SC_MODE_CNTL = 0x2205, PA_SU_VTX_CNTL = 0x2302;
       const PA_CL_CLIP_CNTL = 0x2204, PA_CL_VTE_CNTL = 0x2206;
       const PA_CL_VPORT_XSCALE = 0x210F, PA_CL_VPORT_XOFFSET = 0x2110, PA_CL_VPORT_YSCALE = 0x2111, PA_CL_VPORT_YOFFSET = 0x2112;
@@ -541,6 +782,7 @@
       const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
         surfaceInfo: this.registers.read(RB_SURFACE_INFO) >>> 0,
+        rbModeControl: this.registers.read(RB_MODECONTROL) >>> 0,
         colorInfo0: this.registers.read(RB_COLOR_INFO) >>> 0,
         depthInfo: this.registers.read(RB_DEPTH_INFO) >>> 0,
         colorInfo1: this.registers.read(RB_COLOR1_INFO) >>> 0,
@@ -575,6 +817,28 @@
         paSuPolyOffsetBackScale: this.registers.read(PA_SU_POLY_OFFSET_BACK_SCALE) >>> 0,
         paSuPolyOffsetBackOffset: this.registers.read(PA_SU_POLY_OFFSET_BACK_OFFSET) >>> 0,
       };
+      // xenia's IssueDraw gate (D3D12CommandProcessor::IssueDraw):
+      //   RB_MODECONTROL.edram_mode (bits 0:2) — xenos::ModeControl:
+      //     kIgnore (0)    → the draw is ignored entirely (no fragments),
+      //     kCopy (6)     → the draw is a render-target copy,
+      //     kDepth (5)    → depth-only: no pixel shader, no color output,
+      //     kColorDepth (4)→ an ordinary color+depth draw.
+      //   RB_SURFACE_INFO.surface_pitch == 0 → "Doesn't actually draw".
+      const edramMode = (this.registers.read(RB_MODECONTROL) >>> 0) & 0x7;
+      if (edramMode === 0 /* kIgnore */) {
+        this.log('debug', `${opcodeName}: draw ignored — RB_MODECONTROL.edram_mode = kIgnore (xenia returns before rasterizing)`);
+        return end;
+      }
+      if (edramMode === 6 /* kCopy */) {
+        throw new XenosGpuError(
+          `${opcodeName}: the guest issued a render-target copy (RB_MODECONTROL.edram_mode = kCopy) — the copy of the ` +
+          'render target into guest memory (RB_COPY_*) is not implemented in this port (the EDRAM render-target cache, ' +
+          'step 7). Refusing to draw instead of silently dropping the copy');
+      }
+      if (((this.registers.read(RB_SURFACE_INFO) >>> 0) & 0x3fff) === 0) {
+        this.log('debug', `${opcodeName}: draw skipped — RB_SURFACE_INFO.surface_pitch is 0 (xenia: "doesn't actually draw")`);
+        return end;
+      }
       // xenia: if PA_SC_VIZ_QUERY has viz_query_ena (bit 0) AND kill_pix_post_hi_z (bit 7),
       // the draw is an occlusion-query hint and must NOT touch the render target (r6xx/r7xx
       // VIZ_QUERY). IssueDraw is not called then; other bit combinations draw normally.
@@ -594,12 +858,17 @@
       draw({
         primType: di.primType,
         primTypeName: di.primTypeName,
-        numIndices: di.numIndices,
+        numIndices: indexCount,
         isIndexed: source === pm4().SOURCE_SELECT.kDMA,
         indexGuestBase,
         indexFormat,
         indexEndianness,
         indexLengthWords,
+        // xenia's primitive reset index (multi-primitive index buffers):
+        // PA_SU_SC_MODE_CNTL.multi_prim_ib_ena enables it, and the reset value
+        // itself comes from VGT_MULTI_PRIM_IB_RESET_INDX.
+        multiPrimIbEnable: ((this.registers.read(PA_SU_SC_MODE_CNTL) >>> 21) & 1) !== 0,
+        multiPrimResetIndex: this.registers.read(VGT_MULTI_PRIM_IB_RESET_INDX) >>> 0,
         vizQueryCondition,
         majorModeExplicit,
         vertexFetchConstants,
@@ -607,6 +876,8 @@
         boolConstants,
         renderTargets,
         scissor,
+        // xenia's kDepth mode: no pixel shader, no color output — depth only.
+        depthOnly: edramMode === 5,
       });
       this.stats.draws++;
       return end;
