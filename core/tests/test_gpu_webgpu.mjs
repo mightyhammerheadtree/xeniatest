@@ -90,7 +90,11 @@ test('topologyForPrimType maps the WebGPU-encodable primitive types and traps th
   assert.equal(topologyForPrimType(3, 'kLineStrip'), 'line-strip');
   assert.equal(topologyForPrimType(4, 'kTriangleList'), 'triangle-list');
   assert.equal(topologyForPrimType(6, 'kTriangleStrip'), 'triangle-strip');
-  for (const [prim, name] of [[5, 'kTriangleFan'], [7, 'kTriangleWithWFlags'], [8, 'kRectangleList'], [0x0c, 'kLineLoop'], [0x0d, 'kQuadList'], [0x0f, 'kPolygon']]) {
+  // kTriangleFan/kLineLoop/kQuadList are converted host-side with index expansion (xenia's rule)
+  assert.equal(topologyForPrimType(5, 'kTriangleFan'), 'triangle-list');
+  assert.equal(topologyForPrimType(0x0c, 'kLineLoop'), 'line-strip');
+  assert.equal(topologyForPrimType(0x0d, 'kQuadList'), 'triangle-list');
+  for (const [prim, name] of [[7, 'kTriangleWithWFlags'], [8, 'kRectangleList'], [0x0e, 'kQuadStrip'], [0x0f, 'kPolygon']]) {
     assert.throws(() => topologyForPrimType(prim, name), (e) => e instanceof XenosWebGpuError && /topology is not encodable/.test(e.message), name);
   }
 });

@@ -165,8 +165,13 @@
   }
 
   // Xenos VGT_DRAW_INITIATOR prim_type (pm4.js PRIMITIVE_TYPE) → GPUPrimitiveTopology.
-  // Anything WebGPU cannot represent (triangle fan, quads, polygon, rect lists)
-  // traps loudly instead of silently drawing with the wrong connectivity.
+  // WebGPU cannot represent fan/loop/quad connectivity; those three are
+  // converted host-side with index expansion (see PRIM_TYPE_CONVERT) — the
+  // guest's geometry is always drawn, never silently skipped or misdrawn.
+  // The remaining unencodable values (kTriangleWithWFlags 0x07, kQuadStrip
+  // 0x0E, kPolygon 0x0F, kRectangleList 0x08 and the 2D copies) trap loudly —
+  // xenia's primitive processor refuses them too (they need a geometry
+  // shader / vertex-shader expansion, which is not implemented yet).
   const PRIM_TYPE_TOPOLOGY = new Map([
     [0x01 /* kPointList */, 'point-list'],
     [0x02 /* kLineList */, 'line-list'],
@@ -174,6 +179,52 @@
     [0x04 /* kTriangleList */, 'triangle-list'],
     [0x06 /* kTriangleStrip */, 'triangle-strip'],
   ]);
+  // Host-side index conversion for the primitives WebGPU has no topology for.
+  // Mirrors xenia's primitive_processor.cc conversion paths (used there when
+  // the host lacks the primitive natively — WebGPU always lacks these):
+  //   kTriangleFan → triangle-list: triangles (i0, i1, i2), (i0, i2, i3), …
+  //                  (cyclic rotation of xenia's (i-1, i, i0) — same winding)
+  //   kLineLoop    → line-strip with the loop closed (first index re-appended)
+  //   kQuadList    → triangle-list: (v0,v1,v2), (v0,v2,v3) per quad (xenia order)
+  // Leftover indices that do not complete a primitive are dropped, matching
+  // real hardware's primitive assembly. Fan/loop/quad draws are polygonal
+  // (fan/quads) or lines (loop) exactly as before the conversion.
+  const PRIM_TYPE_CONVERT = new Map([
+    [0x05 /* kTriangleFan */, { topology: 'triangle-list', kind: 'fan' }],
+    [0x0C /* kLineLoop */, { topology: 'line-strip', kind: 'loop' }],
+    [0x0D /* kQuadList */, { topology: 'triangle-list', kind: 'quads' }],
+  ]);
+  // Expand a decoded (little-endian, in-register typed array) index buffer for
+  // a converted primitive type. Returns null when there is nothing to draw.
+  function expandConvertedIndices(indices, kind) {
+    const n = indices.length;
+    if (kind === 'fan') {
+      if (n < 3) return null;
+      const out = new indices.constructor((n - 2) * 3);
+      const v0 = indices[0];
+      let o = 0;
+      for (let i = 2; i < n; i++) { out[o++] = v0; out[o++] = indices[i - 1]; out[o++] = indices[i]; }
+      return out;
+    }
+    if (kind === 'loop') {
+      if (n < 2) return null;
+      const out = new indices.constructor(n + 1);
+      out.set(indices, 0);
+      out[n] = indices[0];
+      return out;
+    }
+    // quads: two triangles per quad, xenia's order (v0,v1,v2), (v0,v2,v3)
+    const quads = Math.floor(n / 4);
+    if (quads === 0) return null;
+    const out = new indices.constructor(quads * 6);
+    let o = 0;
+    for (let q = 0; q < quads; q++) {
+      const b = q * 4, i0 = indices[b], i1 = indices[b + 1], i2 = indices[b + 2], i3 = indices[b + 3];
+      out[o++] = i0; out[o++] = i1; out[o++] = i2;
+      out[o++] = i0; out[o++] = i2; out[o++] = i3;
+    }
+    return out;
+  }
   // xenia draw_util::IsPrimitivePolygonal: triangle-list/fan/strip/W-flags, quad-list/strip,
   // polygon — these have faces that culling/wireframe/polygon-offset apply to.
   function isPrimitivePolygonal(primType) {
@@ -182,10 +233,12 @@
   }
 
   function topologyForPrimType(primType, primTypeName) {
+    const convert = PRIM_TYPE_CONVERT.get((primType ?? 0) & 0x3f);
+    if (convert) return convert.topology; // host-side index expansion — see _setIndexBufferAndDraw
     const topology = PRIM_TYPE_TOPOLOGY.get(primType & 0x3f);
     if (!topology) {
       // Called at draw time, long after XenosWebGpuError (declared below) is initialized.
-      throw new XenosWebGpuError(`prim ${primTypeName ?? `prim_0x${(primType & 0x3f).toString(16)}`}: primitive topology is not encodable in WebGPU (triangle-fan/quad/polygon connectivity would need index conversion) — refusing to draw with the wrong connectivity`);
+      throw new XenosWebGpuError(`prim ${primTypeName ?? `prim_0x${(primType & 0x3f).toString(16)}`}: primitive topology is not encodable in WebGPU (only kTriangleFan/kLineLoop/kQuadList are converted host-side; the rest — e.g. kTriangleWithWFlags, kQuadStrip, kPolygon, kRectangleList — need shader expansion and are refused by xenia's primitive processor as well) — refusing to draw with the wrong connectivity`);
     }
     return topology;
   }
@@ -240,6 +293,9 @@
       this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
       this.boolHash = -1;
       this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0 };
+      this.implicitIndexCache = new Map();
+      this.implicitIndexBytes = 0;
+      this.implicitIndexClock = 0;
       this.lastVertexFetch = null;    // set by prepareVertexFetch() (draw path) — descriptors + constants
       this.lastFetchConstants = null;
       // Content-addressed GPU buffer cache (key: kind:base:bytes:endian → hash-verified buffer).
@@ -862,11 +918,14 @@
 
     /**
      * Upload an index buffer from guest memory into a GPUBuffer.
-     * Real, tested code path — but note the guest index endianness (swap_mode)
-     * must be applied by the time we get here or by the shader; Xenos indices
-     * are big-endian, so we byteswap when indexEndianness indicates 8in16/8in32.
+     * Xenos indices are big-endian, so we byteswap when indexEndianness indicates 8in16/8in32 —
+     * and, for the primitive types WebGPU has no topology for (kTriangleFan, kLineLoop,
+     * kQuadList), EXPAND the indices host-side (xenia's primitive-processor conversion):
+     * the draw then uses a supported topology with the expanded buffer. The returned
+     * object carries the effective index format and the (possibly expanded) count —
+     * 0 means fewer guest indices than one primitive; the caller skips the draw.
      */
-    uploadIndexBuffer({ indexGuestBase, numIndices, indexFormat /* 0=int16, 1=int32 */, indexEndianness /* swap_mode 0..3 from VGT_DMA_SIZE */ }) {
+    uploadIndexBuffer({ indexGuestBase, numIndices, indexFormat /* 0=int16, 1=int32 */, indexEndianness /* swap_mode 0..3 from VGT_DMA_SIZE */, primType = 0 }) {
       if (!this.device) throw new XenosWebGpuError('uploadIndexBuffer before attach()');
       const bytesPerIndex = indexFormat === 1 ? 4 : 2;
       const total = numIndices * bytesPerIndex;
@@ -880,19 +939,89 @@
       // read each 32-bit word big-endian, apply GpuSwap(swap_mode), write it little-endian for the LE GPU.
       const gpuSwap32 = pm4().gpuSwap32;
       const base = indexGuestBase >>> 0;
-      const { buffer, hit } = this._cachedBuffer('ib', base, total, indexEndianness | 0, be, () => {
-        const out = new Uint8Array(paddedTotal);
-        const s = new DataView(be.buffer), d = new DataView(out.buffer);
+      const decode = () => {
+        // The swap is only forced for primitive conversion — the plain path swaps lazily
+        // on cache miss, so identical repeated index buffers cost only the hash below.
+        const decoded = new Uint8Array(paddedTotal);
+        const s = new DataView(be.buffer), d = new DataView(decoded.buffer);
         for (let i = 0; i < paddedTotal; i += 4) d.setUint32(i, gpuSwap32(s.getUint32(i, false), indexEndianness | 0), true);
+        return decoded;
+      };
+      // Host-side primitive conversion (fan/loop/quad-list → list/strip).
+      const convert = PRIM_TYPE_CONVERT.get((primType ?? 0) & 0x3f);
+      if (convert) {
+        const decoded = decode();
+        if (((primType ?? 0) & 0x3f) === 0x0d /* kQuadList */ && (numIndices & 3) !== 0) {
+          this.log('warn', `draw: ${numIndices} indices do not complete ${Math.floor(numIndices / 4)} quad(s) — the ${numIndices & 3} leftover index value(s) are dropped (hardware primitive assembly behaves the same)`);
+        }
+        const typed = new (indexFormat === 1 ? Uint32Array : Uint16Array)(decoded.buffer, decoded.byteOffset, numIndices);
+        const expanded = expandConvertedIndices(typed, convert.kind);
+        if (!expanded) {
+          return { buffer: null, numIndices: 0, indexFormat }; // fewer indices than one primitive — nothing to draw
+        }
+        const finalBytes = new Uint8Array(expanded.buffer, expanded.byteOffset, expanded.byteLength);
+        // salt the cache key so the converted buffer at the same guest base never aliases the raw one
+        const salt = ((indexEndianness | 0) | ((primType & 0x3f) << 4)) >>> 0;
+        const { buffer, hit } = this._cachedBuffer('ib', base, finalBytes.byteLength, salt, finalBytes, () => {
+          const buf = this.device.createBuffer({ size: Math.ceil(finalBytes.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: 'xenos-index' });
+          const padded = new Uint8Array(Math.ceil(finalBytes.byteLength / 4) * 4);
+          padded.set(finalBytes);
+          this.device.queue.writeBuffer(buf, 0, padded);
+          return buf;
+        });
+        if (!hit) {
+          this.uploads.indexBuffers++;
+          this.uploads.indexBytes += finalBytes.byteLength;
+        }
+        return { buffer, numIndices: expanded.length, indexFormat };
+      }
+      const { buffer, hit } = this._cachedBuffer('ib', base, total, indexEndianness | 0, be, () => {
         const buf = this.device.createBuffer({ size: paddedTotal, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: 'xenos-index' });
-        this.device.queue.writeBuffer(buf, 0, out);
+        this.device.queue.writeBuffer(buf, 0, decode());
         return buf;
       });
       if (!hit) {
         this.uploads.indexBuffers++;
         this.uploads.indexBytes += total;
       }
-      return buffer;
+      return { buffer, numIndices, indexFormat };
+    }
+
+    /**
+     * Synthesize (and memoize) the little-endian index buffer for an implicit
+     * (non-indexed) draw of a primitive type that was converted host-side:
+     * fan/loop/quad-list over vertices 0..numIndices-1 expanded the same way
+     * as guest indices. Keyed on (primType, numIndices) — bounded, oldest first.
+     */
+    _implicitConvertedIndexBuffer(primType, numIndices) {
+      const convert = PRIM_TYPE_CONVERT.get(primType & 0x3f);
+      const key = `${primType & 0x3f}:${numIndices}`;
+      let entry = this.implicitIndexCache.get(key);
+      if (entry) { entry.lastUsed = ++this.implicitIndexClock; return entry; }
+      const use16 = numIndices <= 0x10000; // implicit vertex counts are bounded by VGT (u16)
+      const seq = new (use16 ? Uint16Array : Uint32Array)(numIndices);
+      for (let i = 0; i < numIndices; i++) seq[i] = i;
+      const expanded = expandConvertedIndices(seq, convert.kind);
+      const count = expanded ? expanded.length : 0;
+      const bytes = count * seq.BYTES_PER_ELEMENT;
+      // WebGPU buffer sizes must be a multiple of 4 — an odd 16-bit index count
+      // (a 2-index line loop expands to 3) is 6 bytes, so round the allocation up.
+      const allocSize = Math.max(4, Math.ceil(bytes / 4) * 4);
+      const buffer = this.device.createBuffer({ size: allocSize, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: `xenos-implicit-${primType & 0x3f}` });
+      if (count) this.device.queue.writeBuffer(buffer, 0, new Uint8Array(expanded.buffer, expanded.byteOffset, bytes));
+      entry = { buffer, format: use16 ? 'uint16' : 'uint32', numIndices: count, bytes, lastUsed: ++this.implicitIndexClock };
+      this.implicitIndexCache.set(key, entry);
+      while (this.implicitIndexCache.size > 16) {
+        let oldestKey = null, oldest = Infinity;
+        for (const [k, v] of this.implicitIndexCache) if (v.lastUsed < oldest) { oldest = v.lastUsed; oldestKey = k; }
+        if (oldestKey === null) break;
+        const dead = this.implicitIndexCache.get(oldestKey);
+        this.implicitIndexCache.delete(oldestKey);
+        this.implicitIndexBytes -= dead.bytes;
+        if (dead.buffer.destroy) dead.buffer.destroy();
+      }
+      this.implicitIndexBytes += bytes;
+      return entry;
     }
 
     _getPlaceholderPipeline(rtState) {
@@ -1034,15 +1163,25 @@
 
     /** Bind the index buffer (if any) and issue the draw, from a fetch-planned pass. */
     _setIndexBufferAndDraw(pass, params) {
+      const primType = (params.primType ?? 0) & 0x3f;
       if (params.isIndexed) {
         const ib = this.uploadIndexBuffer({
           indexGuestBase: params.indexGuestBase,
           numIndices: params.numIndices,
           indexFormat: params.indexFormat,
           indexEndianness: params.indexEndianness,
+          primType,
         });
-        pass.setIndexBuffer(ib, params.indexFormat === 1 ? 'uint32' : 'uint16');
-        pass.drawIndexed(params.numIndices, 1, 0, 0, 0);
+        if (ib.numIndices === 0) { this.log('info', `draw: prim 0x${primType.toString(16)} with fewer indices than one primitive — nothing to draw`); return; }
+        pass.setIndexBuffer(ib.buffer, ib.indexFormat === 1 ? 'uint32' : 'uint16');
+        pass.drawIndexed(ib.numIndices, 1, 0, 0, 0);
+        return;
+      }
+      if (PRIM_TYPE_CONVERT.has(primType)) {
+        const ib = this._implicitConvertedIndexBuffer(primType, params.numIndices);
+        if (ib.numIndices === 0) { this.log('info', `draw: prim 0x${primType.toString(16)} with fewer vertices than one primitive — nothing to draw`); return; }
+        pass.setIndexBuffer(ib.buffer, ib.format);
+        pass.drawIndexed(ib.numIndices, 1, 0, 0, 0);
         return;
       }
       pass.draw(params.numIndices);
@@ -1063,6 +1202,9 @@
       if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; this.depthView = null; }
       if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
       if (this.viewportBuffer) { this.viewportBuffer.destroy(); this.viewportBuffer = null; this._viewportLast = null; }
+      for (const entry of this.implicitIndexCache.values()) if (entry.buffer.destroy) entry.buffer.destroy();
+      this.implicitIndexCache.clear();
+      this.implicitIndexBytes = 0;
       if (this.boolConstantBuffer) { this.boolConstantBuffer.destroy(); this.boolConstantBuffer = null; }
       if (this.device) { this.device.destroy(); this.device = null; }
       this.context = null;
@@ -1073,7 +1215,7 @@
   }
 
   // Internals exposed for unit tests only — unstable shapes, not public API.
-  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY };
+  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
 
   const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL, _internal };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

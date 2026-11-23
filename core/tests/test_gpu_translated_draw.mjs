@@ -404,12 +404,14 @@ test('no vertex shader loaded traps (never fabricates geometry)', () => {
   assert.throws(() => backend.draw(drawParams()), (e) => e instanceof XenosWebGpuError && /no vertex shader is loaded/.test(e.message));
 });
 
-test('triangle-fan is not encodable in WebGPU and traps instead of drawing wrong connectivity', () => {
+test('kTriangleWithWFlags / kQuadStrip / kPolygon trap loudly — xenia refuses them too', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
-  assert.throws(() => backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan' })), (e) => e instanceof XenosWebGpuError && /topology is not encodable/.test(e.message));
+  for (const [prim, name] of [[0x07, 'kTriangleWithWFlags'], [0x0e, 'kQuadStrip'], [0x0f, 'kPolygon']]) {
+    assert.throws(() => backend.draw(drawParams({ primType: prim, primTypeName: name })), (e) => e instanceof XenosWebGpuError && /topology is not encodable/.test(e.message), name);
+  }
 });
 
 test('point lists map to point-list topology', () => {
@@ -1030,3 +1032,141 @@ test('viewport: user clip planes (PA_CL_CLIP_CNTL.ucp_ena) trap loudly — the f
   assert.equal(log.passes[log.passes.length - 1].colorAttachments[0].loadOp, 'clear');
 });
 
+// ------------------------------------------------------------ primitive conversion (fan/loop/quad-list → list/strip)
+const writeGuestIndices16BE = (guest, base, indices) => {
+  const view = new DataView(guest.arena.buffer);
+  indices.forEach((v, i) => view.setUint16(base + i * 2, v, false));
+};
+const INDEX_DWORDS = { idxBase: 0, };
+
+test('triangle-fan (indexed): guest indices expand fan→list, pipeline uses triangle-list', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const IB = 0x00200000;
+  writeGuestIndices16BE(guest, IB, [7, 8, 9, 10, 11]); // BE uint16, as the guest stores them
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3 /* k16in32: swap 16-bit lanes in each 32-bit word — BE uint16 -> LE */, numIndices: 5 }));
+  assert.equal(log.pipelines[0].desc.primitive.topology, 'triangle-list');
+  assert.equal(log.vertexBindings.length, 1);
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 9]]); // (7,8,9),(7,9,10),(7,10,11)
+  assert.equal(log.indexBuffer.format, 'uint16');
+  const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
+  const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 9);
+  assert.deepEqual([...out], [7, 8, 9, 7, 9, 10, 7, 10, 11]);
+});
+
+test('triangle-fan: the converted index buffer is content-cached across draws (one upload)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const IB = 0x00200000;
+  writeGuestIndices16BE(guest, IB, [0, 1, 2, 3]);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  const params = () => drawParams({ primType: 5, primTypeName: 'kTriangleFan', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3, numIndices: 4 });
+  backend.draw(params());
+  backend.draw(params());
+  const ibWrites = log.writes.filter((w) => w.buffer === log.indexBuffer.buffer);
+  assert.equal(ibWrites.length, 1, 'identical content expands and uploads once');
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 6], ['drawIndexed', 6]]);
+});
+
+test('line loop (indexed): closes the loop by re-appending the first index, line-strip topology', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const IB = 0x00200000;
+  writeGuestIndices16BE(guest, IB, [3, 4, 5, 6]);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 0x0c, primTypeName: 'kLineLoop', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3, numIndices: 4 }));
+  assert.equal(log.pipelines[0].desc.primitive.topology, 'line-strip');
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 5]]);
+  const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
+  const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 5);
+  assert.deepEqual([...out], [3, 4, 5, 6, 3]);
+});
+
+test('quad list (indexed): each quad becomes (v0,v1,v2),(v0,v2,v3); leftover indices are dropped with a warning', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const IB = 0x00200000;
+  writeGuestIndices16BE(guest, IB, [0, 1, 2, 3, 4, 5, 6, 7, 99]); // 9 indices: 2 quads + 1 leftover
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 0x0d, primTypeName: 'kQuadList', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3, numIndices: 9 }));
+  assert.equal(log.pipelines[0].desc.primitive.topology, 'triangle-list');
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 12]]); // leftover dropped
+  const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
+  const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 12);
+  assert.deepEqual([...out], [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+});
+
+test('triangle-fan (implicit vertices, non-indexed): a synthetic index buffer is drawn instead of a wrong topology', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', numIndices: 4, isIndexed: false }));
+  assert.equal(log.pipelines[0].desc.primitive.topology, 'triangle-list');
+  assert.equal(log.vertexBindings.length, 1);
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 6]]);
+  assert.equal(log.indexBuffer.format, 'uint16');
+  const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
+  const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 6);
+  assert.deepEqual([...out], [0, 1, 2, 0, 2, 3]);
+  // and the synthetic buffer is memoized
+  backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', numIndices: 4, isIndexed: false }));
+  const ibWrites = log.writes.filter((w) => w.buffer === log.indexBuffer.buffer);
+  assert.equal(ibWrites.length, 1, 'same implicit expansion is reused, not re-uploaded');
+});
+
+test('line loop (implicit vertices): synthesized closing strip is drawn', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 0x0c, primTypeName: 'kLineLoop', numIndices: 3, isIndexed: false }));
+  assert.equal(log.pipelines[0].desc.primitive.topology, 'line-strip');
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 4]]);
+  const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
+  const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 4);
+  assert.deepEqual([...out], [0, 1, 2, 0]);
+});
+
+test('implicit converted index buffers are allocated with a 4-byte-aligned size (WebGPU requirement)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // a 2-index line loop expands to 3 uint16 indices = 6 bytes -> the allocation must round up to 8
+  backend.draw(drawParams({ primType: 0x0c, primTypeName: 'kLineLoop', numIndices: 2, isIndexed: false }));
+  const implicit = log.buffers.filter((b) => b.desc.label && b.desc.label.startsWith('xenos-implicit-'));
+  assert.equal(implicit.length, 1);
+  assert.equal(implicit[0].desc.size % 4, 0, 'buffer size must be a multiple of 4');
+  assert.equal(implicit[0].desc.size, 8);
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 3]]);
+});
+
+test('degenerate fan/loop draws (fewer indices than one primitive) skip the draw instead of corrupting state', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const IB = 0x00200000;
+  writeGuestIndices16BE(guest, IB, [1, 2]); // only 2 indices for a fan
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3, numIndices: 2 }));
+  assert.deepEqual(log.drawCalls, [], 'no draw issued');
+  backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', numIndices: 2, isIndexed: false }));
+  assert.deepEqual(log.drawCalls, [], 'no implicit draw either');
+});
+
+test('expandConvertedIndices unit semantics (fan/loop/quads, widths preserved, degenerates)', () => {
+  const { expandConvertedIndices } = INTERNAL;
+  assert.deepEqual([...expandConvertedIndices(new Uint16Array([0, 1, 2, 3, 4]), 'fan')], [0, 1, 2, 0, 2, 3, 0, 3, 4]);
+  assert.deepEqual([...expandConvertedIndices(new Uint32Array([9, 8, 7]), 'fan')], [9, 8, 7]);
+  assert.equal(expandConvertedIndices(new Uint16Array([0, 1]), 'fan'), null);
+  assert.deepEqual([...expandConvertedIndices(new Uint16Array([5, 6]), 'loop')], [5, 6, 5]);
+  assert.equal(expandConvertedIndices(new Uint16Array([5]), 'loop'), null);
+  assert.deepEqual([...expandConvertedIndices(new Uint32Array([0, 1, 2, 3, 4, 5, 6, 7]), 'quads')], [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+  assert.equal(expandConvertedIndices(new Uint16Array([0, 1, 2]), 'quads'), null);
+});
