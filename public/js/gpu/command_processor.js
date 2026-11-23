@@ -335,10 +335,17 @@
           this._eventWriteToMemory(u32s, start, end, parsed.opcodeName);
           return end;
         }
+        case op.PM4_EVENT_WRITE_EXT: {
+          // xenia writes the screen extent (six 16-bit values) to guest memory.
+          this._eventWriteScreenExtent(u32s, start, end, parsed.opcodeName);
+          return end;
+        }
         case op.PM4_EVENT_WRITE_CFL:
-        case op.PM4_EVENT_WRITE_EXT:
         case op.PM4_EVENT_WRITE_ZPD: {
-          // cache-flush / screen-extent / z-pass events: initiator recorded; memory writeback formats differ per event — forwarded to the backend, never silently dropped
+          // cache-flush / z-pass events: the initiator is recorded and the event
+          // is forwarded to the backend — xenia implements neither writeback
+          // (the z-pass counter is a TODO there), so nothing is written to guest
+          // memory.
           const initiator = u32s[start];
           if (this.backend && typeof this.backend.eventWrite === 'function') this.backend.eventWrite({ eventType: initiator & 0x3f, address: 0, data: null, opcode: parsed.opcodeName });
           else this.log('info', `${parsed.opcodeName} initiator 0x${initiator.toString(16)} (no backend sink)`);
@@ -363,8 +370,17 @@
           return end;
         }
         case op.PM4_XE_SWAP: {
+          // xenia: the swap packet starts with the 'SWAP' magic (asserted there)
+          // and bumps the GPU frame counter that EVENT_WRITE_SHD writes back.
+          if (end - start >= 1) {
+            const magic = u32s[start] >>> 0;
+            if (magic !== 0x53574150 /* 'SWAP' */) {
+              this.log('warn', `XE_SWAP: unexpected magic 0x${magic.toString(16).toUpperCase()} (xenia asserts 'SWAP' here)`);
+            }
+          }
           if (this.backend && typeof this.backend.swap === 'function') this.backend.swap();
           else this.log('info', 'XE_SWAP (present) — no backend sink');
+          this.counter = (this.counter + 1) >>> 0;
           return end;
         }
 
@@ -387,16 +403,14 @@
           throw new XenosGpuError('PM4_COND_WRITE: conditional write is not implemented');
         }
         case op.PM4_WAIT_REG_MEM:
+          return this._waitRegMem(u32s, start, end, parsed.opcodeName);
         case op.PM4_WAIT_REG_EQ:
         case op.PM4_WAIT_REG_GTE:
         case op.PM4_WAIT_FOR_IDLE:
         case op.PM4_WAIT_UNTIL_READ:
         case op.PM4_WAIT_IB_PFD_COMPLETE:
-          // Genuinely synchronous in our model — the ring is consumed inline, so waits succeed trivially.
-          // WAIT_REG_MEM with a memory location polls a value; xenia blocks until it matches.
-          if (opcode === op.PM4_WAIT_REG_MEM) {
-            throw new XenosGpuError('PM4_WAIT_REG_MEM: polling memory/register is not implemented; waits complete immediately only for WAIT_FOR_IDLE/WAIT_IB_PFD_COMPLETE');
-          }
+          // xenia does not implement these opcodes either — its command
+          // processor logs "Unimplemented GPU OPCODE" and skips the packet.
           return end;
 
         // --- binning (predication) ------------------------------------------
@@ -433,6 +447,72 @@
       }
     }
 
+    /**
+     * xenia's PM4_WAIT_REG_MEM: wait until a register or a memory location
+     * satisfies a comparison.
+     *
+     * xenia polls in a loop and blocks until the condition matches (sleeping
+     * wait/256 ms between polls when wait >= 0x100). This port cannot block —
+     * the command ring is consumed inline — so the comparison is evaluated
+     * once with xenia's exact rules; if it does not match, xenia would sleep
+     * and re-poll forever, and refusing loudly is the only honest answer.
+     */
+    _waitRegMem(u32s, start, end, opcodeName) {
+      if (end - start < 5) {
+        throw new XenosGpuError(`${opcodeName}: expected 5 payload dwords (wait_info, address, reference, mask, wait)`);
+      }
+      const waitInfo = u32s[start] >>> 0;
+      const addrWord = u32s[start + 1] >>> 0;
+      const ref = u32s[start + 2] >>> 0;
+      const mask = u32s[start + 3] >>> 0;
+      let value;
+      let source;
+      if (waitInfo & 0x10) {
+        // Memory: the address's low 2 bits carry the endianness (xenia).
+        const endianness = addrWord & 0x3;
+        const address = (addrWord & ~0x3) >>> 0;
+        if (!this.readGuestMemory) {
+          throw new XenosGpuError(`${opcodeName}: waiting on a memory location needs readGuestMemory() to be wired to guest physical memory`);
+        }
+        const view = this.readGuestMemory(address);
+        if (!view || view.byteLength < 4) {
+          throw new XenosGpuError(`${opcodeName}: memory location 0x${address.toString(16)} is not readable`);
+        }
+        value = pm4().gpuSwap32(view.getUint32(0, false), endianness);
+        source = `memory 0x${address.toString(16)}`;
+      } else {
+        // Register.
+        const index = addrWord >>> 0;
+        // xenia: assert_true(poll_reg_addr < RegisterFile::kRegisterCount = 0x5003).
+        if (index >= 0x5003) {
+          throw new XenosGpuError(`${opcodeName}: register index 0x${index.toString(16)} is outside the register file`);
+        }
+        value = this.registers.read(index) >>> 0;
+        source = `register 0x${index.toString(16)}`;
+      }
+      const masked = (value & mask) >>> 0;
+      let matched;
+      switch (waitInfo & 0x7) {
+        case 0x0: matched = false; break; // never
+        case 0x1: matched = masked < ref; break; // less than
+        case 0x2: matched = masked <= ref; break; // less than or equal
+        case 0x3: matched = masked === ref; break; // equal
+        case 0x4: matched = masked !== ref; break; // not equal
+        case 0x5: matched = masked >= ref; break; // greater than or equal
+        case 0x6: matched = masked > ref; break; // greater than
+        case 0x7: matched = true; break; // always
+        default: matched = false; break;
+      }
+      if (!matched) {
+        throw new XenosGpuError(
+          `${opcodeName}: the wait condition is not met — ${source} holds 0x${value.toString(16).toUpperCase()} ` +
+          `(masked 0x${masked.toString(16).toUpperCase()}), the reference is 0x${ref.toString(16).toUpperCase()} ` +
+          `(compare 0x${(waitInfo & 0x7).toString(16)}). xenia polls in a loop and blocks until it matches; this port ` +
+          'cannot block (the command ring is consumed inline), so it refuses instead of pretending the wait succeeded');
+      }
+      return end;
+    }
+
     _eventWriteToMemory(u32s, start, end, opcodeName) {
       const initiator = u32s[start];
       const eventType = initiator & 0x3f;
@@ -458,7 +538,53 @@
       new DataView(bytes.buffer).setUint32(0, pm4().gpuSwap32(value >>> 0, endianness), false);
       backendOrTrap(this.backend, 'memWrite', opcodeName)(address >>> 0, bytes);
       this.stats.memWriteBytes += 4;
-      this.counter = (this.counter + 1) >>> 0;
+    }
+
+    /**
+     * xenia's PM4_EVENT_WRITE_EXT: a screen-extent writeback.
+     * xenia writes six 16-bit values — {min x, max x, min y, max y, min z,
+     * max z} = {0, 2560>>3, 0, 2560>>3, 0, 1} — to the guest address, with the
+     * bytes of each half word swapped when the address carries the k8in16
+     * endianness (xenia asserts that it does).
+     */
+    _eventWriteScreenExtent(u32s, start, end, opcodeName) {
+      const initiator = u32s[start] >>> 0;
+      this._writeRegister(regFile().XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3f);
+      if (this.backend && typeof this.backend.eventWrite === 'function') {
+        this.backend.eventWrite({ eventType: initiator & 0x3f, address: 0, data: null, opcode: opcodeName });
+      }
+      if (end - start < 2) {
+        // xenia reads the address unconditionally (the packet always has one).
+        this.log('debug', `${opcodeName}: no writeback address in the packet`);
+        return;
+      }
+      const addrWord = u32s[start + 1] >>> 0;
+      const endianness = addrWord & 0x3;
+      let address = (addrWord & ~0x3) >>> 0;
+      if (address > 0x1fffffff) {
+        const wbBase = this.registers.read(this.writebackStartIndex);
+        const wbSize = this.registers.read(this.writebackSizeIndex);
+        const off = (address - wbBase) >>> 0;
+        if (wbBase !== 0 && off < wbSize) address = (0x7f000000 + off) >>> 0;
+      }
+      // xenia: 0 >> 3, 2560 >> 3, 0 >> 3, 2560 >> 3, 0, 1
+      const extents = [0, 2560 >> 3, 0, 2560 >> 3, 0, 1];
+      const bytes = new Uint8Array(extents.length * 2);
+      for (let i = 0; i < extents.length; i++) {
+        const v = extents[i] & 0xffff;
+        // xenia's GpuSwap(uint16): kNone leaves it, k8in16 swaps the bytes in
+        // the half word; the other endiannesses are unhandled in xenia (the
+        // value is written unchanged there).
+        if (endianness === 1) {
+          bytes[i * 2] = (v >>> 8) & 0xff;
+          bytes[i * 2 + 1] = v & 0xff;
+        } else {
+          bytes[i * 2] = v & 0xff;
+          bytes[i * 2 + 1] = (v >>> 8) & 0xff;
+        }
+      }
+      backendOrTrap(this.backend, 'memWrite', opcodeName)(address >>> 0, bytes);
+      this.stats.memWriteBytes += bytes.length;
     }
 
     _loadConstantType(type, index, data, opcodeName) {

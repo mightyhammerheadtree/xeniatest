@@ -182,7 +182,7 @@ test('REG_RMW supports immediate and register operands', () => {
   assert.equal(cp.registers.read(0x0040), 0x0f0fffff);
 });
 
-test('EVENT_WRITE with address writes the payload and increments the counter', () => {
+test('EVENT_WRITE_SHD writes the payload; the counter bit writes the GPU frame counter', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
   const cp = makeCP(guest, backend);
@@ -192,7 +192,65 @@ test('EVENT_WRITE with address writes the payload and increments the counter', (
   assert.equal(cp.registers.read(0x21f9), 0x00000005, 'VGT_EVENT_INITIATOR written');
   // counter bit: initiator with 0x80000000 writes the GPU counter instead of the payload
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_SHD, 2), 0x80000000 | 0x05, GUEST_ADDR]));
-  assert.equal(guest.readU32BE(GUEST_ADDR), 1, 'counter value written back after first event');
+  assert.equal(guest.readU32BE(GUEST_ADDR), 0, 'the frame counter starts at 0');
+});
+
+test('the GPU frame counter is bumped by the swap (xenia: ++counter_ in PM4_XE_SWAP)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // xenia's swap packet starts with the 'SWAP' magic.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_XE_SWAP, 4), 0x53574150, 0, 0, 0]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'swap').length, 1);
+  // The counter bit of EVENT_WRITE_SHD now writes 1.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_SHD, 2), 0x80000000 | 0x05, GUEST_ADDR]));
+  assert.equal(guest.readU32BE(GUEST_ADDR), 1, 'the counter was bumped by the swap');
+  // A second swap bumps it again.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_XE_SWAP, 4), 0x53574150, 0, 0, 0]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_SHD, 2), 0x80000000 | 0x05, GUEST_ADDR]));
+  assert.equal(guest.readU32BE(GUEST_ADDR), 2);
+});
+
+test('WAIT_REG_MEM evaluates xenia\'s comparison and refuses loudly when it would have to block', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // Register case: wait until register 0x2104 (RB_COLOR_MASK) == 0x1234.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2104, 1), 0x00001234]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+    0x00000003 /* compare: equal */, 0x00002104, 0x00001234, 0xffffffff, 0x00000000]));
+  // The comparison is not met → xenia would block; this port refuses loudly.
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+      0x00000003, 0x00002104, 0x00005678, 0xffffffff, 0x00000000])),
+    /wait condition is not met/);
+  // ... and a satisfied condition passes.
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+    0x00000003, 0x00002104, 0x00001234, 0xffffffff, 0x00000000]));
+  // The memory case reads guest memory with the address's endianness.
+  guest.writeU32BE(GUEST_ADDR, 0xdeadbeef);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_WAIT_REG_MEM, 5),
+    0x00000010 | 0x00000003, GUEST_ADDR, 0xdeadbeef, 0xffffffff, 0x00000000]));
+});
+
+test('EVENT_WRITE_EXT writes xenia\'s screen extent (six 16-bit values) to guest memory', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // The address carries the k8in16 endianness (xenia asserts it).
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_EVENT_WRITE_EXT, 2), 0x00000005, GUEST_ADDR | 1]));
+  assert.equal(cp.registers.read(0x21f9), 0x00000005, 'VGT_EVENT_INITIATOR written');
+  const write = backend.calls.find((c) => c.kind === 'memWrite');
+  assert.ok(write, 'the screen extent was written to guest memory');
+  assert.equal(write.addr, GUEST_ADDR);
+  // xenia: {0>>3, 2560>>3, 0>>3, 2560>>3, 0, 1} with the bytes of each half
+  // word swapped (k8in16).
+  const expected = new Uint8Array(12);
+  [0, 320, 0, 320, 0, 1].forEach((v, i) => {
+    expected[i * 2] = (v >>> 8) & 0xff;
+    expected[i * 2 + 1] = v & 0xff;
+  });
+  assert.deepEqual(Array.from(write.bytes), Array.from(expected));
 });
 
 test('EVENT_WRITE maps the writeback window through WRITEBACK_START/SIZE', () => {
