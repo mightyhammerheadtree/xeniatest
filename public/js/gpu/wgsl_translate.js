@@ -1038,10 +1038,20 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
     alphaTestBinding = alphaTest ? (boolBinding >= 0 ? boolBinding + 1 : (floatBinding >= 0 ? 1 : 0)) : -1;
   }
   if (alphaTest && alphaTestBinding < 0) alphaTestBinding = (usesBoolConstants && boolBinding >= 0 ? boolBinding + 1 : (usesFloatConstants && floatBinding >= 0 ? 1 : 0));
+  // The translated vertex shader ALWAYS applies the guest viewport (WebGPU has no
+  // programmable viewport — xenia applies it in the VS too). It reads the composed
+  // coefficients from a persistent, content-hashed uniform (two vec4f: scale xyz, offset xyz).
+  // Numbering must skip the slots taken by fc/bools/alphaTest so the merged 'auto' layout stays unique.
+  const viewportBinding = shaderType === 'vertex'
+    ? (bindings?.viewport ?? ((floatBinding >= 0 ? 1 : 0) + (boolBinding >= 0 ? 1 : 0) + (alphaTestBinding >= 0 ? 1 : 0)))
+    : -1;
   if (usesFloatConstants && floatBinding >= 0) em.emit(`@group(0) @binding(${floatBinding}) var<uniform> fc: array<vec4f, 256>;`);
   if (usesBoolConstants && boolBinding >= 0) {
     em.emit(`@group(0) @binding(${boolBinding}) var<uniform> bools: array<u32, 8>;`);
     em.emit('fn bc(n: u32) -> bool { return ((bools[n >> 5u] >> (n & 31u)) & 1u) != 0u; }');
+  }
+  if (viewportBinding >= 0) {
+    em.emit(`@group(0) @binding(${viewportBinding}) var<uniform> viewport: array<vec4f, 2>;`);
   }
   if (alphaTest) {
     em.emit(`@group(0) @binding(${alphaTestBinding}) var<uniform> alphaTest: vec4f;`);
@@ -1171,12 +1181,23 @@ function assembleStage(shaderType, dwords, decoded, stats, options) {
   if (convertColor0ToGamma) {
     em.emit('out.color0 = vec4f(xenosGamma(clamp(out.color0.x, 0.0, 1.0)), xenosGamma(clamp(out.color0.y, 0.0, 1.0)), xenosGamma(clamp(out.color0.z, 0.0, 1.0)), out.color0.w);');
   }
+  if (viewportBinding >= 0) {
+    // Guest viewport in clip space (pre-w-divide): scale first, then offset*w.
+    // viewport[0] = ndc scale (x,y,z), viewport[1] = ndc offset (x,y,z) — the backend
+    // composes guest NDC → canvas pixels → WebGPU clip space, including the half-pixel
+    // offset (kD3DZero pixel centers) and the window offset when vtx_window_offset_enable.
+    em.emit('out.pos = vec4f(out.pos.x * viewport[0].x + viewport[1].x * out.pos.w,');
+    em.emit('               out.pos.y * viewport[0].y + viewport[1].y * out.pos.w,');
+    em.emit('               out.pos.z * viewport[0].z + viewport[1].z * out.pos.w,');
+    em.emit('               out.pos.w);');
+  }
   em.emit('return out;');
   em.indentOut();
   em.emit('}');
 
   return {
     type: shaderType,
+    viewportBinding: viewportBinding >= 0 ? viewportBinding : undefined,
     wgsl: em.toString(),
     inputLocations: shaderType === 'vertex' ? inputLocations : linked,
     interpolatorLocations,
@@ -1260,7 +1281,8 @@ function translateShaderProgram(vsUcodeWords, psUcodeWords, options) {
     if (compare !== 7) alphaTest = { compare };
   }
   const alphaTestBinding = alphaTest ? (mergedBool ? (mergedFloat ? 2 : 1) : (mergedFloat ? 1 : 0)) : -1;
-  const bindings = { float: mergedFloat ? 0 : -1, bool: mergedBool ? (mergedFloat ? 1 : 0) : -1, alphaTest: alphaTestBinding };
+  const viewportBinding = (mergedFloat ? 1 : 0) + (mergedBool ? 1 : 0) + (alphaTest ? 1 : 0);
+  const bindings = { float: mergedFloat ? 0 : -1, bool: mergedBool ? (mergedFloat ? 1 : 0) : -1, alphaTest: alphaTestBinding, viewport: viewportBinding };
   const vertex = assembleStage('vertex', vd, decodedV, statsV, { bindings });
   let fragment = null;
   if (pd) {
@@ -1278,6 +1300,7 @@ function translateShaderProgram(vsUcodeWords, psUcodeWords, options) {
     exportsColor0: fragment?.exportsColor0 ?? false,
     exportsDepth: fragment?.exportsDepth ?? false,
     alphaTest: fragment?.alphaTest ?? null,
+    viewportBinding,
     convertColor0ToGamma: fragment?.convertColor0ToGamma ?? false,
     colorExpBias: fragment?.colorExpBias ?? 0,
   };

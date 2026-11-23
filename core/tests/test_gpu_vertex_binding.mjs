@@ -98,6 +98,7 @@ function makeFakeDevice() {
       setPipeline(pl) { p.pipeline = pl; },
       setVertexBuffer(i, b) { p.vbs[i] = b; },
       setIndexBuffer(b, f) { p.ib = { buffer: b, format: f }; },
+      setBindGroup(i, bg) { p.bindGroup = [i, bg]; },
       setBlendConstant(c) { p.blendConstant = c; },
       setScissorRect(x, y, w, h) { p.scissorRect = [x, y, w, h]; },
       setStencilReference(ref) { p.stencilRef = ref; },
@@ -114,7 +115,8 @@ function makeFakeDevice() {
     createBuffer(desc) { const b = { desc, kind: 'buffer' }; calls.createBuffer.push(b); return b; },
     createTexture() { return { destroy() {} }; },
     createShaderModule(desc) { const m = { desc }; calls.createShaderModule.push(m); return m; },
-    createRenderPipeline(desc) { const p = { desc }; calls.createRenderPipeline.push(p); return p; },
+    createRenderPipeline(desc) { const p = { desc, getBindGroupLayout() { return { kind: 'fake-bgl' }; } }; calls.createRenderPipeline.push(p); return p; },
+    createBindGroup(desc) { const bg = { desc }; calls.bindGroups = calls.bindGroups ?? []; calls.bindGroups.push(bg); return bg; },
     createCommandEncoder() {
       const p = pass();
       return {
@@ -180,6 +182,7 @@ test('fetch draw uploads the guest vertex buffer with BE→LE dword swap and bin
   const floats = new Float32Array(wb.data.buffer, wb.data.byteOffset, 9);
   assert.deepEqual([...floats], [1, 2, 3, 4, 5, 6, 7, 8, 9]);
   // pass state: vertex buffer bound at slot 0, non-indexed draw of 3 vertices
+  backend.swap(); // draws batch into one frame — swap() ends the pass and flushes it
   const pass = backend.device.calls.passes[0];
   assert.equal(pass.vbs[0], fb);
   assert.equal(pass.drawN, 3);
@@ -206,6 +209,7 @@ test('fetch draw honors isIndexed: index buffer uploaded and drawIndexed issued'
   const backend = makeBackend(guest);
   backend.draw({ ...baseParams, isIndexed: true, indexGuestBase: IB_BASE, indexFormat: 0, indexEndianness: 1, numIndices: 3 });
   assert.equal(backend.uploads.indexBuffers, 1);
+  backend.swap();
   const pass = backend.device.calls.passes[0];
   assert.equal(pass.ib.format, 'uint16');
   assert.deepEqual(pass.drawIN, { n: 3, inst: 1, first: 0, baseVertex: 0 });
@@ -251,6 +255,7 @@ test('draw without a vertex shader falls back to the plain triangle (documented)
   const backend = makeBackend(guest, { withShader: false });
   backend.draw({ ...baseParams });
   assert.equal(backend.uploads.vertexBuffers, 0);
+  backend.swap();
   const pass = backend.device.calls.passes[0];
   assert.equal(pass.drawN, 3); // plain bring-up triangle
 });

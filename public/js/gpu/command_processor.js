@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -531,6 +531,12 @@
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
       const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
       const PA_SC_VIZ_QUERY = 0x2293;
+      const PA_SU_SC_MODE_CNTL = 0x2205, PA_SU_VTX_CNTL = 0x2302;
+      const PA_CL_CLIP_CNTL = 0x2204, PA_CL_VTE_CNTL = 0x2206;
+      const PA_CL_VPORT_XSCALE = 0x210F, PA_CL_VPORT_XOFFSET = 0x2110, PA_CL_VPORT_YSCALE = 0x2111, PA_CL_VPORT_YOFFSET = 0x2112;
+      const PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114;
+      const PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380, PA_SU_POLY_OFFSET_FRONT_OFFSET = 0x2381;
+      const PA_SU_POLY_OFFSET_BACK_SCALE = 0x2382, PA_SU_POLY_OFFSET_BACK_OFFSET = 0x2383;
       const PA_SC_WINDOW_SCISSOR_TL = 0x2081, PA_SC_WINDOW_SCISSOR_BR = 0x2082, PA_SC_WINDOW_OFFSET = 0x2080;
       const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
@@ -554,6 +560,20 @@
         blendControl1: this.registers.read(RB_BLENDCONTROL1) >>> 0,
         blendControl2: this.registers.read(RB_BLENDCONTROL2) >>> 0,
         blendControl3: this.registers.read(RB_BLENDCONTROL3) >>> 0,
+        paSuScModeCntl: this.registers.read(PA_SU_SC_MODE_CNTL) >>> 0,
+        paSuVtxCntl: this.registers.read(PA_SU_VTX_CNTL) >>> 0,
+        paClClipCntl: this.registers.read(PA_CL_CLIP_CNTL) >>> 0,
+        paClVteCntl: this.registers.read(PA_CL_VTE_CNTL) >>> 0,
+        paClVportXscale: this.registers.read(PA_CL_VPORT_XSCALE) >>> 0,
+        paClVportXoffset: this.registers.read(PA_CL_VPORT_XOFFSET) >>> 0,
+        paClVportYscale: this.registers.read(PA_CL_VPORT_YSCALE) >>> 0,
+        paClVportYoffset: this.registers.read(PA_CL_VPORT_YOFFSET) >>> 0,
+        paClVportZscale: this.registers.read(PA_CL_VPORT_ZSCALE) >>> 0,
+        paClVportZoffset: this.registers.read(PA_CL_VPORT_ZOFFSET) >>> 0,
+        paSuPolyOffsetFrontScale: this.registers.read(PA_SU_POLY_OFFSET_FRONT_SCALE) >>> 0,
+        paSuPolyOffsetFrontOffset: this.registers.read(PA_SU_POLY_OFFSET_FRONT_OFFSET) >>> 0,
+        paSuPolyOffsetBackScale: this.registers.read(PA_SU_POLY_OFFSET_BACK_SCALE) >>> 0,
+        paSuPolyOffsetBackOffset: this.registers.read(PA_SU_POLY_OFFSET_BACK_OFFSET) >>> 0,
       };
       // xenia: if PA_SC_VIZ_QUERY has viz_query_ena (bit 0) AND kill_pix_post_hi_z (bit 7),
       // the draw is an occlusion-query hint and must NOT touch the render target (r6xx/r7xx
