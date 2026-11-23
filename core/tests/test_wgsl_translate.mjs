@@ -1387,3 +1387,31 @@ test('transcendental in a pixel shader (sin) runs in the fragment stage', async 
   assert.match(out.wgsl, /sin\(r\[1\]\.w\)/);
   await assertValidWgsl(out.wgsl);
 });
+
+// ------------------------------------------------------------ guest viewport emission
+test('translated vertex shader emits the guest-viewport uniform (VS-only binding, applied after ucode)', async () => {
+  const out = T.translateVertexShader(shader(
+    cfPair(execCf(1, 2, seq(SEQ_FETCH, SEQ_ALU)), NOP_CF),
+    vfetchWords({ dstReg: 1, format: 57 }),
+    aluWords({ isExport: 1, vectorDest: 62, vectorOpcode: 15 /* dp4 */, scalarOpcode: 50, src: [temp(1), temp(1), temp(1)] }),
+  ));
+  // no fc/bools in this shader → viewport at binding 0
+  assert.match(out.wgsl, /@group\(0\) @binding\(0\) var<uniform> viewport: array<vec4f, 2>;/);
+  assert.equal(out.viewportBinding, 0);
+  assert.match(out.wgsl, /out\.pos = vec4f\(out\.pos\.x \* viewport\[0\]\.x \+ viewport\[1\]\.x \* out\.pos\.w/);
+  assert.ok(out.wgsl.lastIndexOf('viewport[0].x') < out.wgsl.indexOf('return out'));
+  await assertValidWgsl(out.wgsl);
+});
+
+test('viewport binding skips the fc/bools slots (and alphaTest on the shared program path)', () => {
+  const program = T.translateShaderProgram(
+    shader(cfPair(execCf(1, 1, seq(SEQ_ALU)), NOP_CF),
+      aluWords({ isExport: 1, vectorDest: 62, vectorOpcode: 0, src: [temp(1), konst(0), temp(1)] })),
+    null,
+    { alphaTest: undefined },
+  );
+  // fc used (one konst read) → fc @0, viewport @1
+  assert.equal(program.viewportBinding, 1);
+  assert.match(program.vertex.wgsl, /@group\(0\) @binding\(1\) var<uniform> viewport/);
+  assert.match(program.vertex.wgsl, /@group\(0\) @binding\(0\) var<uniform> fc/);
+});

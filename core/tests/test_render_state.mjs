@@ -363,3 +363,252 @@ test('decodeColorInfo decodes color_exp_bias as a SIGNED 6-bit field (xenia int3
   assert.equal(bias(0x20), -32, '0b100000 is -32');
   assert.equal(bias(0x1F), 31);
 });
+
+// ------------------------------------------- back-face stencil masks / alpha-to-coverage
+test('BF stencil read/write mask mismatch traps naming both masks (WebGPU shares one pair)', () => {
+  const front = 0x4255007F; // ref 0x7F, stencilmask 0x55, writemask 0x42
+  assert.throws(() => rtState({ stencilRefMask: front, stencilRefMaskBf: (0x66 << 8) | 0x7F, depthControl: 0x1 | 0x80 }), /stencil read\/write mask differs/);
+  assert.throws(() => rtState({ stencilRefMask: front, stencilRefMaskBf: (0x42 << 16) | 0x7F & ((0x77 << 8) | 0) | 0, depthControl: 0x1 | 0x80 }), /stencil read\/write mask differs|front/);
+  // matching ref and masks — renders
+  assert.doesNotThrow(() => rtState({ stencilRefMask: front, stencilRefMaskBf: front, depthControl: 0x1 | 0x80 }));
+  // mismatch only matters with stencil + backface enabled
+  assert.doesNotThrow(() => rtState({ stencilRefMask: front, stencilRefMaskBf: 0x007F, depthControl: 0x2 }));
+});
+
+// ------------------------------------------------------------ rasterizer state (PA_SU_SC_MODE_CNTL / PA_SU_POLY_OFFSET_*)
+// xenia d3d12 pipeline_cache.cc "Rasterizer state" semantics.
+const F32 = (x) => new Float32Array(new Float32Array([x]).buffer)[0];
+const bits = (x) => new Uint32Array(new Float32Array([x]).buffer)[0];
+
+test('rasterizer state defaults (registers zeroed): no culling, CCW front faces, no depth bias, no drop', () => {
+  const s = rtState({});
+  assert.deepEqual(s.raster, { cullMode: 'none', frontFace: 'ccw', depthBias: 0, depthBiasSlopeScale: 0, depthBiasClamp: 0, bothCull: false });
+});
+
+test('rasterizer state: face bit (bit 2) selects CW front faces', () => {
+  const s = rtState({ paSuScModeCntl: 0x4 }, { primitivePolygonal: true });
+  assert.equal(s.raster.frontFace, 'cw');
+  const s2 = rtState({ paSuScModeCntl: 0x0 }, { primitivePolygonal: true });
+  assert.equal(s2.raster.frontFace, 'ccw');
+});
+
+test('rasterizer state: cull_back / cull_front select the WebGPU cull mode (polygonal only)', () => {
+  assert.equal(rtState({ paSuScModeCntl: 0x2 }, { primitivePolygonal: true }).raster.cullMode, 'back');
+  assert.equal(rtState({ paSuScModeCntl: 0x1 }, { primitivePolygonal: true }).raster.cullMode, 'front');
+  // points/lines: never culled (xenia: filled front faces only)
+  assert.equal(rtState({ paSuScModeCntl: 0x2 }, { primitivePolygonal: false }).raster.cullMode, 'none');
+  assert.equal(rtState({ paSuScModeCntl: 0x1 }, { primitivePolygonal: false }).raster.cullMode, 'none');
+});
+
+test('rasterizer state: both faces culled drops the draw (no fragments), does not throw', () => {
+  const s = rtState({ paSuScModeCntl: 0x3 }, { primitivePolygonal: true });
+  assert.equal(s.raster.bothCull, true);
+  // same registers, non-polygonal primitive: no culling at all
+  const s2 = rtState({ paSuScModeCntl: 0x3 }, { primitivePolygonal: false });
+  assert.equal(s2.raster.bothCull, false);
+  assert.equal(s2.raster.cullMode, 'none');
+});
+
+test('rasterizer state: kDualMode with a non-triangle polygon on a non-culled face traps (WebGPU has no wireframe)', () => {
+  // poly_mode=1 (kDualMode) at bits 3-4, front ptype = kLines (1) at bits 5-7
+  const mode = (1 << 3) | (1 << 5);
+  assert.throws(() => rtState({ paSuScModeCntl: mode }, { primitivePolygonal: true }),
+    (e) => e instanceof RS.XenosRenderStateError && /kDualMode/.test(e.message));
+  // same but the front face is culled and the back face is triangles — no wireframe to emit
+  const culled = (1 << 3) | (1 << 5) | (2 << 8) | 0x1;
+  assert.doesNotThrow(() => rtState({ paSuScModeCntl: culled }, { primitivePolygonal: true }));
+  // front = triangles (2), back = kPoints (0) at bits 8-10 → the back face traps
+  const backWire = (1 << 3) | (2 << 5);
+  assert.throws(() => rtState({ paSuScModeCntl: backWire }, { primitivePolygonal: true }),
+    (e) => e instanceof RS.XenosRenderStateError && /back/.test(e.message));
+  // kDualMode with both faces kTriangles (2): renders filled triangles, no trap (4541096E lesson)
+  const dualTri = (1 << 3) | (2 << 5) | (2 << 8);
+  assert.doesNotThrow(() => rtState({ paSuScModeCntl: dualTri }, { primitivePolygonal: true }));
+  // poly_mode != kDualMode ignores the ptype fields entirely (4541096E uses poly_mode=2 + ptype 0)
+  const reserved = (2 << 3) | (0 << 5) | (0 << 8);
+  assert.doesNotThrow(() => rtState({ paSuScModeCntl: reserved }, { primitivePolygonal: true }));
+});
+
+test('rasterizer state: polygon offset (front registers) maps to depthBias in UNORM24 units', () => {
+  // front offset = 0.5f, front scale = 2.0f; offset enable bit 11; polygonal
+  const mode = 0x800;
+  const s = rtState({
+    paSuScModeCntl: mode,
+    paSuPolyOffsetFrontScale: bits(2.0),
+    paSuPolyOffsetFrontOffset: bits(0.5),
+  }, { primitivePolygonal: true });
+  // xenia GetD3D10IntegerPolygonOffset(kD24S8, 0.5) = ceil(0.5 * 16777215) = 8388608
+  assert.equal(s.raster.depthBias, 8388608);
+  assert.equal(s.raster.depthBiasSlopeScale, 2.0 / 16.0);
+  assert.equal(s.raster.depthBiasClamp, 0);
+});
+
+test('rasterizer state: negative offset gives a negative depthBias', () => {
+  const s = rtState({
+    paSuScModeCntl: 0x800,
+    paSuPolyOffsetFrontScale: bits(1.0),
+    paSuPolyOffsetFrontOffset: bits(-2.0),
+  }, { primitivePolygonal: true });
+  assert.equal(s.raster.depthBias, -Math.ceil(2.0 * 16777215));
+});
+
+test('xenia polygon offset: back registers are used only when front is disabled/culled and decodes to zero', () => {
+  // back enabled, front disabled → back registers
+  const backOnly = rtState({
+    paSuScModeCntl: 0x1000, // back offset enable only
+    paSuPolyOffsetBackScale: bits(4.0),
+    paSuPolyOffsetBackOffset: bits(1.0),
+  }, { primitivePolygonal: true });
+  assert.equal(backOnly.raster.depthBiasSlopeScale, 4.0 / 16.0);
+  assert.equal(backOnly.raster.depthBias, Math.ceil(1.0 * 16777215));
+  // both enabled, front decodes non-zero → front wins
+  const frontWins = rtState({
+    paSuScModeCntl: 0x800 | 0x1000,
+    paSuPolyOffsetFrontScale: bits(1.0),
+    paSuPolyOffsetFrontOffset: bits(1.0),
+    paSuPolyOffsetBackScale: bits(8.0),
+    paSuPolyOffsetBackOffset: bits(1.0),
+  }, { primitivePolygonal: true });
+  assert.equal(frontWins.raster.depthBiasSlopeScale, 1.0 / 16.0);
+  // both enabled, front decodes to exactly 0/0 → back fills in (xenia !scale && !offset rule)
+  const backFills = rtState({
+    paSuScModeCntl: 0x800 | 0x1000,
+    paSuPolyOffsetFrontScale: bits(0.0),
+    paSuPolyOffsetFrontOffset: bits(0.0),
+    paSuPolyOffsetBackScale: bits(8.0),
+    paSuPolyOffsetBackOffset: bits(0.0),
+  }, { primitivePolygonal: true });
+  assert.equal(backFills.raster.depthBiasSlopeScale, 8.0 / 16.0);
+  // both enabled but front faces culled → back registers (xenia also requires the back enable bit)
+  const frontCulled = rtState({
+    paSuScModeCntl: 0x800 | 0x1000 | 0x1, // front+back offset enable + cull front
+    paSuPolyOffsetFrontScale: bits(1.0),
+    paSuPolyOffsetFrontOffset: bits(1.0),
+    paSuPolyOffsetBackScale: bits(8.0),
+    paSuPolyOffsetBackOffset: bits(0.0),
+  }, { primitivePolygonal: true });
+  assert.equal(frontCulled.raster.depthBiasSlopeScale, 8.0 / 16.0);
+});
+
+test('rasterizer state: para polygon offset (points/lines) uses the FRONT register pair', () => {
+  const s = rtState({
+    paSuScModeCntl: 0x2000, // para offset enable
+    paSuPolyOffsetFrontScale: bits(2.0),
+    paSuPolyOffsetFrontOffset: bits(1.0),
+  }, { primitivePolygonal: false });
+  assert.equal(s.raster.depthBiasSlopeScale, 2.0 / 16.0);
+  assert.equal(s.raster.depthBias, Math.ceil(1.0 * 16777215));
+});
+
+test('rasterizer state: kD24FS8 depth uses the float24-ULP offset factor (xenia GetD3D10IntegerPolygonOffset)', () => {
+  const s = rtState({
+    depthInfo: 1 << 16, // kD24FS8 (but no depth writes/tests → the D24FS8 trap does not fire)
+    paSuScModeCntl: 0x800,
+    paSuPolyOffsetFrontScale: bits(0.0),
+    paSuPolyOffsetFrontOffset: bits(1.0),
+  }, { primitivePolygonal: true });
+  // ceil(1.0 * 2^24 * (1/8)) = ceil(2^21) = 2097152, then float24→float32 ULP: <<= 3
+  assert.equal(s.raster.depthBias, 2097152 * 8);
+});
+
+test('rasterizer state: decode result is part of the render-target state cache key', () => {
+  const a = rtState({ paSuScModeCntl: 0x2 }, { primitivePolygonal: true });
+  const b = rtState({ paSuScModeCntl: 0x1 }, { primitivePolygonal: true });
+  const c = rtState({ paSuScModeCntl: 0x2 }, { primitivePolygonal: false });
+  assert.notEqual(a.key, b.key);
+  assert.notEqual(a.key, c.key);
+  assert.equal(a.key, rtState({ paSuScModeCntl: 0x2 }, { primitivePolygonal: true }).key);
+});
+
+// ------------------------------------------------------------ viewport decode (PA_CL_VTE_CNTL / PA_CL_CLIP_CNTL / PA_CL_VPORT_* / PA_SU_VTX_CNTL)
+const VIEWPORT_ZERO = {
+  paClVteCntl: 0, paClClipCntl: 0, paSuVtxCntl: 0, paSuScModeCntl: 0,
+  paClVportXscale: 0, paClVportXoffset: 0, paClVportYscale: 0, paClVportYoffset: 0,
+  paClVportZscale: 0, paClVportZoffset: 0,
+};
+const vp = (overrides = {}, scissor = {}, surface = { width: 640, height: 480 }) =>
+  RS.decodeViewportState({ ...VIEWPORT_ZERO, ...overrides }, scissor, surface);
+const f32 = (x) => new Float32Array(new Float32Array([x]).buffer)[0];
+
+test('viewport: zeroed registers map NDC across the whole canvas (kD3DZero half-pixel on by default, GL z remap)', () => {
+  const v = vp();
+  const kx = 2 / 640, ky = 2 / 480;
+  assert.equal(v.scale[0], f32(kx));
+  assert.equal(v.scale[1], f32(ky));
+  // pix_center is kD3DZero (bit 0 clear) → +0.5 pixel offsets (xenia half_pixel_offset default)
+  assert.equal(v.offset[0], f32(0.5 * kx - 1));
+  assert.equal(v.offset[1], f32(0.5 * ky - 1));
+  // dx_clip_space_def clear → GL-style z remap, zmin/zmax = saturate(0)/saturate(1)
+  assert.equal(v.scale[2], f32(0.5));
+  assert.equal(v.offset[2], f32(0.5));
+});
+
+test('viewport: kOGLHalf pixel centers (PA_SU_VTX_CNTL.pix_center=1) disable the half-pixel offset', () => {
+  const v = vp({ paSuVtxCntl: 1 });
+  const kx = 2 / 640, ky = 2 / 480;
+  assert.equal(v.offset[0], f32(-1));
+  assert.equal(v.offset[1], f32(-1));
+  assert.equal(v.scale[0], f32(kx));
+  assert.equal(v.scale[1], f32(ky));
+});
+
+test('viewport: dx_clip_space_def passes the guest z through scale/offset with a full-range host depth', () => {
+  const v = vp({ paClClipCntl: 0x80000, paClVteCntl: 0x30, paClVportZscale: bits(0.5), paClVportZoffset: bits(0.25) });
+  assert.equal(v.scale[2], f32(0.5));
+  assert.equal(v.offset[2], f32(0.25));
+});
+
+test('viewport: clip_disable also passes the guest z through (screen-space draws)', () => {
+  const v = vp({ paClClipCntl: 0x10000, paClVteCntl: 0x30, paClVportZscale: bits(0.7), paClVportZoffset: bits(0.3) });
+  assert.equal(v.scale[2], f32(0.7));
+  assert.equal(v.offset[2], f32(0.3));
+});
+
+test('viewport: GL-style z (dx=0) folds the −W..W → 0..W remap and [saturate(oz−sz), saturate(oz+sz)] host range', () => {
+  // oz=0.75, sz=0.5 → zmin=saturate(0.25)=0.25, zmax=saturate(1.25)=1.0 → scale 0.375, offset 0.625
+  const v = vp({ paClVteCntl: 0x30, paClVportZscale: bits(0.5), paClVportZoffset: bits(0.75) });
+  assert.equal(v.scale[2], f32(0.375));
+  assert.equal(v.offset[2], f32(0.625));
+  // canonical GL range: oz=0, sz=1 (identity in guest clip) → full host range
+  const v0 = vp({ paClVteCntl: 0x30, paClVportZscale: bits(1.0), paClVportZoffset: bits(0.0) });
+  assert.equal(v0.scale[2], f32(0.5));
+  assert.equal(v0.offset[2], f32(0.5));
+  // guest asking for the 0..1 end state: ZSCALE=0.5/ZOFFSET=0.5 → identity passthrough semantics
+  const v1 = vp({ paClVteCntl: 0x30, paClVportZscale: bits(0.5), paClVportZoffset: bits(0.5) });
+  assert.equal(v1.scale[2], f32(0.5));
+  assert.equal(v1.offset[2], f32(0.5));
+  // oz=-1, sz=4 → zmin=0, zmax=1 → the full range
+  const v2 = vp({ paClVteCntl: 0x30, paClVportZscale: bits(4.0), paClVportZoffset: bits(-1.0) });
+  assert.equal(v2.scale[2], f32(0.5));
+  assert.equal(v2.offset[2], f32(0.5));
+});
+
+test('viewport: x scale/offset enable bits (and signs) produce the composed NDC coefficients', () => {
+  const v = vp({ paSuVtxCntl: 1, paClVteCntl: 0x3, paClVportXscale: bits(320.0), paClVportXoffset: bits(160.0) });
+  const kx = 2 / 640;
+  assert.equal(v.scale[0], f32(320.0 * kx));
+  assert.equal(v.offset[0], f32(160.0 * kx - 1));
+  // negative y scale (guest flip) is preserved verbatim
+  const v2 = vp({ paSuVtxCntl: 1, paClVteCntl: 0x4, paClVportYscale: bits(-1.0) });
+  assert.equal(v2.scale[1], f32(-(2 / 480)));
+});
+
+test('viewport: PA_SC_WINDOW_OFFSET applies only when vtx_window_offset_enable is set', () => {
+  // window offset x=16, y=-2 → packed s15 pair 0x7FFE0010
+  const scissor = { windowOffset: 0x7FFE0010 };
+  const on = vp({ paSuVtxCntl: 1, paSuScModeCntl: 0x10000, paClVteCntl: 0xF }, scissor);
+  const kx = 2 / 640, ky = 2 / 480;
+  assert.equal(on.offset[0], f32(16 * kx - 1));
+  assert.equal(on.offset[1], f32(-2 * ky - 1));
+  // same mode bit clear → the window offset is ignored
+  const off = vp({ paSuVtxCntl: 1, paSuScModeCntl: 0x0, paClVteCntl: 0xF }, scissor);
+  assert.equal(off.offset[0], f32(-1));
+  assert.equal(off.offset[1], f32(-1));
+});
+
+test('viewport: user clip planes TRAP loudly (WebGPU has no clip planes)', () => {
+  assert.throws(() => vp({ paClClipCntl: 0x00000001 }), (e) => e instanceof RS.XenosRenderStateError && /ucp_ena/.test(e.message));
+  assert.throws(() => vp({ paClClipCntl: 0x0000003F }), (e) => e instanceof RS.XenosRenderStateError && /ucp_ena/.test(e.message));
+  // ucp bits unrelated to the low 6 do not trap
+  assert.doesNotThrow(() => vp({ paClClipCntl: 0x10000 }));
+});

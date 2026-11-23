@@ -246,7 +246,9 @@ test('draw() runs the translated vertex shader: module has both entry points, to
   assert.equal(log.pipelines[0].desc.primitive.topology, 'triangle-list');
   assert.deepEqual(log.pipelines[0].desc.vertex.buffers[0].attributes.map((a) => a.shaderLocation), [1]);
   assert.deepEqual(log.drawCalls, [['draw', 3]]);
-  assert.equal(log.bindGroupsCreated.length, 0, 'no constants used — no bind group');
+  assert.equal(log.bindGroupsCreated.length, 1, 'the viewport uniform is always bound (the translated VS always applies it)');
+  assert.equal(log.bindGroupsCreated[0].entries.length, 1);
+  assert.equal(log.bindGroupsCreated[0].entries[0].binding, 0, 'no fc/bools — the viewport takes binding 0');
   assert.equal(log.vertexBindings.length, 1);
   assert.equal(log.vertexBindings[0][0], 0, 'fetch binding index 0');
 });
@@ -279,7 +281,8 @@ test('translated VS with fc[] binds the ALU uniform at binding 0', () => {
   backend.shaders.vertex = { kind: 'vertex', code: CONST_VS, dwords: CONST_VS.length };
   backend.draw(drawParams({ aluConstants: aluConstantArray() }));
   assert.equal(log.bindGroupsCreated.length, 1);
-  assert.equal(log.bindGroupsCreated[0].entries.length, 1);
+  assert.equal(log.bindGroupsCreated[0].entries.length, 2, 'fc + the viewport uniform');
+  assert.deepEqual(log.bindGroupsCreated[0].entries.map((e) => e.binding), [0, 1]);
   assert.equal(log.bindGroupsCreated[0].entries[0].binding, 0);
   assert.equal(log.bindGroupsSet.length, 1);
   assert.equal(log.bindGroupsSet[0][0], 0);
@@ -293,11 +296,12 @@ test('translated VS with bc() binds bools at binding 0 when no fc[] is used', ()
   const boolConstants = new Uint32Array(8);
   boolConstants[0] = 1 << 4; // bool 4
   backend.draw(drawParams({ boolConstants }));
-  const boolWrites = log.writes.filter((w) => w.bytes.length === 32);
+  const boolWrites = log.writes.filter((w) => w.buffer === backend.boolConstantBuffer);
   assert.equal(boolWrites.length, 1, 'one 32-byte bool-constants write');
   assert.equal(new DataView(boolWrites[0].bytes.buffer).getUint32(0, true), 1 << 4);
   assert.equal(log.bindGroupsCreated.length, 1);
-  assert.equal(log.bindGroupsCreated[0].entries.length, 1);
+  assert.equal(log.bindGroupsCreated[0].entries.length, 2, 'bools + the viewport uniform');
+  assert.deepEqual(log.bindGroupsCreated[0].entries.map((e) => e.binding), [0, 1]);
   assert.equal(log.bindGroupsCreated[0].entries[0].binding, 0);
 });
 
@@ -378,7 +382,7 @@ test('every stage of the translated pair uses the shared constant bindings (fc=0
   backend.shaders.pixel = { kind: 'pixel', code: PS_CONST_VS, dwords: PS_CONST_VS.length }; // uses fc
   backend.draw(drawParams({ aluConstants: aluConstantArray() }));
   assert.equal(log.bindGroupsCreated.length, 1);
-  assert.deepEqual(log.bindGroupsCreated[0].entries.map((e) => e.binding), [0], 'fc at binding 0, no bools anywhere');
+  assert.deepEqual(log.bindGroupsCreated[0].entries.map((e) => e.binding), [0, 1], 'fc at binding 0, no bools anywhere, viewport after them');
   assert.match(log.modules[0].code, /@group\(0\) @binding\(0\) var<uniform> fc/);
   assert.match(log.modules[1].code, /@group\(0\) @binding\(0\) var<uniform> fc/);
 });
@@ -779,7 +783,7 @@ test('an oDepth-only PS writes depth but never color (writeMask 0, depth stays e
   assert.ok(log.pipelines[0].desc.depthStencil, 'depth-stencil state present');
 });
 
-test('frame-clear semantics: first pass of a frame clears, later passes load (guest clears, not the host)', () => {
+test('frame-clear semantics: first pass of a frame clears; draws batch into that one pass (guest clears, not the host)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend, log } = makeBackend(guest); // makeBackend mirrors attach()/_recreateDepth — frame starts fresh
@@ -788,17 +792,61 @@ test('frame-clear semantics: first pass of a frame clears, later passes load (gu
   backend.draw(drawParams());
   backend.draw(drawParams());
   backend.draw(drawParams());
-  assert.deepEqual(passDescs().map((d) => d.colorAttachments[0].loadOp), ['clear', 'load', 'load']);
-  assert.deepEqual(passDescs().map((d) => d.depthStencilAttachment.depthLoadOp), ['clear', 'load', 'load']);
-  assert.deepEqual(passDescs().map((d) => d.depthStencilAttachment.stencilLoadOp), ['clear', 'load', 'load']);
+  // one batched frame = one pass, descriptor opened on the first draw of the frame
+  assert.equal(passDescs().length, 1);
+  assert.equal(passDescs()[0].colorAttachments[0].loadOp, 'clear');
+  assert.equal(passDescs()[0].depthStencilAttachment.depthLoadOp, 'clear');
+  assert.equal(passDescs()[0].depthStencilAttachment.stencilLoadOp, 'clear');
   // PM4_XE_SWAP ends the frame — next frame starts with defined targets again
   backend.swap();
   backend.draw(drawParams());
-  assert.equal(log.passes[3].colorAttachments[0].loadOp, 'clear');
-  assert.equal(log.passes[3].depthStencilAttachment.depthLoadOp, 'clear');
+  assert.equal(passDescs().length, 2);
+  assert.equal(passDescs()[1].colorAttachments[0].loadOp, 'clear');
+  assert.equal(passDescs()[1].depthStencilAttachment.depthLoadOp, 'clear');
   // depth clear value and stencil clear are the frame-start defaults
-  assert.equal(log.passes[3].depthStencilAttachment.depthClearValue, 1.0);
-  assert.equal(log.passes[3].depthStencilAttachment.stencilClearValue, 0);
+  assert.equal(passDescs()[1].depthStencilAttachment.depthClearValue, 1.0);
+  assert.equal(passDescs()[1].depthStencilAttachment.stencilClearValue, 0);
+});
+
+test('batched frame: draws accumulate; swap() ends the pass and submits once per frame', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  backend.draw(drawParams());
+  assert.equal(log.passes.length, 1, 'both draws share one pass');
+  assert.equal(log.submits, 0, 'nothing reaches the canvas until swap()');
+  backend.swap();
+  assert.equal(log.passes.length, 1);
+  assert.equal(log.submits, 1, 'one submit per swap');
+  backend.draw(drawParams());
+  assert.equal(log.submits, 1, 'next frame not yet submitted');
+  backend.swap();
+  assert.equal(log.submits, 2);
+  assert.equal(log.passes.length, 2, 'one pass per frame');
+});
+
+test('batched frame: a trap mid-frame drops the pending frame unsubmitted — no partial frame reaches the canvas', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  assert.equal(log.submits, 0, 'pending');
+  // a 4x-MSAA render target refuses to draw — the trap drops the WHOLE pending frame
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
+    /4x MSAA/);
+  assert.equal(log.submits, 0, 'no partial frame is submitted after a trap');
+  backend.swap(); // nothing pending — swap has nothing to flush
+  assert.equal(log.submits, 0);
+  // the next frame starts with defined targets again (clear, not load)
+  backend.draw(drawParams());
+  backend.swap();
+  const last = log.passes[log.passes.length - 1];
+  assert.equal(last.colorAttachments[0].loadOp, 'clear');
+  assert.equal(last.depthStencilAttachment.depthLoadOp, 'clear');
 });
 
 test('resize() forces a defined-target frame (resize of the canvas = new frame)', () => {
@@ -852,3 +900,133 @@ test('color_exp_bias: negative exponent decodes signed through the whole stack (
   const fsModule = log.modules.find((m) => m.label === 'xenos-translated-ps');
   assert.match(fsModule.code, /out\.color0 = out\.color0 \* vec4f\(2\.5000000000e\-1\);/);
 });
+
+// ------------------------------------------------------------ rasterizer state (PA_SU_SC_MODE_CNTL / PA_SU_POLY_OFFSET_*)
+const bits32 = (x) => new Uint32Array(new Float32Array([x]).buffer)[0];
+
+test('rasterizer state: cull mode and front face reach the pipeline descriptor (polygonal primitive)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paSuScModeCntl: 0x2 }) })); // cull back
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paSuScModeCntl: 0x1 }) })); // cull front
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paSuScModeCntl: 0x4 }) })); // CW front faces
+  assert.equal(log.pipelines[0].desc.primitive.cullMode, 'back');
+  assert.equal(log.pipelines[1].desc.primitive.cullMode, 'front');
+  assert.equal(log.pipelines[2].desc.primitive.frontFace, 'cw');
+  assert.equal(log.pipelines[2].desc.primitive.cullMode, 'none');
+  assert.equal(log.pipelines.length, 3, 'raster state is part of the pipeline key');
+});
+
+test('rasterizer state: points are never culled even with cull bits set (xenia: filled front faces only)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ primType: 0x01, primTypeName: 'kPointList', renderTargets: defaultRenderTargets({ paSuScModeCntl: 0x3 }) }));
+  assert.equal(log.pipelines[0].desc.primitive.cullMode, 'none');
+  assert.equal(log.drawCalls.length, 1, 'both cull bits have no effect on points');
+});
+
+test('rasterizer state: both faces culled — the draw is dropped, no pass, no submit (xenia semantics)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paSuScModeCntl: 0x3 }) }));
+  assert.equal(log.drawCalls.length, 0);
+  assert.equal((log.passes ?? []).length, 0, 'no render pass is opened for a rasterization-disabled draw');
+  backend.swap();
+  assert.equal(log.submits, 0, 'nothing to submit — no frame was opened');
+  // the next good draw starts a defined frame
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paSuScModeCntl: 0x0 }) }));
+  backend.swap();
+  assert.equal(log.submits, 1);
+  assert.equal(log.passes[log.passes.length - 1].colorAttachments[0].loadOp, 'clear');
+});
+
+test('rasterizer state: polygon offset reaches the depth-stencil descriptor (UNORM24 integer bias)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({
+    renderTargets: defaultRenderTargets({
+      paSuScModeCntl: 0x800, // front polygon-offset enable
+      paSuPolyOffsetFrontScale: bits32(2.0),
+      paSuPolyOffsetFrontOffset: bits32(0.5),
+    }),
+  }));
+  const ds = log.pipelines[0].desc.depthStencil;
+  assert.equal(ds.depthBias, 8388608); // ceil(0.5 * 16777215)
+  assert.equal(ds.depthBiasSlopeScale, 0.125); // 2 / 16
+  assert.equal(ds.depthBiasClamp, 0);
+});
+
+test('rasterizer state: kDualMode wireframe traps loudly instead of silently drawing filled', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paSuScModeCntl: (1 << 3) | (1 << 5) }) })),
+    /kDualMode/);
+});
+
+// ------------------------------------------------------------ guest viewport (PA_CL_VTE_CNTL / PA_CL_CLIP_CNTL / PA_CL_VPORT_*)
+test('viewport uniform is uploaded once, re-uploaded only when the composed coefficients change', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  backend.draw(drawParams());
+  let vpWrites = log.writes.filter((w) => w.buffer === backend.viewportBuffer);
+  assert.equal(vpWrites.length, 1, 'identical viewport coefficients upload once');
+  // 10.0f at PA_CL_VPORT_XOFFSET (with x offset enable)
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paClVteCntl: 0x2, paClVportXoffset: 0x41200000 }) }));
+  vpWrites = log.writes.filter((w) => w.buffer === backend.viewportBuffer);
+  assert.equal(vpWrites.length, 2, 'a changed coefficient re-uploads');
+  const f = new Float32Array(vpWrites[1].bytes.buffer, vpWrites[1].bytes.byteOffset, 8);
+  // composed: scale 2/64 (unchanged), offset (10+0.5 half-pixel)*(2/64)-1 — pix_center defaults to kD3DZero
+  assert.equal(f[0], 2 / 64);
+  assert.equal(f[4], Math.fround(10.5 * (2 / 64) - 1));
+  // and back to the zeroed config — content compare catches the change regardless of direction
+  backend.draw(drawParams());
+  vpWrites = log.writes.filter((w) => w.buffer === backend.viewportBuffer);
+  assert.equal(vpWrites.length, 3);
+});
+
+test('viewport: the translated vertex module declares and applies the guest-viewport uniform (clip space, pre-w-divide)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams());
+  const vsCode = log.modules[0].code;
+  assert.match(vsCode, /@group\(0\) @binding\(\d+\) var<uniform> viewport: array<vec4f, 2>;/);
+  assert.match(vsCode, /out\.pos = vec4f\(out\.pos\.x \* viewport\[0\]\.x/);
+  // applied AFTER the guest ucode ran, right before `return out`
+  assert.ok(vsCode.lastIndexOf('viewport[0]') < vsCode.indexOf('return out'), 'viewport applied before the return');
+  // the fragment stage never declares it
+  assert.doesNotMatch(log.modules[1].code, /viewport/);
+});
+
+test('viewport: user clip planes (PA_CL_CLIP_CNTL.ucp_ena) trap loudly — the frame is dropped, no submit', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  assert.throws(
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paClClipCntl: 0x00000001 }) })),
+    /ucp_ena/);
+  assert.equal(log.submits, 0, 'nothing is submitted');
+  assert.equal(log.drawCalls.length, 0);
+  // the next clean frame starts with defined targets
+  backend.draw(drawParams());
+  backend.swap();
+  assert.equal(log.submits, 1);
+  assert.equal(log.passes[log.passes.length - 1].colorAttachments[0].loadOp, 'clear');
+});
+

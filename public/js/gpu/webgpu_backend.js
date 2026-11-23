@@ -174,6 +174,13 @@
     [0x04 /* kTriangleList */, 'triangle-list'],
     [0x06 /* kTriangleStrip */, 'triangle-strip'],
   ]);
+  // xenia draw_util::IsPrimitivePolygonal: triangle-list/fan/strip/W-flags, quad-list/strip,
+  // polygon — these have faces that culling/wireframe/polygon-offset apply to.
+  function isPrimitivePolygonal(primType) {
+    const t = (primType ?? 0) & 0x3f;
+    return (t >= 0x04 && t <= 0x07) || t === 0x0d || t === 0x0e || t === 0x0f;
+  }
+
   function topologyForPrimType(primType, primTypeName) {
     const topology = PRIM_TYPE_TOPOLOGY.get(primType & 0x3f);
     if (!topology) {
@@ -215,6 +222,9 @@
       // the frame boundary; attach()/resize() reset both targets.
       this._frameClearColor = false;
       this._frameClearDepth = false;
+      this._frame = null; // { encoder, pass, colorView, draws } while a frame is being built
+      this.viewportBuffer = null;   // persistent 32-byte uniform (scale xyz / offset xyz), content-compared
+      this._viewportLast = null;
       this.depthTexture = null;
       this.depthFormat = 'depth24plus-stencil8'; // must match pipeline depth-stencil format
       this.pipelineCache = new Map(); // key -> GPURenderPipeline
@@ -291,7 +301,7 @@
     }
 
     /** Resize depth attachment to the canvas size (call before drawing after a resize). */
-    resize() { this._recreateDepth(); }
+    resize() { this._flushFrame(); this._recreateDepth(); }
 
     // --- IXenosGpuBackend ----------------------------------------------------
 
@@ -567,7 +577,15 @@
 
     /** The depth-stencil state for every pipeline this backend builds. */
     _depthStencilDesc(rtState) {
-      if (rtState && rtState.depthStencil) return { ...rtState.depthStencil };
+      if (rtState && rtState.depthStencil) {
+        const desc = { ...rtState.depthStencil };
+        if (rtState.raster && (rtState.raster.depthBias !== 0 || rtState.raster.depthBiasSlopeScale !== 0)) {
+          desc.depthBias = rtState.raster.depthBias;
+          desc.depthBiasSlopeScale = rtState.raster.depthBiasSlopeScale;
+          desc.depthBiasClamp = rtState.raster.depthBiasClamp;
+        }
+        return desc;
+      }
       return { format: this.depthFormat, depthWriteEnabled: false, depthCompare: 'always' };
     }
 
@@ -588,12 +606,20 @@
           // No pixel shader → the bring-up FS writes the attachment unconditionally.
           psExportsColor0: program?.fragment ? program.exportsColor0 : true,
           psExportsDepth: program?.exportsDepth ?? false,
+          // xenia IsPrimitivePolygonal — culling/wireframe/polygon offset only for polygonal prims.
+          primitivePolygonal: isPrimitivePolygonal(params.primType),
         });
       } catch (e) {
         if (e && e.constructor && e.constructor.name === 'XenosRenderStateError') {
           throw new XenosWebGpuError(`draw: ${e.message}`);
         }
         throw e;
+      }
+      if (rtState.raster && rtState.raster.bothCull) {
+        // xenia: both faces culled → rasterization disabled; the draw produces no fragments.
+        // (A memexporting VS would still run — memory exports trap in this port — so dropping is exact.)
+        this.log('info', `draw(prim=${params.primTypeName ?? params.primType}): both faces culled (PA_SU_SC_MODE_CNTL cull_front+cull_back) — no fragments are produced; draw dropped`);
+        return null;
       }
       return rtState;
     }
@@ -623,7 +649,40 @@
     }
 
     /** Begin the render pass for a frame segment: canvas color attachment + depth/stencil attachment. */
-    _beginPass(encoder, colorView, rtState, scissor) {
+    // Per-frame batched encoder + pass: draws accumulate; swap() (or 256 pending draws,
+    // or resize()/destroy()) ends the pass and submits once. Scissor/blend/stencil state
+    // is applied per draw INSIDE the open pass (all dynamic pass commands). A trap in any
+    // draw drops the pending frame unsubmitted — no partial frame reaches the canvas.
+    static MAX_DRAWS_PER_SUBMIT = 256;
+
+    _dropFrame() {
+      this._frame = null; // encoder + pass are garbage; never submitted
+      this._frameClearColor = false;
+      this._frameClearDepth = false;
+    }
+
+    _flushFrame() {
+      if (!this._frame) return;
+      const { encoder, pass } = this._frame;
+      this._frame = null; // release before submit so a re-entrant draw starts a fresh frame
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+    }
+
+    /** Open (or reuse) the batched frame's pass. Returns the pass — never ends it per draw. */
+    _openFrame() {
+      if (this._frame && this._frame.draws >= XenosWebGpuBackend.MAX_DRAWS_PER_SUBMIT) this._flushFrame();
+      if (!this._frame) {
+        const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
+        const colorView = this.context.getCurrentTexture().createView();
+        const pass = this._beginFramePass(encoder, colorView);
+        this._frame = { encoder, pass, colorView, draws: 0 };
+      }
+      return this._frame.pass;
+    }
+
+    /** The frame pass descriptor: defined image on the first pass of a frame, load after. */
+    _beginFramePass(encoder, colorView) {
       const colorAttachment = this._frameClearColor
         ? { view: colorView, loadOp: 'load', storeOp: 'store' }
         : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' };
@@ -649,7 +708,11 @@
           };
         this._frameClearDepth = true;
       }
-      const pass = encoder.beginRenderPass(desc);
+      return encoder.beginRenderPass(desc);
+    }
+
+    /** Per-draw dynamic state inside the open frame pass (blend constant, stencil ref, scissor). */
+    _frameDrawState(pass, rtState, scissor) {
       if (rtState) {
         pass.setBlendConstant(rtState.blendConstant);
         pass.setStencilReference(rtState.stencilRef);
@@ -657,8 +720,15 @@
       if (scissor) {
         pass.setScissorRect(scissor.x, scissor.y, scissor.width, scissor.height);
       }
-      return pass;
     }
+
+    /** Count the draw against the batch; flushes the frame if the batch is full. */
+    _finishDraw() {
+      if (!this._frame) return;
+      this._frame.draws++;
+      if (this._frame.draws >= XenosWebGpuBackend.MAX_DRAWS_PER_SUBMIT) this._flushFrame();
+    }
+
 
     /**
      * Fetch or build the { pipeline, bindGroup } for the translated shader program
@@ -705,19 +775,65 @@
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
         fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState, colorExportKey(program) === '1')] },
         depthStencil: this._depthStencilDesc(rtState),
-        primitive: { topology },
+        primitive: { topology, cullMode: rtState.raster.cullMode, frontFace: rtState.raster.frontFace },
       });
       let bindGroup = null;
-      if (program.usesFloatConstants || program.usesBoolConstants || program.alphaTest) {
+      {
         const entries = [];
         if (program.usesFloatConstants) entries.push({ binding: 0, resource: { buffer: this.aluConstantBuffer } });
         if (program.usesBoolConstants) entries.push({ binding: program.usesFloatConstants ? 1 : 0, resource: { buffer: this.boolConstantBuffer } });
         if (program.alphaTest) entries.push({ binding: program.alphaTest.binding, resource: { buffer: this.alphaTestBuffer } });
+        if (program.viewportBinding !== undefined) entries.push({ binding: program.viewportBinding, resource: { buffer: this.viewportBuffer } });
         bindGroup = this.device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
       }
       entry = { pipeline, bindGroup };
       perShader.set(layoutKey, entry);
       return entry;
+    }
+
+    /**
+     * Resolve the guest viewport (PA_CL_VTE_CNTL / PA_CL_CLIP_CNTL / PA_CL_VPORT_*) into
+     * the coefficients the translated vertex shader applies. WebGPU has no programmable
+     * viewport — see decodeViewportState() for the exact math (xenia's formula).
+     * Throws XenosWebGpuError on missing prerequisites or unsupported clip state (UCP).
+     */
+    _resolveViewport(params) {
+      const rs = globalThis.XenonGpuRenderState;
+      if (!rs) {
+        throw new XenosWebGpuError('XenonGpuRenderState is not loaded — public/js/gpu/render_state.js must be loaded before the backend builds a draw');
+      }
+      try {
+        return rs.decodeViewportState(params.renderTargets, params.scissor, this.canvas ?? { width: 1, height: 1 });
+      } catch (e) {
+        if (e && e.constructor && e.constructor.name === 'XenosRenderStateError') {
+          throw new XenosWebGpuError(`draw: ${e.message}`);
+        }
+        throw e;
+      }
+    }
+
+    /**
+     * Upload the composed viewport coefficients into a persistent 32-byte uniform.
+     * Skipped entirely while the six floats are unchanged (content compare — the hash
+     * costs compares, the write costs a queue submission).
+     */
+    _uploadViewport(viewport) {
+      if (typeof GPUBufferUsage === 'undefined') throw new XenosWebGpuError('_uploadViewport: GPUBufferUsage is not defined in this environment');
+      const sx = viewport.scale[0], sy = viewport.scale[1], sz = viewport.scale[2];
+      const ox = viewport.offset[0], oy = viewport.offset[1], oz = viewport.offset[2];
+      const last = this._viewportLast;
+      if (last && last[0] === sx && last[1] === sy && last[2] === sz && last[3] === ox && last[4] === oy && last[5] === oz) {
+        return;
+      }
+      const bytes = new Uint8Array(32);
+      const f = new Float32Array(bytes.buffer);
+      f[0] = sx; f[1] = sy; f[2] = sz; f[3] = 0;
+      f[4] = ox; f[5] = oy; f[6] = oz; f[7] = 0;
+      if (!this.viewportBuffer) {
+        this.viewportBuffer = this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: 'xenos-viewport' });
+      }
+      this.device.queue.writeBuffer(this.viewportBuffer, 0, bytes);
+      this._viewportLast = [sx, sy, sz, ox, oy, oz];
     }
 
     /** Placeholder pipeline whose vertex stage consumes the plan's attributes (fetch bring-up). */
@@ -738,7 +854,7 @@
         vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
         fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
         depthStencil: this._depthStencilDesc(rtState),
-        primitive: { topology: 'triangle-list' },
+        primitive: { topology: 'triangle-list', cullMode: rtState?.raster?.cullMode ?? 'none', frontFace: rtState?.raster?.frontFace ?? 'ccw' },
       });
       this.pipelineCache.set(key, p);
       return p;
@@ -790,13 +906,23 @@
         vertex: { module, entryPoint: 'vs_main' },
         fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
         depthStencil: this._depthStencilDesc(rtState),
-        primitive: { topology: 'triangle-list' },
+        primitive: { topology: 'triangle-list', cullMode: rtState?.raster?.cullMode ?? 'none', frontFace: rtState?.raster?.frontFace ?? 'ccw' },
       });
       this.pipelineCache.set(key, p);
       return p;
     }
 
     draw(params) {
+      try {
+        return this._drawImpl(params);
+      } catch (e) {
+        // Drop (never submit) the frame being built — partial frames stay off the canvas; the next frame starts with defined targets.
+        this._dropFrame();
+        throw e;
+      }
+    }
+
+    _drawImpl(params) {
       if (!this.device) throw new XenosWebGpuError('draw before attach()');
       if (!this.canvas) throw new XenosWebGpuError('draw requires a canvas (headless rendering into textures is not wired yet)');
       this.uploads.frames++;
@@ -849,18 +975,19 @@
         const buffers = plan ? this.uploadVertexBuffers(plan) : [];
         this._uploadShaderConstants(params, program);
         this._uploadAlphaTest(params, program);
+        const viewport = this._resolveViewport(params); // traps loudly on UCP before any GPU work happens
+        this._uploadViewport(viewport);
         const rtState = this._resolveRenderTargets(params, program);
+        if (!rtState) return;
         const scissor = this._resolveScissor(params);
         const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
-        const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
-        const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginPass(encoder, colorView, rtState, scissor);
+        const pass = this._openFrame();
+        this._frameDrawState(pass, rtState, scissor);
         pass.setPipeline(pipeline);
         if (bindGroup) pass.setBindGroup(0, bindGroup);
         for (const b of buffers) pass.setVertexBuffer(b.bindingIndex, b.buffer);
         this._setIndexBufferAndDraw(pass, params);
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
+        this._finishDraw();
         return;
       }
       // --- clearly-labelled bring-up path ---------------------------------------------------------
@@ -872,11 +999,11 @@
       const fetchReady = !!(this.shaders.vertex && params.vertexFetchConstants);
       if (fetchReady) {
         const rtState = this._resolveRenderTargets(params, null);
+        if (!rtState) return;
         const scissor = this._resolveScissor(params);
         const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
-        const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
-        const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginPass(encoder, colorView, rtState, scissor);
+        const pass = this._openFrame();
+        this._frameDrawState(pass, rtState, scissor);
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
           pass.setPipeline((plan._pipeline ??= this._getFetchPlaceholderPipeline(plan.descriptors, rtState)));
@@ -888,22 +1015,20 @@
           pass.setPipeline(this._getPlaceholderPipeline(rtState));
           pass.draw(3);
         }
-        pass.end();
-        this.device.queue.submit([encoder.finish()]);
+        this._finishDraw();
         return;
       }
       if (this.shaders.vertex) {
         this.log('warn', 'draw: vertex shader loaded but the packet carried no fetch constants — bypassing the fetch path (full-canvas placeholder)');
       }
       const rtState = this._resolveRenderTargets(params, null);
+      if (!rtState) return;
       const scissor = this._resolveScissor(params);
-      const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
-      const colorView = this.context.getCurrentTexture().createView();
-      const pass = this._beginPass(encoder, colorView, rtState, scissor);
+      const pass = this._openFrame();
+      this._frameDrawState(pass, rtState, scissor);
       pass.setPipeline(this._getPlaceholderPipeline(rtState));
       pass.draw(3);
-      pass.end();
-      this.device.queue.submit([encoder.finish()]);
+      this._finishDraw();
       return;
     }
 
@@ -925,6 +1050,7 @@
 
     /** Frame boundary from PM4_XE_SWAP — xenia uses this to trigger present/swap on the host. */
     swap() {
+      this._flushFrame();
       this._frameClearColor = false;
       this._frameClearDepth = false;
       this.lastFrame = { at: (typeof performance !== 'undefined' ? performance.now() : Date.now()) };
@@ -933,8 +1059,10 @@
 
     /** Call after the last frame of a session to release GPU resources. */
     destroy() {
+      this._flushFrame();
       if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; this.depthView = null; }
       if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
+      if (this.viewportBuffer) { this.viewportBuffer.destroy(); this.viewportBuffer = null; this._viewportLast = null; }
       if (this.boolConstantBuffer) { this.boolConstantBuffer.destroy(); this.boolConstantBuffer = null; }
       if (this.device) { this.device.destroy(); this.device = null; }
       this.context = null;
@@ -945,7 +1073,7 @@
   }
 
   // Internals exposed for unit tests only — unstable shapes, not public API.
-  const _internal = { topologyForPrimType, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY };
+  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY };
 
   const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL, _internal };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

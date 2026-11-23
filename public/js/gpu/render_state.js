@@ -47,9 +47,37 @@
  *     guest PS statically exports oC0 — discard against RB_ALPHA_REF (IEEE-754
  *     uniform). kAlways disables it (xenia skips it). The fixed bring-up FS
  *     never applies it (never the guest's shader).
- *   - WebGPU exposes one stencil reference per render pass; the back-face
- *     reference (RB_STENCILREFMASK_BF) cannot differ from the front-face one
- *     when back-face stencil is in effect.
+ *   - WebGPU exposes one stencil reference and one read/write mask pair per
+ *     render pass; the back-face reference/masks (RB_STENCILREFMASK_BF) cannot
+ *     differ from the front-face ones when back-face stencil is in effect.
+ *   - Rasterizer state (PA_SU_SC_MODE_CNTL + PA_SU_POLY_OFFSET_*): decoded for
+ *     triangle-list-class (polygonal) primitives exactly like xenia's D3D12 pipeline
+ *     cache — cull_front/cull_back select cullMode (both set = the draw is dropped,
+ *     rasterization produces no fragments; our translated shaders cannot memexport),
+ *     the `face` bit selects frontFace (0 = CCW, 1 = CW), and polygon offset becomes
+ *     depthBias/depthBiasSlopeScale (UNORM24 factor for kD24S8, float24-ULP factor ×8
+ *     for kD24FS8, slope in 1/16-subpixel units). Points/lines are never culled
+ *     (xenia: filled front faces only) and use the para offset register pair.
+ *     kDualMode with a non-triangle polygon type on a non-culled face is wireframe —
+ *     WebGPU has no wireframe fill mode, so it traps loudly (4541096E-style
+ *     poly_mode=2 + kTriangles does NOT trap, exactly like xenia).
+ *   - Viewport (PA_CL_VTE_CNTL/PA_CL_CLIP_CNTL/the PA_CL_VPORT registers/PA_SU_VTX_CNTL,
+ *     window offset from the scissor snapshot): WebGPU has no programmable
+ *     viewport, so the guest viewport is applied in the translated vertex shader
+ *     (xenia's clipping-disabled formula for every guest draw):
+ *     ndc_scale[i] = scale[i] * (2/extent[i]);
+ *     ndc_offset[i] = (offset[i] + window/half-pixel offsets) * (2/extent[i]) - 1.
+ *     Z passes through when PA_CL_CLIP_CNTL.clip_disable or dx_clip_space_def is set,
+ *     otherwise the GL-style -W..W → 0..W remap with zmin/zmax = saturate(oz),
+ *     saturate(oz+sz) (xenia's exact z branch, minus the D3D12 reverse-Z swap —
+ *     WebGPU's depth-compare is arbitrary). Guest pixels map 1:1 onto the canvas
+ *     (extent = canvas size, assumed == guest RT extent); xenia's integer-extent
+ *     host-viewport crop (a host-side EDRAM optimization) is NOT reproduced —
+ *     out-of-viewport geometry rasterizes as on hardware. User clip planes
+ *     (PA_CL_CLIP_CNTL.ucp_ena != 0) TRAP — WebGPU has no clip planes.
+ *   - RB_COLORCONTROL.alpha_to_mask_enable (bit 4) is inert at 1x MSAA on
+ *     Xenos-class hardware, so it needs no handling here; multisampled guests
+ *     are refused by the MSAA trap instead.
  *   - Anything with an unrecognized enumeration still decodes to a named,
  *     loud XenosRenderStateError — never to a silent guess.
  */
@@ -66,6 +94,9 @@
   const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
   const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
   const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
+  const PA_SU_SC_MODE_CNTL = 0x2205;
+  const PA_SU_POLY_OFFSET_FRONT_SCALE = 0x2380, PA_SU_POLY_OFFSET_FRONT_OFFSET = 0x2381;
+  const PA_SU_POLY_OFFSET_BACK_SCALE = 0x2382, PA_SU_POLY_OFFSET_BACK_OFFSET = 0x2383;
 
   // xenos::ColorRenderTargetFormat name table. Undefined nibbles are reported
   // as '0x<nibble> (unrecognized)'.
@@ -180,7 +211,176 @@
     return ((maskNibble & compMask) | (0xF & ~compMask)) >>> 0;
   }
 
-  const dwordToF32 = (v) => new Float32Array(new Uint32Array([v >>> 0]).buffer)[0];
+  // zero-allocation dword→f32 bitcast (single-threaded command processor — the
+  // scratch is never held across a call boundary)
+  const _dwordScratch = new ArrayBuffer(4);
+  const _dwordScratchU32 = new Uint32Array(_dwordScratch);
+  const _dwordScratchF32 = new Float32Array(_dwordScratch);
+  const dwordToF32 = (v) => { _dwordScratchU32[0] = v >>> 0; return _dwordScratchF32[0]; };
+
+  // xenia xenos::kPolygonOffsetScaleSubpixelUnit: the guest slope-scale registers
+  // are in 1/16 subpixel units; WebGPU's depthBiasSlopeScale is per pixel.
+  const K_POLY_OFFSET_SCALE_SUBPIXEL_UNIT = 1.0 / 16.0;
+  // xenia draw_util.h: UNORM24 offsets in units of the 24-bit UNORM resolution;
+  // float24 offsets in float24 ULPs (2^24, scaled down by the 3-mantissa-bit gap).
+  const K_D3D10_POLYGON_OFFSET_FACTOR_UNORM24 = (1 << 24) - 1; // 16777215
+  const K_D3D10_POLYGON_OFFSET_FACTOR_FLOAT24 = Math.pow(2, 24) * (1.0 / 8.0); // 2^21
+
+  /**
+   * Rasterizer state (PA_SU_SC_MODE_CNTL + PA_SU_POLY_OFFSET_*).
+   * Mirrors xenia's D3D12 pipeline cache (d3d12/pipeline_cache.cc, "Rasterizer state").
+   * @param {object} raw — raw register snapshot (paSuScModeCntl, paSuPolyOffset*);
+   *   missing fields decode to 0 (all-disabled), like every other register here.
+   * @param {object} ctx
+   * @param {boolean} ctx.primitivePolygonal — xenia IsPrimitivePolygonal: triangle-list/
+   *   fan/strip (+ fan-with-W-flags), quad-list/strip, polygon (and patch types on the
+   *   tessellation path, which this port does not support). Points/lines: no culling.
+   * @param {boolean} ctx.isFloat24Depth — RB_DEPTH_INFO format bit (kD24FS8), selecting the
+   *   float24-ULP offset factor (xenia GetD3D10IntegerPolygonOffset).
+   */
+  function decodeRasterState(raw, { primitivePolygonal = false, isFloat24Depth = false } = {}) {
+    const mode = raw.paSuScModeCntl >>> 0;
+    const cullFront = (mode & 0x1) !== 0;
+    const cullBack = (mode & 0x2) !== 0;
+    const faceCw = (mode & 0x4) !== 0; // 0 - front is CCW, 1 - front is CW (xenia)
+    const polyMode = (mode >>> 3) & 0x3; // xenos::PolygonModeEnable: 1 = kDualMode
+    const frontPtype = (mode >>> 5) & 0x7, backPtype = (mode >>> 8) & 0x7; // xenos::PolygonType: 2 = kTriangles
+    const frontOffsetEna = (mode & 0x800) !== 0;
+    const backOffsetEna = (mode & 0x1000) !== 0;
+    const paraOffsetEna = (mode & 0x2000) !== 0;
+
+    let cullMode = 'none';
+    let bothCull = false;
+    if (primitivePolygonal) {
+      if (cullFront && cullBack) {
+        // xenia: rasterization is disabled for both-faces-culled draws (the draw
+        // produces no fragments). Translated shaders cannot export to memory, so
+        // dropping the draw is exactly equivalent.
+        bothCull = true;
+      } else if (cullFront) {
+        cullMode = 'front';
+      } else if (cullBack) {
+        cullMode = 'back';
+      }
+      // Wireframe (kDualMode): an unrepresentable fill mode in WebGPU. Only a
+      // non-culled face matters — xenia ignores the culled side entirely.
+      if (polyMode === 1) {
+        const frontWire = !cullFront && frontPtype !== 2;
+        const backWire = !cullBack && backPtype !== 2;
+        if (frontWire || backWire) {
+          throw new XenosRenderStateError(
+            `PA_SU_SC_MODE_CNTL poly_mode=kDualMode with a non-triangle ${frontWire ? 'front' : 'back'} polygon ` +
+            `(ptype ${frontWire ? frontPtype : backPtype}, points/lines) — WebGPU has no wireframe fill mode; ` +
+            'refusing to draw (4541096E-style poly_mode=2 + kTriangles is NOT affected, matching xenia)');
+        }
+      }
+    }
+    const frontFace = faceCw ? 'cw' : 'ccw';
+
+    // Polygon offset (xenia GetPreferredFacePolygonOffset): front wins for
+    // polygonal primitives (unless disabled or culled); back only when it
+    // decodes to a non-zero scale/offset; para registers for points/lines.
+    let scale = 0.0, offset = 0.0;
+    if (primitivePolygonal) {
+      if (frontOffsetEna && !cullFront) {
+        scale = dwordToF32(raw.paSuPolyOffsetFrontScale);
+        offset = dwordToF32(raw.paSuPolyOffsetFrontOffset);
+      }
+      if (backOffsetEna && !cullBack && !scale && !offset) {
+        scale = dwordToF32(raw.paSuPolyOffsetBackScale);
+        offset = dwordToF32(raw.paSuPolyOffsetBackOffset);
+      }
+    } else if (paraOffsetEna) {
+      scale = dwordToF32(raw.paSuPolyOffsetFrontScale);
+      offset = dwordToF32(raw.paSuPolyOffsetFrontOffset);
+    }
+    // xenia GetD3D10IntegerPolygonOffset (ceil-abs, sign restore).
+    const factor = isFloat24Depth ? K_D3D10_POLYGON_OFFSET_FACTOR_FLOAT24 : K_D3D10_POLYGON_OFFSET_FACTOR_UNORM24;
+    let bias = Math.ceil(Math.abs(offset) * factor);
+    if (isFloat24Depth) bias *= 8; // float24 ULP -> float32 ULPs (xenia: bias <<= 3)
+    const depthBias = offset < 0 ? -bias : bias;
+    const depthBiasSlopeScale = scale * K_POLY_OFFSET_SCALE_SUBPIXEL_UNIT;
+
+    return { cullMode, frontFace, depthBias, depthBiasSlopeScale, depthBiasClamp: 0, bothCull };
+  }
+
+  const PA_CL_CLIP_CNTL = 0x2204, PA_CL_VTE_CNTL = 0x2206, PA_SU_VTX_CNTL = 0x2302;
+  const PA_CL_VPORT_XSCALE = 0x210F, PA_CL_VPORT_XOFFSET = 0x2110, PA_CL_VPORT_YSCALE = 0x2111, PA_CL_VPORT_YOFFSET = 0x2112;
+  const PA_CL_VPORT_ZSCALE = 0x2113, PA_CL_VPORT_ZOFFSET = 0x2114;
+
+  const sat01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+  const s15f = (v) => { v &= 0x7fff; return v & 0x4000 ? v - 0x8000 : v; };
+
+  /**
+   * Viewport decode (PA_CL_VTE_CNTL + PA_CL_CLIP_CNTL + PA_CL_VPORT_* + PA_SU_VTX_CNTL,
+   * window offset from the scissor snapshot). WebGPU has no programmable viewport —
+   * the returned coefficients are applied in the translated vertex shader
+   * (in clip space, pre-w-divide), xenia's clipping-disabled formula for both XY axes:
+   *   n' = n * scale * (2/E) + (offset + window/half-pixel offsets) * (2/E) - 1
+   * @param {object} raw — snapshot fields paClVteCntl/paClClipCntl/paClVportXSCALE..OFFSET / paSuVtxCntl/paSuScModeCntl;
+   *   missing fields decode to 0 = all enables off = scale 1 / offset 0 (xenia's zeroed-register behavior,
+   *   which maps NDC across the whole render target — the pre-viewport bring-up behavior)
+   * @param {object} [scissor] — scissor snapshot carrying windowOffset (PA_SC_WINDOW_OFFSET)
+   * @param {object} surface — { width, height } canvas size (1:1 with the guest render target)
+   * @returns {{ scale: number[], offset: number[] }} — [x,y,z] clip-space coefficients
+   */
+  function decodeViewportState(raw, scissor, surface) {
+    const clip = (raw?.paClClipCntl ?? 0) >>> 0;
+    const ucp = clip & 0x3F;
+    if (ucp !== 0) {
+      throw new XenosRenderStateError(
+        `user clip planes are enabled (PA_CL_CLIP_CNTL.ucp_ena=0x${ucp.toString(16)}) — WebGPU has no clip planes and this port does not emulate them; ` +
+        'refusing to draw (trap, never a silent missing clip)');
+    }
+    const vte = (raw?.paClVteCntl ?? 0) >>> 0;
+    const mode = (raw?.paSuScModeCntl ?? 0) >>> 0;
+    const sx = (vte & 0x1) ? dwordToF32(raw.paClVportXscale) : 1.0;
+    const ox = (vte & 0x2) ? dwordToF32(raw.paClVportXoffset) : 0.0;
+    const sy = (vte & 0x4) ? dwordToF32(raw.paClVportYscale) : 1.0;
+    const oy = (vte & 0x8) ? dwordToF32(raw.paClVportYoffset) : 0.0;
+    const sz = (vte & 0x10) ? dwordToF32(raw.paClVportZscale) : 1.0;
+    const oz = (vte & 0x20) ? dwordToF32(raw.paClVportZoffset) : 0.0;
+
+    // offset_add: PA_SC_WINDOW_OFFSET (only when vtx_window_offset_enable, bit 16) + the
+    // half-pixel offset for kD3DZero pixel centers (xenia half_pixel_offset cvar, default on).
+    let addX = 0, addY = 0;
+    if ((mode & 0x10000) !== 0) {
+      const w = (scissor?.windowOffset ?? 0) >>> 0;
+      addX += s15f(w);
+      addY += s15f(w >>> 16);
+    }
+    const pixCenter = (raw?.paSuVtxCntl ?? 0) & 0x1; // xenos::PixelCenter: 0 = kD3DZero, 1 = kOGLHalf
+    if (pixCenter === 0) { addX += 0.5; addY += 0.5; }
+
+    // XY: guest pixel space → WebGPU fixed mapping composite. Extent = canvas
+    // size (1:1 with the guest RT); axes are independent.
+    const ex = Math.max(1, surface?.width ?? 1), ey = Math.max(1, surface?.height ?? 1);
+    const kx = 2 / ex, ky = 2 / ey;
+    const ndcX = sx * kx, ndcY = sy * ky;
+    const offX = (ox + addX) * kx - 1, offY = (oy + addY) * ky - 1;
+    // round to f32 — the coefficients ride a Float32 uniform; keep the JS contract identical to the wire
+
+    // Z: clip_disable or dx_clip_space_def → guest z passes through scale/offset
+    // (xenia: host viewport depth range = [saturate(oz−sz), saturate(oz+sz)], VS
+    // pass-through). Otherwise the guest clip space is -W..W: the VS remaps to 0..W
+    // (×0.5 + 0.5W) and xenia's host depth range [saturate(oz−sz), saturate(oz+sz)]
+    // (from host_clip_offset_z = offset_z − scale_z) is folded in as well, giving
+    // z' = 0.5(zmax−zmin)·z_gl + 0.5(zmin+zmax). No reverse-z swap — WebGPU allows
+    // any depthCompare direction (xenia's swap exists only to satisfy D3D12).
+    let zScale, zOffset;
+    if (((clip & 0x10000) !== 0) || ((clip & 0x80000) !== 0)) {
+      zScale = sz;
+      zOffset = oz;
+    } else {
+      const zmin = sat01(oz - sz), zmax = sat01(oz + sz);
+      zScale = 0.5 * (zmax - zmin);
+      zOffset = 0.5 * (zmin + zmax);
+    }
+    return {
+      scale: [Math.fround(ndcX), Math.fround(ndcY), Math.fround(zScale)],
+      offset: [Math.fround(offX), Math.fround(offY), Math.fround(zOffset)],
+    };
+  }
 
   // The draw path decodes the ROP snapshot on every draw; identical raw values
   // decode to identical state, so memoize the decode (bounded — ROP state
@@ -188,6 +388,46 @@
   const rtDecodeCache = new Map();
   const RT_DECODE_CACHE_LIMIT = 64;
 
+  // Two-level memo for the decode hot path: a 32-bit FNV-1a fingerprint of every
+  // field that determines the decode (same fields the string cacheKey covers),
+  // bucketed and verified element-by-element on hit. This avoids building a long
+  // string on every draw; collisions just fall through to the string cache
+  // (the verification is exact — a fingerprint match never skips it).
+  const RT_FP_CACHE_LIMIT = 64;
+  const rtFpCache = new Map(); // fingerprint -> [{ raw, flags, state }] — verified against raw on hit
+  const fpMix = (h, x) => Math.imul((h ^ (x >>> 0)) >>> 0, 16777619) >>> 0;
+  // Fingerprint over exactly the fields the string cacheKey covers. Allocation-free.
+  function fingerprintRaw(raw, flags) {
+    let h = 2166136261 >>> 0;
+    h = fpMix(h, raw.surfaceInfo === undefined ? -1 : raw.surfaceInfo);
+    h = fpMix(h, raw.colorInfo0); h = fpMix(h, raw.depthInfo); h = fpMix(h, raw.colorMask);
+    h = fpMix(h, raw.depthControl); h = fpMix(h, raw.blendControl0); h = fpMix(h, raw.stencilRefMask);
+    h = fpMix(h, raw.stencilRefMaskBf); h = fpMix(h, raw.colorControl);
+    h = fpMix(h, raw.blendRed); h = fpMix(h, raw.blendGreen); h = fpMix(h, raw.blendBlue); h = fpMix(h, raw.blendAlpha);
+    h = fpMix(h, raw.alphaRef === undefined ? -1 : raw.alphaRef); h = fpMix(h, flags);
+    h = fpMix(h, raw.paSuScModeCntl);
+    h = fpMix(h, raw.paSuPolyOffsetFrontScale); h = fpMix(h, raw.paSuPolyOffsetFrontOffset);
+    h = fpMix(h, raw.paSuPolyOffsetBackScale); h = fpMix(h, raw.paSuPolyOffsetBackOffset);
+    return h >>> 0;
+  }
+  // Exact field-by-field verification against the stored snapshot of normalized values.
+  // `a` is the stored snapshot (already >>> 0 / -1); `b` is the incoming raw snapshot — normalize as we compare.
+  function sameFields(a, b) {
+    const si = b.surfaceInfo === undefined ? -1 : b.surfaceInfo >>> 0;
+    const ar = b.alphaRef === undefined ? -1 : b.alphaRef >>> 0;
+    return a.surfaceInfo === si && a.colorInfo0 === (b.colorInfo0 >>> 0) && a.depthInfo === (b.depthInfo >>> 0)
+      && a.colorMask === (b.colorMask >>> 0) && a.depthControl === (b.depthControl >>> 0)
+      && a.blendControl0 === (b.blendControl0 >>> 0) && a.stencilRefMask === (b.stencilRefMask >>> 0)
+      && a.stencilRefMaskBf === (b.stencilRefMaskBf >>> 0) && a.colorControl === (b.colorControl >>> 0)
+      && a.blendRed === (b.blendRed >>> 0) && a.blendGreen === (b.blendGreen >>> 0)
+      && a.blendBlue === (b.blendBlue >>> 0) && a.blendAlpha === (b.blendAlpha >>> 0)
+      && a.alphaRef === ar
+      && a.paSuScModeCntl === (b.paSuScModeCntl >>> 0)
+      && a.paSuPolyOffsetFrontScale === (b.paSuPolyOffsetFrontScale >>> 0)
+      && a.paSuPolyOffsetFrontOffset === (b.paSuPolyOffsetFrontOffset >>> 0)
+      && a.paSuPolyOffsetBackScale === (b.paSuPolyOffsetBackScale >>> 0)
+      && a.paSuPolyOffsetBackOffset === (b.paSuPolyOffsetBackOffset >>> 0);
+  }
   /**
    * Build the WebGPU render-target state for one draw.
    * @param {object} raw — raw register snapshot (see module docs); all fields required.
@@ -208,7 +448,7 @@
         'snapshots RB_COLOR_INFO/RB_DEPTH_INFO/RB_COLOR_MASK/RB_BLENDCONTROL[0-3]/RB_DEPTHCONTROL/RB_COLORCONTROL/' +
         'RB_STENCILREFMASK[_BF]/RB_BLEND_* at draw time; refusing to draw with fabricated render state');
     }
-    const { psExportsColor0 = true, psExportsDepth = false } = opts;
+    const { psExportsColor0 = true, psExportsDepth = false, primitivePolygonal = false } = opts;
     // --- RB_SURFACE_INFO: MSAA must be off (canvas/depth targets are single-sampled) ----
     // msaa_samples at bits +16:2 (k1X=0, k2X=1, k4X=2) — xenia's RB_SURFACE_INFO.
     // The scanout canvas and the depth24plus-stencil8 attachment are 1x; rendering
@@ -225,12 +465,23 @@
         `guest render target is configured for ${msaaSamples === 1 ? '2x' : '4x'} MSAA (RB_SURFACE_INFO.msaa_samples=${msaaSamples}) — ` +
         'the canvas and the depth24plus-stencil8 attachment are single-sampled; MSAA needs the EDRAM render-target cache (step 7). Refusing to draw');
     }
+    const flags = (psExportsColor0 ? 1 : 0) | ((psExportsDepth ? 1 : 0) << 1) | ((primitivePolygonal ? 1 : 0) << 2);
+    const fp = fingerprintRaw(raw, flags);
+    const bucket = rtFpCache.get(fp);
+    if (bucket) {
+      for (let i = 0; i < bucket.length; i++) {
+        const c = bucket[i];
+        if (c.flags === flags && sameFields(c.raw, raw)) return c.state;
+      }
+    }
     const cacheKey = [
       raw.surfaceInfo === undefined ? -1 : (raw.surfaceInfo >>> 0), raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, raw.colorMask >>> 0, raw.depthControl >>> 0,
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
-      raw.alphaRef === undefined ? -1 : (raw.alphaRef >>> 0),
-      (psExportsColor0 ? 1 : 0) | ((psExportsDepth ? 1 : 0) << 1),
+      raw.alphaRef === undefined ? -1 : (raw.alphaRef >>> 0), flags,
+      raw.paSuScModeCntl >>> 0,
+      raw.paSuPolyOffsetFrontScale >>> 0, raw.paSuPolyOffsetFrontOffset >>> 0,
+      raw.paSuPolyOffsetBackScale >>> 0, raw.paSuPolyOffsetBackOffset >>> 0,
     ].join(',');
     const cached = rtDecodeCache.get(cacheKey);
     if (cached) return cached;
@@ -244,6 +495,10 @@
     const colorControl = raw.colorControl >>> 0;
     const alphaTestEnable = (colorControl & 0x8) !== 0;
     const alphaFunc = colorControl & 0x7;
+    // RB_COLORCONTROL.alpha_to_mask_enable (bit 4): on Xenos/r5xx-class hardware A2C has an
+    // effect only with multisampling; at 1x MSAA it is inert (reference: the same rule on the
+    // host xenia/D3D path). Multisampled guests trap on RB_SURFACE_INFO below, so A2C can
+    // never be silently dropped here — it is either a hardware no-op or the draw is refused.
     const alphaRef = raw.alphaRef;
     let alphaTest = null;
     if (alphaTestEnable && alphaFunc !== 7) {
@@ -285,16 +540,27 @@
         'the float24 depth path is part of the EDRAM render-target cache work (step 7). Refusing to draw');
     }
 
-    // --- stencil reference (one per pass in WebGPU) -------------------------
+    // --- stencil reference + masks (one pair per pass in WebGPU) -------------
     const stencilRefMask = raw.stencilRefMask >>> 0;
     const stencilRefMaskBf = raw.stencilRefMaskBf >>> 0;
     const ref = stencilRefMask & 0xFF;
     const refBf = stencilRefMaskBf & 0xFF;
-    if (stencilEnable && backfaceEnable && refBf !== ref) {
-      throw new XenosRenderStateError(
-        `stencil reference differs between front (0x${ref.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
-        `(0x${refBf.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — WebGPU has one stencil reference per render pass, ` +
-        'so the back faces would test against the wrong value. Refusing to draw');
+    if (stencilEnable && backfaceEnable) {
+      if (refBf !== ref) {
+        throw new XenosRenderStateError(
+          `stencil reference differs between front (0x${ref.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
+          `(0x${refBf.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — WebGPU has one stencil reference per render pass, ` +
+          'so the back faces would test against the wrong value. Refusing to draw');
+      }
+      const readMaskF = (stencilRefMask >>> 8) & 0xFF, readMaskB = (stencilRefMaskBf >>> 8) & 0xFF;
+      const writeMaskF = (stencilRefMask >>> 16) & 0xFF, writeMaskB = (stencilRefMaskBf >>> 16) & 0xFF;
+      if (readMaskB !== readMaskF || writeMaskB !== writeMaskF) {
+        throw new XenosRenderStateError(
+          `stencil read/write mask differs between front (stencilmask 0x${readMaskF.toString(16).padStart(2, '0')}, ` +
+          `writemask 0x${writeMaskF.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
+          `(stencilmask 0x${readMaskB.toString(16).padStart(2, '0')}, writemask 0x${writeMaskB.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — ` +
+          'WebGPU has one stencil read/write mask pair per render pass. Refusing to draw');
+      }
     }
 
     // --- write mask ---------------------------------------------------------
@@ -310,6 +576,9 @@
     const blendConstant = [
       dwordToF32(raw.blendRed), dwordToF32(raw.blendGreen), dwordToF32(raw.blendBlue), dwordToF32(raw.blendAlpha),
     ];
+
+    // --- rasterizer state (cull/winding/depth bias) --------------------------
+    const raster = decodeRasterState(raw, { primitivePolygonal, isFloat24Depth: depthInfo.format === 1 });
 
     // --- depth/stencil state ------------------------------------------------
     const depthStencil = {
@@ -342,6 +611,10 @@
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
       psExportsColor0 ? 1 : 0, psExportsDepth ? 1 : 0,
+      raw.paSuScModeCntl >>> 0,
+      raw.paSuPolyOffsetFrontScale >>> 0, raw.paSuPolyOffsetFrontOffset >>> 0,
+      raw.paSuPolyOffsetBackScale >>> 0, raw.paSuPolyOffsetBackOffset >>> 0,
+      primitivePolygonal ? 1 : 0,
     ].join(',');
 
     const state = {
@@ -352,6 +625,7 @@
       depthStencil,
       stencilRef: ref,
       alphaTest,
+      raster,
       surfacePitch: surfaceInfo & 0x3FFF,
       convertColor0ToGamma,
       colorFormatName: colorInfo0.formatName,
@@ -359,6 +633,21 @@
     };
     if (rtDecodeCache.size >= RT_DECODE_CACHE_LIMIT) rtDecodeCache.clear();
     rtDecodeCache.set(cacheKey, state);
+    if (rtFpCache.size >= RT_FP_CACHE_LIMIT) rtFpCache.clear();
+    // snapshot the 19 decoded fields once (not per draw) for verification on later hits
+    const snap = {
+      surfaceInfo: raw.surfaceInfo === undefined ? -1 : raw.surfaceInfo >>> 0, colorInfo0: raw.colorInfo0 >>> 0, depthInfo: raw.depthInfo >>> 0,
+      colorMask: raw.colorMask, depthControl: raw.depthControl, blendControl0: raw.blendControl0,
+      stencilRefMask: raw.stencilRefMask, stencilRefMaskBf: raw.stencilRefMaskBf, colorControl: raw.colorControl,
+      blendRed: raw.blendRed, blendGreen: raw.blendGreen, blendBlue: raw.blendBlue, blendAlpha: raw.blendAlpha,
+      alphaRef: raw.alphaRef === undefined ? -1 : (raw.alphaRef >>> 0),
+      paSuScModeCntl: raw.paSuScModeCntl >>> 0,
+      paSuPolyOffsetFrontScale: raw.paSuPolyOffsetFrontScale >>> 0, paSuPolyOffsetFrontOffset: raw.paSuPolyOffsetFrontOffset >>> 0,
+      paSuPolyOffsetBackScale: raw.paSuPolyOffsetBackScale >>> 0, paSuPolyOffsetBackOffset: raw.paSuPolyOffsetBackOffset >>> 0,
+    };
+    const bucket2 = rtFpCache.get(fp);
+    if (bucket2) bucket2.push({ raw: snap, flags, state });
+    else rtFpCache.set(fp, [{ raw: snap, flags, state }]);
     return state;
   }
 
@@ -425,6 +714,14 @@
       return enabled && func !== 7 ? { compare: func } : null;
     },
     buildRenderTargetState,
+    decodeViewportState,
+    decodeRasterState,
+    PA_SU_SC_MODE_CNTL,
+    PA_CL_CLIP_CNTL, PA_CL_VTE_CNTL, PA_SU_VTX_CNTL,
+    PA_CL_VPORT_XSCALE, PA_CL_VPORT_XOFFSET, PA_CL_VPORT_YSCALE, PA_CL_VPORT_YOFFSET,
+    PA_CL_VPORT_ZSCALE, PA_CL_VPORT_ZOFFSET,
+    PA_SU_POLY_OFFSET_FRONT_SCALE, PA_SU_POLY_OFFSET_FRONT_OFFSET,
+    PA_SU_POLY_OFFSET_BACK_SCALE, PA_SU_POLY_OFFSET_BACK_OFFSET,
     PA_SC_WINDOW_SCISSOR_TL, PA_SC_WINDOW_SCISSOR_BR, PA_SC_WINDOW_OFFSET,
     PA_SC_SCREEN_SCISSOR_TL, PA_SC_SCREEN_SCISSOR_BR,
     buildScissorState,
