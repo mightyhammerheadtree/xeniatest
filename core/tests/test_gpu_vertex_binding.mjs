@@ -291,6 +291,10 @@ test('VETEX constants flow from the register file through the CP into the draw p
   // vertex shader via IM_LOAD_IMMEDIATE (type 0 = vertex, 9 dwords inline)
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_IM_LOAD_IMMEDIATE, 11), 0, 9, ...FETCH_VS]));
   // draw, source = kAutoIndex (no index DMA), 3 vertices
+  // (RB_MODECONTROL = kColorDepth and a non-zero surface_pitch, so the draw is
+  // not ignored — xenia's IssueDraw gate).
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000004]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2000, 1), 0x00001000]));
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
   assert.equal(calls.length, 1);

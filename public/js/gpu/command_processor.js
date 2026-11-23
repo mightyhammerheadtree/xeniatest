@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/, depthOnly /* RB_MODECONTROL.edram_mode = kDepth: depth only, no color output *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -667,6 +667,7 @@
       const RB_COLOR_INFO = 0x2001, RB_DEPTH_INFO = 0x2002;
       const RB_COLOR1_INFO = 0x2003, RB_COLOR2_INFO = 0x2004, RB_COLOR3_INFO = 0x2005;
       const RB_COLOR_MASK = 0x2104, RB_ALPHA_REF = 0x210e;
+      const RB_MODECONTROL = 0x2208;
       const RB_BLEND_RED = 0x2105, RB_BLEND_GREEN = 0x2106, RB_BLEND_BLUE = 0x2107, RB_BLEND_ALPHA = 0x2108;
       const RB_STENCILREFMASK_BF = 0x210c, RB_STENCILREFMASK = 0x210d;
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
@@ -682,6 +683,7 @@
       const PA_SC_SCREEN_SCISSOR_TL = 0x200e, PA_SC_SCREEN_SCISSOR_BR = 0x200f;
       const renderTargets = {
         surfaceInfo: this.registers.read(RB_SURFACE_INFO) >>> 0,
+        rbModeControl: this.registers.read(RB_MODECONTROL) >>> 0,
         colorInfo0: this.registers.read(RB_COLOR_INFO) >>> 0,
         depthInfo: this.registers.read(RB_DEPTH_INFO) >>> 0,
         colorInfo1: this.registers.read(RB_COLOR1_INFO) >>> 0,
@@ -716,6 +718,28 @@
         paSuPolyOffsetBackScale: this.registers.read(PA_SU_POLY_OFFSET_BACK_SCALE) >>> 0,
         paSuPolyOffsetBackOffset: this.registers.read(PA_SU_POLY_OFFSET_BACK_OFFSET) >>> 0,
       };
+      // xenia's IssueDraw gate (D3D12CommandProcessor::IssueDraw):
+      //   RB_MODECONTROL.edram_mode (bits 0:2) — xenos::ModeControl:
+      //     kIgnore (0)    → the draw is ignored entirely (no fragments),
+      //     kCopy (6)     → the draw is a render-target copy,
+      //     kDepth (5)    → depth-only: no pixel shader, no color output,
+      //     kColorDepth (4)→ an ordinary color+depth draw.
+      //   RB_SURFACE_INFO.surface_pitch == 0 → "Doesn't actually draw".
+      const edramMode = (this.registers.read(RB_MODECONTROL) >>> 0) & 0x7;
+      if (edramMode === 0 /* kIgnore */) {
+        this.log('debug', `${opcodeName}: draw ignored — RB_MODECONTROL.edram_mode = kIgnore (xenia returns before rasterizing)`);
+        return end;
+      }
+      if (edramMode === 6 /* kCopy */) {
+        throw new XenosGpuError(
+          `${opcodeName}: the guest issued a render-target copy (RB_MODECONTROL.edram_mode = kCopy) — the copy of the ` +
+          'render target into guest memory (RB_COPY_*) is not implemented in this port (the EDRAM render-target cache, ' +
+          'step 7). Refusing to draw instead of silently dropping the copy');
+      }
+      if (((this.registers.read(RB_SURFACE_INFO) >>> 0) & 0x3fff) === 0) {
+        this.log('debug', `${opcodeName}: draw skipped — RB_SURFACE_INFO.surface_pitch is 0 (xenia: "doesn't actually draw")`);
+        return end;
+      }
       // xenia: if PA_SC_VIZ_QUERY has viz_query_ena (bit 0) AND kill_pix_post_hi_z (bit 7),
       // the draw is an occlusion-query hint and must NOT touch the render target (r6xx/r7xx
       // VIZ_QUERY). IssueDraw is not called then; other bit combinations draw normally.
@@ -748,6 +772,8 @@
         boolConstants,
         renderTargets,
         scissor,
+        // xenia's kDepth mode: no pixel shader, no color output — depth only.
+        depthOnly: edramMode === 5,
       });
       this.stats.draws++;
       return end;

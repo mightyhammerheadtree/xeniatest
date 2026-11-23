@@ -784,6 +784,27 @@ test('kD24FS8 float depth uses a depth32float attachment (xenia uses a float dep
 test('Dawn accepts the depth attachment formats this port chooses (depth24plus-stencil8, depth32float)', async () => {
   assert.equal(await checkAttachmentFormats({ depthFormat: 'depth24plus-stencil8', stencil: true }), null);
   assert.equal(await checkAttachmentFormats({ depthFormat: 'depth32float' }), null);
+  // A depth-only pipeline (xenia's kDepth mode) has no fragment stage and a
+  // zero color write mask — Dawn must accept that combination.
+  assert.equal(await checkAttachmentFormats({ depthFormat: 'depth24plus-stencil8', depthOnly: true }), null);
+});
+
+test('a depth-only draw (xenia kDepth) runs no pixel shader and writes no color', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.shaders.pixel = { kind: 'pixel', code: PS_CONST_VS, dwords: PS_CONST_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets(), depthOnly: true }));
+  const pipeline = log.pipelines.at(-1);
+  assert.ok(pipeline, 'a pipeline was created');
+  assert.equal(pipeline.desc.depthStencil.format, 'depth24plus-stencil8');
+  // The color target writes nothing and no guest pixel shader is bound.
+  assert.equal(pipeline.desc.fragment.targets[0].writeMask, 0, 'the color target writes nothing');
+  assert.match(pipeline.desc.fragment.module.desc.code, /Depth-only draw/);
+  assert.doesNotMatch(pipeline.desc.fragment.module.desc.code, /Xenos pixel shader/);
+  // The guest pixel shader was not translated at all for this draw.
+  assert.equal(log.modules.filter((m) => /Xenos pixel shader/.test(m.code)).length, 0);
 });
 
 test('traps: kD24FS8 float depth with stencil is refused (WebGPU has no float depth format with a stencil plane)', () => {

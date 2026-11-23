@@ -46,6 +46,19 @@ function makeCP(guest, backend) {
   return new XenosCommandProcessor({ backend, readGuestMemory: guest.readGuestMemory, writeGuestMemory: guest.writeGuestMemory });
 }
 
+/**
+ * Put the command processor into xenia's ordinary color+depth draw mode.
+ * xenia's IssueDraw ignores a draw while RB_MODECONTROL.edram_mode is
+ * kIgnore (0 — the reset value) and while RB_SURFACE_INFO.surface_pitch is 0
+ * ("doesn't actually draw"), so a guest that wants its draws rasterized
+ * programs both registers.
+ */
+function enableDraws(cp) {
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000004])); // RB_MODECONTROL = kColorDepth
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2000, 1), 0x00001000])); // RB_SURFACE_INFO.surface_pitch = 0x1000
+  return cp;
+}
+
 /** Encode padded list of dwords as BE bytes. */
 function beWords(words) {
   const buf = new Uint8Array(words.length * 4);
@@ -269,7 +282,7 @@ test('EVENT_WRITE maps the writeback window through WRITEBACK_START/SIZE', () =>
 test('DRAW_INDX (indexed, DMA) decodes the initiator and notifies the backend', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   const numIndices = 0x00f0;
   const primType = PM4.PRIMITIVE_TYPE.kTriangleList;
   const sourceSelect = PM4.SOURCE_SELECT.kDMA;
@@ -291,7 +304,7 @@ test('DRAW_INDX (indexed, DMA) decodes the initiator and notifies the backend', 
 test('DRAW_INDX_2 (auto-index) draws without an index DMA', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleStrip;
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
   const draws = backend.calls.filter((c) => c.kind === 'draw');
@@ -303,7 +316,7 @@ test('DRAW_INDX_2 (auto-index) draws without an index DMA', () => {
 test('predicated packets are skipped while the bin predicate fails and execute when it passes', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   // mask = 0 → predicate fails
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_MASK, 2), 0x00000000, 0x00000000]));
@@ -384,7 +397,7 @@ test('PM4_XE_SWAP calls backend.swap (frame boundary)', () => {
 
 test('draw without a backend trap: clear error naming the missing method', () => {
   const guest = makeGuest();
-  const cp = new XenosCommandProcessor({ readGuestMemory: guest.readGuestMemory }); // no backend
+  const cp = enableDraws(new XenosCommandProcessor({ readGuestMemory: guest.readGuestMemory })); // no backend
   const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
   assert.throws(() => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator])), (e) => /backend does not implement draw\(\)/.test(e.message));
 });
@@ -392,7 +405,7 @@ test('draw without a backend trap: clear error naming the missing method', () =>
 test('draw packet snapshots ALU and bool constants from the register file', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   // SET_CONSTANT ALU index 0: two dwords (1.0f, 2.0f bits) — packet has 3 payload dwords (index + 2)
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_CONSTANT, 3), 0, 0x3f800000, 0x40000000]));
   // SET_CONSTANT BOOL index 4: value with bit for bool 4
@@ -413,7 +426,7 @@ test('draw packet snapshots ALU and bool constants from the register file', () =
 test('draw packet snapshots the RB_* render-target registers from the register file', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
-  const cp = makeCP(guest, backend);
+  const cp = enableDraws(makeCP(guest, backend));
   // Write the render-target registers via direct context-register writes (index base 0x2000).
   // RB_COLOR_INFO (0x2001): format 5 (k_16_16_16_16) at +16, base 0x42.
   // RB_COLOR_MASK (0x2104): 0xA5A5A5A5.
@@ -481,13 +494,67 @@ test('PA_SC_VIZ_QUERY ena without kill (or kill without ena) still draws (xenia 
   for (const viz of [0x01, 0x80, 0x00]) {
     const guest = makeGuest();
     const backend = makeBackend(guest);
-    const cp = makeCP(guest, backend);
+    const cp = enableDraws(makeCP(guest, backend));
     const setReg = (index, value) => cp.executeCommandBuffer(beWords([PM4.makePacketType0(index, 1), value]));
     setReg(0x2293, viz);
     const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
     cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
     assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 1, `PA_SC_VIZ_QUERY=0x${viz.toString(16)} must still draw`);
   }
+});
+
+test('RB_MODECONTROL gates the draw exactly like xenia (kIgnore / kCopy / kDepth)', () => {
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  // kIgnore (0, the reset value) → the draw is ignored (no fragments).
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000000]));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'a kIgnore draw never reaches the backend');
+  }
+  // kCopy (6) → the guest wants a render-target copy: this port cannot do it.
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000006]));
+    assert.throws(
+      () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator])),
+      /render-target copy/);
+  }
+  // kDepth (5) → depth only: the draw reaches the backend flagged as such.
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2208, 1), 0x00000005]));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    const draw = backend.calls.find((c) => c.kind === 'draw');
+    assert.ok(draw, 'the depth-only draw reached the backend');
+    assert.equal(draw.depthOnly, true);
+  }
+  // kColorDepth (4) → an ordinary draw.
+  {
+    const guest = makeGuest();
+    const backend = makeBackend(guest);
+    const cp = enableDraws(makeCP(guest, backend));
+    cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+    const draw = backend.calls.find((c) => c.kind === 'draw');
+    assert.ok(draw);
+    assert.equal(draw.depthOnly, false);
+  }
+});
+
+test('a draw with RB_SURFACE_INFO.surface_pitch == 0 does not draw (xenia: "doesn\'t actually draw")', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = enableDraws(makeCP(guest, backend));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType0(0x2000, 1), 0x00000000])); // surface_pitch = 0
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2, 1), initiator]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'the draw never reaches the backend');
 });
 
 test('PM4_VIZ_QUERY traps loudly (occlusion queries unimplemented — step 9)', () => {

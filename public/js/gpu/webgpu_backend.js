@@ -159,6 +159,17 @@
 }
 `;
 
+  // The depth-only fragment stage (xenia's RB_MODECONTROL.edram_mode = kDepth):
+  // no guest pixel shader runs, nothing is written to the color attachment
+  // (the pipeline's color target carries a zero write mask) and the depth
+  // comes from the rasterizer — the stage exists only because WebGPU requires
+  // a fragment stage for a pipeline that is used in a pass with a color
+  // attachment (all the draws of a frame share one pass).
+  const DEPTH_ONLY_FRAGMENT_WGSL = `// Depth-only draw (xenia kDepth mode) — no guest pixel shader, no color output.
+@fragment fn fs_main() {
+}
+`;
+
   /**
    * The present blit: a fullscreen triangle that copies the offscreen
    * render target into the canvas texture. The guest's render-target format
@@ -734,7 +745,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       try {
         rtState = rs.buildRenderTargetState(params.renderTargets, {
           // No pixel shader → the bring-up FS writes the attachment unconditionally.
-          psExportsColor0: program?.fragment ? program.exportsColor0 : true,
+          psExportsColor0: params.depthOnly ? false : (program?.fragment ? program.exportsColor0 : true),
           psExportsDepth: program?.exportsDepth ?? false,
           // xenia IsPrimitivePolygonal — culling/wireframe/polygon offset only for polygonal prims.
           primitivePolygonal: isPrimitivePolygonal(params.primType),
@@ -968,13 +979,13 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
      * blend, depth/stencil) — the same shader pair drawn with different ROP
      * state gets a different pipeline.
      */
-    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program, rtState) {
+    _getTranslatedProgramResources(vsCode, psCode, plan, topology, program, rtState, depthOnly = false) {
       let perShader = this.translatedPipelines.get(vsCode);
       if (!perShader) {
         perShader = new Map();
         this.translatedPipelines.set(vsCode, perShader);
       }
-      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}eb${expBiasKey(program)}`;
+      const pairKey = (psCode ? `ps${this._psId(psCode)}` : 'flat') + `|a${alphaTestKey(program)}g${convertKey(program)}c${colorExportKey(program)}eb${expBiasKey(program)}` + (depthOnly ? '|depth' : '');
       const rtKey = rtState ? rtState.key : 'rt:none';
       const layoutKey = `${pairKey}|${topology}:${this.format}:${rtKey}:` + JSON.stringify((plan?.descriptors ?? []).map((d) => [d.arrayStride, d.attributes]));
       let entry = perShader.get(layoutKey);
@@ -982,9 +993,12 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
       if (!program) program = this._translateProgram(vsCode, psCode);
       const vsModule = this.device.createShaderModule({ code: program.vertex.wgsl, label: 'xenos-translated-vs' });
+      // xenia's kDepth mode runs no guest pixel shader at all (the depth comes
+      // from the rasterizer): the pipeline gets a stage that writes nothing,
+      // and the color target carries a zero write mask.
       const fsModule = this.device.createShaderModule({
-        code: program.fragment ? program.fragment.wgsl : FLAT_FRAGMENT_WGSL,
-        label: program.fragment ? 'xenos-translated-ps' : 'xenos-bringup-fs',
+        code: depthOnly ? DEPTH_ONLY_FRAGMENT_WGSL : (program.fragment ? program.fragment.wgsl : FLAT_FRAGMENT_WGSL),
+        label: depthOnly ? 'xenos-depth-only-fs' : (program.fragment ? 'xenos-translated-ps' : 'xenos-bringup-fs'),
       });
       const vertexBuffers = (plan?.descriptors ?? []).map((d) => ({
         arrayStride: d.arrayStride,
@@ -995,7 +1009,11 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         label: program.fragment ? 'xenos-translated-vs-ps' : 'xenos-translated-vs',
         layout: 'auto',
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
-        fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState, colorExportKey(program) === '1')] },
+        fragment: {
+          module: fsModule,
+          entryPoint: 'fs_main',
+          targets: [this._colorTargetDesc(rtState, depthOnly ? false : colorExportKey(program) === '1')],
+        },
         depthStencil: this._depthStencilDesc(rtState),
         multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology, cullMode: rtState.raster.cullMode, frontFace: rtState.raster.frontFace },
@@ -1235,7 +1253,8 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
             'refusing to fabricate geometry. Pass { placeholderShader: true } to attach() to render the bring-up triangle instead.');
         }
         // A pixel shader, when loaded, IS translated and run — no guessed fragment stage anywhere.
-        const psCode = this.shaders.pixel?.code ?? null;
+        // xenia's kDepth mode (RB_MODECONTROL.edram_mode) runs no pixel shader.
+        const psCode = params.depthOnly ? null : (this.shaders.pixel?.code ?? null);
         const topology = topologyForPrimType(params.primType ?? 0x04, params.primTypeName);
         const alphaTest = globalThis.XenonGpuRenderState?.decodeAlphaTest(params.renderTargets?.colorControl ?? 0) ?? null;
         // format nibble of RB_COLOR_INFO at bits 16-19 (1 = k_8_8_8_8_GAMMA);
@@ -1278,7 +1297,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         const rtState = this._resolveRenderTargets(params, program);
         if (!rtState) return;
         const scissor = this._resolveScissor(params);
-        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
+        const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState, !!params.depthOnly);
         const pass = this._openFrame(rtState);
         this._frameDrawState(pass, rtState, scissor);
         pass.setPipeline(pipeline);
@@ -1431,7 +1450,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   }
 
   // Internals exposed for unit tests only — unstable shapes, not public API.
-  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRESENT_BLIT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
+  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, DEPTH_ONLY_FRAGMENT_WGSL, PRESENT_BLIT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
 
   const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL, _internal };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
