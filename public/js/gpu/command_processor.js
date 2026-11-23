@@ -162,8 +162,11 @@
         if (offset + parsed.count > stop) throw new XenosGpuError(`${parsed.opcodeName} at word ${offset - 1}: truncated (${parsed.count} dwords needed, ${stop - offset} available)`);
         const payloadStart = offset;
         if (parsed.predicate) {
+          // xenia: a predicated type-3 packet is skipped when the bin
+          // predicate fails — and a predicated swap is skipped unconditionally
+          // ("we also skip predicated swaps, as they are never valid").
           const anyPass = (this.binSelect & this.binMask) !== 0n;
-          if (!anyPass && parsed.opcode !== pm4().PM4_OPCODE.PM4_XE_SWAP) {
+          if (!anyPass || parsed.opcode === pm4().PM4_OPCODE.PM4_XE_SWAP) {
             offset += parsed.count; // skipped by the bin predicate
             continue;
           }
@@ -196,6 +199,18 @@
       const opcode = parsed.opcode;
       const count = parsed.count;
       switch (opcode) {
+        case op.PM4_CONTEXT_UPDATE: {
+          // xenia: PM4_CONTEXT_UPDATE asserts a single dword payload of 0 and
+          // continues (it is a no-op); anything else asserts in xenia too.
+          if (count !== 1) throw new XenosGpuError('PM4_CONTEXT_UPDATE: expected 1 payload dword');
+          const value = u32s[start] >>> 0;
+          if (value !== 0) {
+            throw new XenosGpuError(
+              `PM4_CONTEXT_UPDATE: value 0x${value.toString(16).toUpperCase()} is not 0 — xenia asserts on any ` +
+              'other context-update value. Refusing to continue');
+          }
+          return end;
+        }
         case op.PM4_NOP:
           return end;
 

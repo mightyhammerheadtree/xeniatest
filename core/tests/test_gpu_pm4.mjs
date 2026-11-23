@@ -259,6 +259,27 @@ test('predicated packets are skipped while the bin predicate fails and execute w
   assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 1, 'predicated draw executed');
 });
 
+test('a predicated swap is skipped even when the bin predicate passes (xenia: predicated swaps are never valid)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  // mask = 1, select = 1 → the predicate passes
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_MASK, 2), 0x00000000, 0x00000001]));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_SELECT, 2), 0x00000000, 0x00000001]));
+  const swapsBefore = backend.calls.filter((c) => c.kind === 'swap').length;
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_XE_SWAP, 1, /* predicate */ true), 0x00000000]));
+  assert.equal(backend.calls.filter((c) => c.kind === 'swap').length, swapsBefore, 'the predicated swap was skipped');
+});
+
+test('PM4_CONTEXT_UPDATE with a 0 payload is a no-op (xenia); a non-zero payload traps', () => {
+  const guest = makeGuest();
+  const cp = makeCP(guest, makeBackend(guest));
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_CONTEXT_UPDATE, 1), 0x00000000]));
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_CONTEXT_UPDATE, 1), 0x00000001])),
+    /CONTEXT_UPDATE/);
+});
+
 test('IM_LOAD_IMMEDIATE loads a shader and reports it to the backend', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);
