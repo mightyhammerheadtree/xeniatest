@@ -796,15 +796,32 @@ test('traps: kD24FS8 float depth with stencil is refused (WebGPU has no float de
     /kD24FS8/);
 });
 
-test('traps: back-face stencil reference differing from the front face is refused (WebGPU has one reference)', () => {
+test('the pipeline honors the guest z-clipping (xenia depth_clip = !PA_CL_CLIP_CNTL.clip_disable)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
-  const { backend } = makeBackend(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets() }));
+  assert.equal(log.pipelines.at(-1).desc.depthStencil.depthClipEnabled, true);
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ paClClipCntl: 1 << 16 }) }));
+  assert.equal(log.pipelines.at(-1).desc.depthStencil.depthClipEnabled, false);
+});
+
+test('the stencil reference follows xenia (the front pair, or the BF pair when the front faces are culled)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   const dc = 0x1 | 0x80; // stencil on + backface_enable
-  assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }) })),
-    /STENCILREFMASK_BF/);
+  // Both faces drawn → the front pair (RB_STENCILREFMASK), like xenia's hosts.
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }) }));
+  assert.equal(log.stencilRef, 0x01);
+  // Front faces culled (only back faces are rasterized) → the BF pair.
+  log.stencilRef = undefined;
+  backend.draw(drawParams({
+    renderTargets: defaultRenderTargets({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02, paSuScModeCntl: 0x1 }),
+  }));
+  assert.equal(log.stencilRef, 0x02);
 });
 
 test('traps: a draw without the render-target snapshot refuses (the CP always attaches it)', () => {

@@ -242,18 +242,36 @@ test('stencil enable maps func/fail/zpass/zfail for both faces (BF off → same 
   assert.equal(s.stencilRef, 0x7F);
 });
 
-test('back-face stencil uses the BF fields when backface_enable is set', () => {
+test('back-face stencil uses the BF fields when backface_enable is set (xenia: only for two-faced primitives)', () => {
   const dc = 0x1 | 0x80 /* backface_enable */
     | (1 << 8) | (2 << 11) | (3 << 14) | (4 << 17)      // front: less/replace/incr-clamp/decr-clamp
     | (7 << 20) | (6 << 23) | (5 << 26) | (7 << 29);    // back: always/increment-wrap/invert/decrement-wrap
-  const s = rtState({ depthControl: dc, stencilRefMask: 0x11, stencilRefMaskBf: 0x11 });
+  const s = rtState({ depthControl: dc, stencilRefMask: 0x11, stencilRefMaskBf: 0x11 }, { primitivePolygonal: true });
   assert.deepEqual(s.depthStencil.stencilFront, { compare: 'less', failOp: 'replace', depthFailOp: 'decrement-clamp', passOp: 'increment-clamp' });
   assert.deepEqual(s.depthStencil.stencilBack, { compare: 'always', failOp: 'increment-wrap', depthFailOp: 'decrement-wrap', passOp: 'invert' });
+  // xenia: the back-face stencil ops apply only to two-faced primitives
+  // (IsPrimitiveTwoFaced) — points/lines use the front-face ops for both faces.
+  const lines = rtState({ depthControl: dc, stencilRefMask: 0x11, stencilRefMaskBf: 0x11 }, { primitivePolygonal: false });
+  assert.deepEqual(lines.depthStencil.stencilBack, s.depthStencil.stencilFront);
 });
 
-test('back-face stencil reference may not differ from the front one (WebGPU has one reference per pass)', () => {
-  const dc = 0x1 | 0x80;
-  assert.throws(() => rtState({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }), /RB_STENCILREFMASK_BF/);
+test('the stencil reference/mask pair follows xenia (front pair, or the BF pair when the front faces are culled)', () => {
+  const dc = 0x1 | 0x80; // stencil_enable | backface_enable
+  // Both faces drawn → the front pair (RB_STENCILREFMASK), like xenia's hosts.
+  const s = rtState({ depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02 }, { primitivePolygonal: true });
+  assert.equal(s.stencilRef, 0x01);
+  assert.equal(s.depthStencil.stencilReadMask, 0x00);
+  assert.equal(s.depthStencil.stencilWriteMask, 0x00);
+  // Front faces culled (only back faces are rasterized) → the BF pair.
+  const bf = rtState(
+    { depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02, paSuScModeCntl: 0x1 },
+    { primitivePolygonal: true });
+  assert.equal(bf.stencilRef, 0x02);
+  // ... and the back faces are not culled → the front pair again.
+  const backCulled = rtState(
+    { depthControl: dc, stencilRefMask: 0x01, stencilRefMaskBf: 0x02, paSuScModeCntl: 0x2 },
+    { primitivePolygonal: true });
+  assert.equal(backCulled.stencilRef, 0x01);
 });
 
 test('equal BF reference is fine', () => {
@@ -283,6 +301,13 @@ test('kD24S8 depth maps to WebGPU depth24plus-stencil8', () => {
   const st = rtState({ depthInfo: 0, depthControl: 0x2 | 0x4 | 0x10 });
   assert.equal(st.depthStencil.format, 'depth24plus-stencil8');
   assert.equal(st.depthFormatName, 'kD24S8');
+});
+
+test('z clipping follows xenia (depth_clip = !PA_CL_CLIP_CNTL.clip_disable)', () => {
+  // PA_CL_CLIP_CNTL.clip_disable is bit 16 (xenia registers.h).
+  assert.equal(rtState({}).depthStencil.depthClipEnabled, true);
+  assert.equal(rtState({ paClClipCntl: 0 }).depthStencil.depthClipEnabled, true);
+  assert.equal(rtState({ paClClipCntl: 1 << 16 }).depthStencil.depthClipEnabled, false);
 });
 
 test('alpha test decodes (applied by the translated PS, not pipeline state)', () => {
@@ -424,13 +449,21 @@ test('decodeColorInfo decodes color_exp_bias as a SIGNED 6-bit field (xenia int3
 });
 
 // ------------------------------------------- back-face stencil masks / alpha-to-coverage
-test('BF stencil read/write mask mismatch traps naming both masks (WebGPU shares one pair)', () => {
-  const front = 0x4255007F; // ref 0x7F, stencilmask 0x55, writemask 0x42
-  assert.throws(() => rtState({ stencilRefMask: front, stencilRefMaskBf: (0x66 << 8) | 0x7F, depthControl: 0x1 | 0x80 }), /stencil read\/write mask differs/);
-  assert.throws(() => rtState({ stencilRefMask: front, stencilRefMaskBf: (0x42 << 16) | 0x7F & ((0x77 << 8) | 0) | 0, depthControl: 0x1 | 0x80 }), /stencil read\/write mask differs|front/);
+test('the stencil read/write mask pair follows xenia (the front pair, or the BF pair when the front faces are culled)', () => {
+  const front = 0x4255007F; // ref 0x7F, stencilmask 0x00, writemask 0x55
+  const bf = (0x66 << 8) | 0x7F; // ref 0x7F, stencilmask 0x66, writemask 0x00
+  // Both faces drawn → the front pair (like xenia's hosts).
+  const s = rtState({ stencilRefMask: front, stencilRefMaskBf: bf, depthControl: 0x1 | 0x80 }, { primitivePolygonal: true });
+  assert.equal(s.depthStencil.stencilReadMask, 0x00);
+  assert.equal(s.depthStencil.stencilWriteMask, 0x55);
+  // Front faces culled → the BF pair.
+  const culled = rtState(
+    { stencilRefMask: front, stencilRefMaskBf: bf, depthControl: 0x1 | 0x80, paSuScModeCntl: 0x1 },
+    { primitivePolygonal: true });
+  assert.equal(culled.depthStencil.stencilReadMask, 0x66);
   // matching ref and masks — renders
   assert.doesNotThrow(() => rtState({ stencilRefMask: front, stencilRefMaskBf: front, depthControl: 0x1 | 0x80 }));
-  // mismatch only matters with stencil + backface enabled
+  // a mismatch only matters with stencil + backface enabled
   assert.doesNotThrow(() => rtState({ stencilRefMask: front, stencilRefMaskBf: 0x007F, depthControl: 0x2 }));
 });
 
@@ -441,7 +474,10 @@ const bits = (x) => new Uint32Array(new Float32Array([x]).buffer)[0];
 
 test('rasterizer state defaults (registers zeroed): no culling, CCW front faces, no depth bias, no drop', () => {
   const s = rtState({});
-  assert.deepEqual(s.raster, { cullMode: 'none', frontFace: 'ccw', depthBias: 0, depthBiasSlopeScale: 0, depthBiasClamp: 0, bothCull: false });
+  assert.deepEqual(s.raster, {
+    cullMode: 'none', frontFace: 'ccw', depthBias: 0, depthBiasSlopeScale: 0, depthBiasClamp: 0,
+    bothCull: false, cullFront: false, cullBack: false,
+  });
 });
 
 test('rasterizer state: face bit (bit 2) selects CW front faces', () => {

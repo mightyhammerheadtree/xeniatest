@@ -349,7 +349,13 @@
     const depthBias = offset < 0 ? -bias : bias;
     const depthBiasSlopeScale = scale * K_POLY_OFFSET_SCALE_SUBPIXEL_UNIT;
 
-    return { cullMode, frontFace, depthBias, depthBiasSlopeScale, depthBiasClamp: 0, bothCull };
+    return {
+      cullMode, frontFace, depthBias, depthBiasSlopeScale, depthBiasClamp: 0, bothCull,
+      // xenia gates the culling (and therefore the back-face stencil state) on
+      // the primitive being two-faced; points/lines are never culled.
+      cullFront: primitivePolygonal ? cullFront : false,
+      cullBack: primitivePolygonal ? cullBack : false,
+    };
   }
 
   const PA_CL_CLIP_CNTL = 0x2204, PA_CL_VTE_CNTL = 0x2206, PA_SU_VTX_CNTL = 0x2302;
@@ -456,6 +462,7 @@
     h = fpMix(h, raw.paSuScModeCntl);
     h = fpMix(h, raw.paSuPolyOffsetFrontScale); h = fpMix(h, raw.paSuPolyOffsetFrontOffset);
     h = fpMix(h, raw.paSuPolyOffsetBackScale); h = fpMix(h, raw.paSuPolyOffsetBackOffset);
+    h = fpMix(h, raw.paClClipCntl === undefined ? -1 : raw.paClClipCntl);
     return h >>> 0;
   }
   // Exact field-by-field verification against the stored snapshot of normalized values.
@@ -474,7 +481,8 @@
       && a.paSuPolyOffsetFrontScale === (b.paSuPolyOffsetFrontScale >>> 0)
       && a.paSuPolyOffsetFrontOffset === (b.paSuPolyOffsetFrontOffset >>> 0)
       && a.paSuPolyOffsetBackScale === (b.paSuPolyOffsetBackScale >>> 0)
-      && a.paSuPolyOffsetBackOffset === (b.paSuPolyOffsetBackOffset >>> 0);
+      && a.paSuPolyOffsetBackOffset === (b.paSuPolyOffsetBackOffset >>> 0)
+      && a.paClClipCntl === (b.paClClipCntl === undefined ? -1 : b.paClClipCntl >>> 0);
   }
   /**
    * Build the WebGPU render-target state for one draw.
@@ -541,6 +549,7 @@
       raw.paSuScModeCntl >>> 0,
       raw.paSuPolyOffsetFrontScale >>> 0, raw.paSuPolyOffsetFrontOffset >>> 0,
       raw.paSuPolyOffsetBackScale >>> 0, raw.paSuPolyOffsetBackOffset >>> 0,
+      raw.paClClipCntl === undefined ? -1 : (raw.paClClipCntl >>> 0),
     ].join(',');
     const cached = rtDecodeCache.get(cacheKey);
     if (cached) return cached;
@@ -617,28 +626,15 @@
     }
 
     // --- stencil reference + masks (one pair per pass in WebGPU) -------------
+    // The guest has a separate reference/mask pair per face (RB_STENCILREFMASK
+    // and RB_STENCILREFMASK_BF); WebGPU (like D3D12 and Vulkan) has one per
+    // render pass. xenia's D3D12 host picks the pair that applies to the faces
+    // actually drawn: the back-face pair when the back-face stencil is enabled
+    // and the front faces are culled, the front pair otherwise.
     const stencilRefMask = raw.stencilRefMask >>> 0;
     const stencilRefMaskBf = raw.stencilRefMaskBf >>> 0;
-    const ref = stencilRefMask & 0xFF;
-    const refBf = stencilRefMaskBf & 0xFF;
-    if (stencilEnable && backfaceEnable) {
-      if (refBf !== ref) {
-        throw new XenosRenderStateError(
-          `stencil reference differs between front (0x${ref.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
-          `(0x${refBf.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — WebGPU has one stencil reference per render pass, ` +
-          'so the back faces would test against the wrong value. Refusing to draw');
-      }
-      const readMaskF = (stencilRefMask >>> 8) & 0xFF, readMaskB = (stencilRefMaskBf >>> 8) & 0xFF;
-      const writeMaskF = (stencilRefMask >>> 16) & 0xFF, writeMaskB = (stencilRefMaskBf >>> 16) & 0xFF;
-      if (readMaskB !== readMaskF || writeMaskB !== writeMaskF) {
-        throw new XenosRenderStateError(
-          `stencil read/write mask differs between front (stencilmask 0x${readMaskF.toString(16).padStart(2, '0')}, ` +
-          `writemask 0x${writeMaskF.toString(16).padStart(2, '0')}, RB_STENCILREFMASK) and back faces ` +
-          `(stencilmask 0x${readMaskB.toString(16).padStart(2, '0')}, writemask 0x${writeMaskB.toString(16).padStart(2, '0')}, RB_STENCILREFMASK_BF) — ` +
-          'WebGPU has one stencil read/write mask pair per render pass. Refusing to draw');
-      }
-    }
-
+    // The stencil reference for the pass (WebGPU has one per render pass).
+    let stencilRef = stencilRefMask & 0xFF;
     // --- write mask ---------------------------------------------------------
     const colorMask = raw.colorMask >>> 0;
     // The guest's mask, restricted to the channels the format actually has
@@ -666,6 +662,10 @@
     ];
 
     // --- rasterizer state (cull/winding/depth bias) --------------------------
+    // xenia gates the culling (and therefore the back-face stencil state) on
+    // the primitive being two-faced: IsPrimitiveTwoFaced covers the triangle
+    // list/fan/strip/W-flags, quad list/strip and polygon types.
+    const primitiveTwoFaced = primitivePolygonal;
     const raster = decodeRasterState(raw, { primitivePolygonal, isFloat24Depth: depthInfo.format === 1 });
 
     // --- depth/stencil state ------------------------------------------------
@@ -674,6 +674,9 @@
       format: floatDepth ? 'depth32float' : 'depth24plus-stencil8',
       depthWriteEnabled: zEnable && zWriteEnable,
       depthCompare: zEnable ? cmp(depthControl >>> 4) : 'always',
+      // xenia: depth_clip = !PA_CL_CLIP_CNTL.clip_disable (bit 16) — the guest
+      // can disable z clipping; WebGPU's depthClipEnabled does the same.
+      depthClipEnabled: !(((raw.paClClipCntl ?? 0) >>> 16) & 0x1),
     };
     if (stencilEnable) {
       const front = {
@@ -682,7 +685,11 @@
         depthFailOp: sOp(depthControl >>> 17),
         passOp: sOp(depthControl >>> 14),
       };
-      const back = backfaceEnable ? {
+      // xenia: the back-face stencil ops apply only when the primitive is
+      // two-faced and the guest enabled the back-face stencil; otherwise both
+      // faces use the front-face ops.
+      const stencilBackfaceEnable = primitiveTwoFaced && backfaceEnable;
+      const back = stencilBackfaceEnable ? {
         compare: cmp(depthControl >>> 20),
         failOp: sOp(depthControl >>> 23),
         depthFailOp: sOp(depthControl >>> 29),
@@ -690,8 +697,14 @@
       } : { ...front };
       depthStencil.stencilFront = front;
       depthStencil.stencilBack = back;
-      depthStencil.stencilReadMask = (stencilRefMask >>> 8) & 0xFF;
-      depthStencil.stencilWriteMask = (stencilRefMask >>> 16) & 0xFF;
+      // xenia's D3D12 host: the back-face reference/mask pair is used when the
+      // back-face stencil is enabled and the front faces are culled (only back
+      // faces are rasterized then); otherwise the front-face pair is used.
+      const useBackfacePair = stencilBackfaceEnable && raster.cullFront;
+      const stencilPair = useBackfacePair ? stencilRefMaskBf : stencilRefMask;
+      stencilRef = stencilPair & 0xFF;
+      depthStencil.stencilReadMask = (stencilPair >>> 8) & 0xFF;
+      depthStencil.stencilWriteMask = (stencilPair >>> 16) & 0xFF;
     }
 
     // Cache key: raw values fully determine the decode. RB_SURFACE_INFO is
@@ -706,6 +719,9 @@
       raw.paSuScModeCntl >>> 0,
       raw.paSuPolyOffsetFrontScale >>> 0, raw.paSuPolyOffsetFrontOffset >>> 0,
       raw.paSuPolyOffsetBackScale >>> 0, raw.paSuPolyOffsetBackOffset >>> 0,
+      // PA_CL_CLIP_CNTL carries clip_disable (bit 16) → the pipeline's
+      // depthClipEnabled.
+      raw.paClClipCntl === undefined ? -1 : (raw.paClClipCntl >>> 0),
       primitivePolygonal ? 1 : 0,
     ].join(',');
 
@@ -715,7 +731,7 @@
       blend,
       blendConstant,
       depthStencil,
-      stencilRef: ref,
+      stencilRef,
       alphaTest,
       raster,
       surfacePitch: surfaceInfo & 0x3FFF,
@@ -741,6 +757,7 @@
       paSuScModeCntl: raw.paSuScModeCntl >>> 0,
       paSuPolyOffsetFrontScale: raw.paSuPolyOffsetFrontScale >>> 0, paSuPolyOffsetFrontOffset: raw.paSuPolyOffsetFrontOffset >>> 0,
       paSuPolyOffsetBackScale: raw.paSuPolyOffsetBackScale >>> 0, paSuPolyOffsetBackOffset: raw.paSuPolyOffsetBackOffset >>> 0,
+      paClClipCntl: raw.paClClipCntl === undefined ? -1 : raw.paClClipCntl >>> 0,
     };
     const bucket2 = rtFpCache.get(fp);
     if (bucket2) bucket2.push({ raw: snap, flags, state });
