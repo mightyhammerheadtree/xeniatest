@@ -936,10 +936,11 @@ test('batched frame: a trap mid-frame drops the pending frame unsubmitted — no
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   backend.draw(drawParams());
   assert.equal(log.submits, 0, 'pending');
-  // a 4x-MSAA render target refuses to draw — the trap drops the WHOLE pending frame
+  // a color format WebGPU only has behind an optional feature refuses to draw —
+  // the trap drops the WHOLE pending frame
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
-    /4x MSAA/);
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 5 << 16 }) })),
+    /k_16_16_16_16/);
   assert.equal(log.submits, 0, 'no partial frame is submitted after a trap');
   backend.swap(); // nothing pending — swap has nothing to flush
   assert.equal(log.submits, 0);
@@ -963,14 +964,69 @@ test('resize() forces a defined-target frame (resize of the canvas = new frame)'
   assert.equal(log.passes[1].colorAttachments[0].loadOp, 'clear');
 });
 
-test('traps: a 4x-MSAA guest render target refuses to draw (single-sampled canvas)', () => {
+test('a 4x-MSAA guest render target renders into a multisampled attachment and resolves', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  // the pipeline declares the sample count
+  assert.equal(log.pipelines[0].desc.multisample.count, 4);
+  // the frame renders into a 4x multisampled texture of the canvas format
+  const msaa = log.textures.find((t) => t.desc.sampleCount === 4);
+  assert.ok(msaa, 'the multisampled color attachment exists');
+  assert.equal(msaa.desc.format, 'bgra8unorm');
+  // ... and the pass resolves it into the single-sample target
+  const pass = log.passes[0];
+  assert.ok(pass.colorAttachments[0].resolveTarget, 'the pass has a resolve target');
+  assert.equal(pass.colorAttachments[0].storeOp, 'discard', 'the multisample content is not kept');
+  // the depth attachment follows the sample count (it is recreated for it)
+  const depth = log.textures.filter((t) => t.desc.label === 'xenos-depth').at(-1);
+  assert.equal(depth.desc.sampleCount, 4);
+  // ... and the pass uses the NEW depth view (the old one was destroyed)
+  const depthViews = log.passes[0].depthStencilAttachment;
+  assert.ok(depthViews, 'the pass has a depth attachment');
+});
+
+test('the bring-up placeholder pipelines carry the sample count too', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest, { placeholderShader: true });
+  // no vertex shader → the full-canvas placeholder path
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  assert.equal(log.pipelines.at(-1).desc.multisample.count, 4);
+});
+
+test('a 2x-MSAA guest render target traps (WebGPU only has a sample count of 1 or 4)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) })),
-    /4x MSAA/);
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 1 << 16 }) })),
+    /2x MSAA/);
+});
+
+test('the MSAA sample count is part of the pipeline key (a 1x pipeline is never reused for 4x)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 0 << 16 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  const counts = log.pipelines.map((p) => p.desc.multisample.count);
+  assert.deepEqual(counts, [1, 4], 'two pipelines, one per sample count');
+});
+
+test('the guest switching the sample count mid-frame ends the pass (attachments must match)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 0 << 16 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ surfaceInfo: 2 << 16 }) }));
+  assert.equal(log.passes.length, 2);
+  assert.ok(log.textures.find((t) => t.desc.sampleCount === 4));
 });
 
 test('color_exp_bias: the translated PS scales oC0 by 2^bias (all lanes) and the draw runs', () => {

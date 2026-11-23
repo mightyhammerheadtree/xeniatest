@@ -24,6 +24,7 @@ const { XenosCommandProcessor } = globalThis.XenonGpuCommandProcessor;
 const { XenosWebGpuBackend } = globalThis.XenonWebGpuBackend;
 
 globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
+globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
 
 // ------------------------------------------------------------ microcode fixture
 function execCf(address, count, sequence, opcode = 2) {

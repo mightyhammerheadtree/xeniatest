@@ -50,6 +50,7 @@ function makeGuest(bytes = 96 * 1024 * 1024) {
 
 // ---- bench 2: repeated fetch-draw of static geometry — GPU op counts + ms ----
 globalThis.GPUBufferUsage = { VERTEX: 0x20, INDEX: 0x10, COPY_DST: 0x08 };
+globalThis.GPUTextureUsage = { COPY_SRC: 0x01, COPY_DST: 0x02, TEXTURE_BINDING: 0x04, STORAGE_BINDING: 0x08, RENDER_ATTACHMENT: 0x10 };
 {
   const guest = makeGuest();
   const VB_BASE = 0x00100000, IB_BASE = 0x00200000;

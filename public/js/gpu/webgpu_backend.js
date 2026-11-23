@@ -317,7 +317,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
       this.boolHash = -1;
       this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0, presents: 0 };
-      this._offscreenColor = null; // { key, texture, format } — the guest's RT texture (non-canvas formats)
+      this._colorTargets = new Map(); // `${format}:${samples}:${w}x${h}` -> { texture, format, sampleCount }
       this._presentPending = false; // an offscreen frame is waiting to be blitted to the canvas
       this._presentPipeline = new Map(); // source format -> { pipeline, bindGroup } for the present blit
       this.implicitIndexCache = new Map();
@@ -374,25 +374,56 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       if (this.depthTexture) this.depthTexture.destroy();
       this._frameClearColor = false;
       this._frameClearDepth = false;
+      this.depthSampleCount = 1;
       this.depthTexture = this.device.createTexture({
         size: [width, height, 1],
         format: this.depthFormat,
+        sampleCount: 1,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
         label: 'xenos-depth',
       });
       this.depthView = typeof this.depthTexture.createView === 'function' ? this.depthTexture.createView() : null;
     }
 
+    /**
+     * The depth attachment must have the frame's sample count (a WebGPU
+     * render pass requires the depth attachment's sample count to match the
+     * color attachment's), so the depth texture is recreated when the guest
+     * switches between 1x and multisampled rendering.
+     */
+    _ensureDepthTexture(sampleCount) {
+      if (this.depthTexture && this.depthSampleCount === sampleCount) return;
+      if (!this.device || !this.canvas) return;
+      const width = Math.max(1, this.canvas.width | 0);
+      const height = Math.max(1, this.canvas.height | 0);
+      if (this.depthTexture) this.depthTexture.destroy();
+      this.depthSampleCount = sampleCount;
+      this._frameClearDepth = false; // the new attachment starts undefined
+      this.depthTexture = this.device.createTexture({
+        size: [width, height, 1],
+        format: this.depthFormat,
+        sampleCount,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        label: 'xenos-depth',
+      });
+      this.depthView = typeof this.depthTexture.createView === 'function' ? this.depthTexture.createView() : null;
+    }
+
+    /** Release every color target texture (resize / destroy). */
+    _destroyColorTargets() {
+      for (const entry of this._colorTargets.values()) entry.texture.destroy();
+      this._colorTargets.clear();
+      this._presentPipeline.clear();
+      this._presentPending = false;
+      this._presentKey = null;
+    }
+
     /** Resize depth attachment to the canvas size (call before drawing after a resize). */
     resize() {
       this._flushFrame();
-      // The offscreen target is sized like the canvas (the guest's RT extent
-      // is assumed to be the canvas extent) — drop it so it is recreated.
-      if (this._offscreenColor) {
-        this._offscreenColor.texture.destroy();
-        this._offscreenColor = null;
-        this._presentPipeline.clear();
-      }
+      // The color targets are sized like the canvas (the guest's RT extent is
+      // assumed to be the canvas extent) — drop them so they are recreated.
+      this._destroyColorTargets();
       this._recreateDepth();
     }
 
@@ -760,13 +791,16 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
     _flushFrame() {
       if (!this._frame) return;
-      const { encoder, pass, offscreen } = this._frame;
+      const { encoder, pass, offscreen, presentKey } = this._frame;
       this._frame = null; // release before submit so a re-entrant draw starts a fresh frame
       pass.end();
       this.device.queue.submit([encoder.finish()]);
       // A frame that rendered into the offscreen target has not reached the
       // canvas yet — swap() presents it.
-      if (offscreen) this._presentPending = true;
+      if (offscreen) {
+        this._presentPending = true;
+        this._presentKey = presentKey;
+      }
     }
 
     /**
@@ -780,40 +814,57 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
      *     by a blit at swap() (_presentOffscreen).
      */
     _colorAttachment(rtState) {
-      const format = rtState?.colorFormat ?? null;
-      if (!format) {
-        return { view: this.context.getCurrentTexture().createView(), format: this.format, offscreen: false };
+      const format = rtState?.colorFormat ?? null;   // null = the canvas format
+      const samples = rtState?.sampleCount ?? 1;
+      // The single-sample target: the canvas texture, or an offscreen texture
+      // with the guest's format (the canvas cannot carry it).
+      let single = null;
+      if (format) {
+        single = this._colorTargetTexture(format, 1);
+      } else {
+        single = { texture: this.context.getCurrentTexture(), format: this.format, sampleCount: 1, key: null };
       }
-      const texture = this._offscreenColorTexture(format);
-      return { view: texture.createView(), format, offscreen: true };
+      if (samples === 1) {
+        return { view: single.texture.createView(), format: single.format, sampleCount: 1, offscreen: format !== null, resolveTarget: null, sourceKey: single.key ?? null };
+      }
+      // Multisampled: the frame renders into a multisampled attachment of the
+      // same format, and WebGPU's resolve (a box filter over the samples)
+      // writes the single-sample target — the same box filter xenia's EDRAM
+      // resolve applies for "all samples".
+      const msaa = this._colorTargetTexture(single.format, samples);
+      return {
+        view: msaa.texture.createView(),
+        format: single.format,
+        sampleCount: samples,
+        offscreen: format !== null,
+        resolveTarget: single.texture.createView(),
+        sourceKey: single.key ?? null,
+      };
     }
 
     /**
-     * The offscreen color target for a guest render-target format that the
-     * canvas cannot carry. Recreated when the format or the canvas size
-     * changes (the guest's RT extent is assumed to be the canvas extent, like
-     * the viewport decode assumes).
+     * A color target texture: the guest's render-target format (offscreen) or
+     * the canvas format, single- or multisampled. Keyed by format, sample
+     * count and size (the guest's RT extent is assumed to be the canvas
+     * extent, like the viewport decode assumes).
      */
-    _offscreenColorTexture(format) {
+    _colorTargetTexture(format, sampleCount) {
       const width = Math.max(1, (this.canvas?.width ?? 1) | 0);
       const height = Math.max(1, (this.canvas?.height ?? 1) | 0);
-      const key = `${format}:${width}x${height}`;
-      if (this._offscreenColor && this._offscreenColor.key === key) return this._offscreenColor.texture;
-      if (this._offscreenColor) {
-        this._offscreenColor.texture.destroy();
-        this._offscreenColor = null;
-        // the cached blit bind group referenced the destroyed texture
-        this._presentPipeline.clear();
-      }
+      const key = `${format}:${sampleCount}:${width}x${height}`;
+      const existing = this._colorTargets.get(key);
+      if (existing) return existing;
       if (typeof GPUTextureUsage === 'undefined') throw new XenosWebGpuError('GPUTextureUsage is not defined in this environment');
       const texture = this.device.createTexture({
-        label: `xenos-rt-${format}`,
+        label: sampleCount > 1 ? `xenos-msaa-${format}` : `xenos-rt-${format}`,
         size: [width, height, 1],
         format,
-        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+        sampleCount,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | (sampleCount > 1 ? 0 : GPUTextureUsage.TEXTURE_BINDING),
       });
-      this._offscreenColor = { key, texture, format };
-      return texture;
+      const entry = { texture, format, sampleCount, key };
+      this._colorTargets.set(key, entry);
+      return entry;
     }
 
     /** Open (or reuse) the batched frame's pass. Returns the pass — never ends it per draw. */
@@ -824,7 +875,9 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       // old frame's canvas update is dropped (its offscreen content is
       // superseded by the new frame — a guest that changes the render-target
       // format mid-frame is not a shape this port reproduces faithfully).
-      if (this._frame && this._frame.colorFormat !== ((rtState?.colorFormat) ?? this.format)) {
+      const wantFormat = (rtState?.colorFormat) ?? this.format;
+      const wantSamples = rtState?.sampleCount ?? 1;
+      if (this._frame && (this._frame.colorFormat !== wantFormat || this._frame.sampleCount !== wantSamples)) {
         this._flushFrame();
         this._presentPending = false;
         this._frameClearColor = false;
@@ -833,17 +886,26 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       if (!this._frame) {
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const attachment = this._colorAttachment(rtState);
-        const pass = this._beginFramePass(encoder, attachment.view);
-        this._frame = { encoder, pass, colorView: attachment.view, draws: 0, colorFormat: attachment.format, offscreen: attachment.offscreen };
+        this._ensureDepthTexture(attachment.sampleCount);
+        const pass = this._beginFramePass(encoder, attachment);
+        this._frame = {
+          encoder, pass, colorView: attachment.view, draws: 0,
+          colorFormat: attachment.format, sampleCount: attachment.sampleCount, offscreen: attachment.offscreen,
+          presentKey: attachment.sourceKey,
+        };
       }
       return this._frame.pass;
     }
 
     /** The frame pass descriptor: defined image on the first pass of a frame, load after. */
-    _beginFramePass(encoder, colorView) {
+    _beginFramePass(encoder, attachment) {
+      const colorView = attachment.view;
+      // With MSAA the frame renders into the multisampled attachment and the
+      // resolve writes the single-sample target — the multisample content
+      // itself is not needed afterwards.
       const colorAttachment = this._frameClearColor
-        ? { view: colorView, loadOp: 'load', storeOp: 'store' }
-        : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' };
+        ? { view: colorView, loadOp: 'load', storeOp: attachment.resolveTarget ? 'discard' : 'store', resolveTarget: attachment.resolveTarget ?? undefined }
+        : { view: colorView, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: attachment.resolveTarget ? 'discard' : 'store', resolveTarget: attachment.resolveTarget ?? undefined };
       this._frameClearColor = true;
       const desc = { colorAttachments: [colorAttachment] };
       if (this.depthView) {
@@ -933,6 +995,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         vertex: { module: vsModule, entryPoint: 'vs_main', buffers: vertexBuffers },
         fragment: { module: fsModule, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState, colorExportKey(program) === '1')] },
         depthStencil: this._depthStencilDesc(rtState),
+        multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology, cullMode: rtState.raster.cullMode, frontFace: rtState.raster.frontFace },
       });
       let bindGroup = null;
@@ -1012,6 +1075,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         vertex: { module, entryPoint: 'vs_main', buffers: vertexBuffers },
         fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
         depthStencil: this._depthStencilDesc(rtState),
+        multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology: 'triangle-list', cullMode: rtState?.raster?.cullMode ?? 'none', frontFace: rtState?.raster?.frontFace ?? 'ccw' },
       });
       this.pipelineCache.set(key, p);
@@ -1137,6 +1201,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         vertex: { module, entryPoint: 'vs_main' },
         fragment: { module, entryPoint: 'fs_main', targets: [this._colorTargetDesc(rtState)] },
         depthStencil: this._depthStencilDesc(rtState),
+        multisample: { count: rtState?.sampleCount ?? 1 },
         primitive: { topology: 'triangle-list', cullMode: rtState?.raster?.cullMode ?? 'none', frontFace: rtState?.raster?.frontFace ?? 'ccw' },
       });
       this.pipelineCache.set(key, p);
@@ -1297,7 +1362,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     _presentOffscreen() {
       if (!this._presentPending) return;
       this._presentPending = false;
-      const source = this._offscreenColor;
+      const source = this._presentKey ? this._colorTargets.get(this._presentKey) : null;
       if (!source) return;
       const canvasTexture = this.context.getCurrentTexture();
       let entry = this._presentPipeline.get(source.format);
@@ -1350,8 +1415,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; this.depthView = null; }
       if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
       if (this.viewportBuffer) { this.viewportBuffer.destroy(); this.viewportBuffer = null; this._viewportLast = null; }
-      if (this._offscreenColor) { this._offscreenColor.texture.destroy(); this._offscreenColor = null; }
-      this._presentPipeline.clear();
+      this._destroyColorTargets();
       for (const entry of this.implicitIndexCache.values()) if (entry.buffer.destroy) entry.buffer.destroy();
       this.implicitIndexCache.clear();
       this.implicitIndexBytes = 0;

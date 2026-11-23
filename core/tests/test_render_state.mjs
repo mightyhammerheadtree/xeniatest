@@ -383,12 +383,14 @@ test('a missing snapshot traps with a named reason (no fabricated raster state)'
 });
 
 // ------------------------------------------------------------ MSAA (RB_SURFACE_INFO)
-test('RB_SURFACE_INFO msaa_samples 2x/4x trap loudly naming MSAA (canvas/depth are single-sampled)', () => {
-  for (const [samples, label] of [[1, '2x'], [2, '4x']]) {
-    assert.throws(() => rtState({ surfaceInfo: samples << 16 }), new RegExp(label + ' MSAA'));
-  }
-  // 3 (k3X, "this value is not supported on hardware" but must still not pass) — also traps
-  assert.throws(() => rtState({ surfaceInfo: 3 << 16 }), /MSAA/);
+test('RB_SURFACE_INFO msaa_samples decodes the guest sample count (xenia MsaaSamples)', () => {
+  assert.equal(rtState({ surfaceInfo: 0 << 16 }).sampleCount, 1, 'k1X');
+  assert.equal(rtState({ surfaceInfo: 2 << 16 }).sampleCount, 4, 'k4X');
+  // 2x: WebGPU's multisample count must be 1 or 4 (the spec's sample-count
+  // validation) — xenia's D3D12 host supports k2X, WebGPU cannot.
+  assert.throws(() => rtState({ surfaceInfo: 1 << 16 }), /2x MSAA/);
+  // 3 is not a guest MSAA mode (xenia's enum has only k1X/k2X/k4X) — it traps.
+  assert.throws(() => rtState({ surfaceInfo: 3 << 16 }), /msaa_samples=3/);
 });
 
 test('RB_SURFACE_INFO k1X renders (default reset state) and exposes the surface pitch', () => {

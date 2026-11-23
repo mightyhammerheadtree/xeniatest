@@ -40,8 +40,14 @@
  *     path); blending then happens on gamma-encoded values (same caveat as xenia).
  *   - kD24S8 depth maps to WebGPU depth24plus-stencil8. kD24FS8 (20e4 float
  *     depth) is not representable and traps.
- *   - RB_SURFACE_INFO.msaa_samples must be k1X — the canvas/depth attachments are
- *     single-sampled; 2x/4x guest MSAA traps (needs the EDRAM render-target cache, step 7).
+ *   - RB_SURFACE_INFO.msaa_samples selects the sample count of the frame's
+ *     attachments: k1X renders single-sampled, k4X renders into a multisampled
+ *     color and depth attachment whose resolve (a box filter over the samples)
+ *     produces the single-sample target — the same box filter xenia's EDRAM
+ *     resolve applies for "all samples". WebGPU's 4x sample positions are the
+ *     standard D3D ones (the spec mandates them), which are the positions
+ *     xenia's D3D12 host uses too. k2X TRAPS: WebGPU's sample count must be 1
+ *     or 4 (the spec's sample-count validation), and xenia's host supports 2x.
  *   - Alpha test (RB_COLORCONTROL.ALPHA_TEST): xenia implements it in the
  *     pixel shader (OpDiscard), so it is honored exactly when the translated
  *     guest PS statically exports oC0 — discard against RB_ALPHA_REF (IEEE-754
@@ -488,10 +494,13 @@
         'RB_STENCILREFMASK[_BF]/RB_BLEND_* at draw time; refusing to draw with fabricated render state');
     }
     const { psExportsColor0 = true, psExportsDepth = false, primitivePolygonal = false } = opts;
-    // --- RB_SURFACE_INFO: MSAA must be off (canvas/depth targets are single-sampled) ----
-    // msaa_samples at bits +16:2 (k1X=0, k2X=1, k4X=2) — xenia's RB_SURFACE_INFO.
-    // The scanout canvas and the depth24plus-stencil8 attachment are 1x; rendering
-    // guest-4x-MSAA state into them would silently drop sample shading/resolve, so trap.
+    // --- RB_SURFACE_INFO: the guest's MSAA sample count --------------------
+    // msaa_samples at bits +16:2 — xenia's RB_SURFACE_INFO (xenos::MsaaSamples:
+    // k1X=0, k2X=1, k4X=2; the field has no k8X, so 3 is invalid).
+    // The frame renders into a multisampled attachment of the same size as
+    // the target, and WebGPU's resolve (a box filter over the samples) writes
+    // the single-sample target — xenia's EDRAM resolve for "all samples" is a
+    // box filter over the sample planes too.
     const surfaceInfo = raw.surfaceInfo;
     if (surfaceInfo === undefined) {
       throw new XenosRenderStateError(
@@ -499,11 +508,19 @@
         'the command processor snapshots it at draw time; refusing to draw without the MSAA decision');
     }
     const msaaSamples = (surfaceInfo >>> 16) & 0x3;
-    if (msaaSamples !== 0) {
+    if (msaaSamples === 3) {
       throw new XenosRenderStateError(
-        `guest render target is configured for ${msaaSamples === 1 ? '2x' : '4x'} MSAA (RB_SURFACE_INFO.msaa_samples=${msaaSamples}) — ` +
-        'the canvas and the depth24plus-stencil8 attachment are single-sampled; MSAA needs the EDRAM render-target cache (step 7). Refusing to draw');
+        "RB_SURFACE_INFO.msaa_samples=3 — xenia's MsaaSamples has only k1X/k2X/k4X, so this is not a " +
+        'guest MSAA mode. Refusing to draw');
     }
+    if (msaaSamples === 1) {
+      // WebGPU's multisample count must be 1 or 4 (the spec's sample-count
+      // validation) — there is no 2x. xenia's D3D12 host supports k2X.
+      throw new XenosRenderStateError(
+        'guest render target is configured for 2x MSAA (RB_SURFACE_INFO.msaa_samples=1) — WebGPU only ' +
+        'supports a sample count of 1 or 4, so 2x coverage cannot be reproduced. Refusing to draw');
+    }
+    const sampleCount = msaaSamples === 0 ? 1 : 4;
     const flags = (psExportsColor0 ? 1 : 0) | ((psExportsDepth ? 1 : 0) << 1) | ((primitivePolygonal ? 1 : 0) << 2);
     const fp = fingerprintRaw(raw, flags);
     const bucket = rtFpCache.get(fp);
@@ -668,8 +685,11 @@
       depthStencil.stencilWriteMask = (stencilRefMask >>> 16) & 0xFF;
     }
 
-    // Cache key: raw values fully determine the decode.
+    // Cache key: raw values fully determine the decode. RB_SURFACE_INFO is
+    // part of it — it carries the MSAA sample count, which the pipeline
+    // descriptor depends on (the backend keys its pipeline cache on this).
     const key = [
+      raw.surfaceInfo === undefined ? -1 : (raw.surfaceInfo >>> 0),
       raw.colorInfo0 >>> 0, raw.depthInfo >>> 0, colorMask, raw.depthControl >>> 0,
       raw.blendControl0 >>> 0, raw.stencilRefMask >>> 0, raw.stencilRefMaskBf >>> 0, raw.colorControl >>> 0,
       raw.blendRed >>> 0, raw.blendGreen >>> 0, raw.blendBlue >>> 0, raw.blendAlpha >>> 0,
@@ -695,6 +715,8 @@
       // The WebGPU color target format for this draw (null = the canvas
       // format — the guest's format is 8-bit unorm RGBA).
       colorFormat,
+      // The guest's MSAA sample count (1, 2 or 4) — xenia's MsaaSamples.
+      sampleCount,
       depthFormatName: depthInfo.formatName,
     };
     if (rtDecodeCache.size >= RT_DECODE_CACHE_LIMIT) rtDecodeCache.clear();
