@@ -118,6 +118,45 @@
   const COLOR_FORMAT_COMPONENTS = {
     0: 4, 1: 4, 2: 4, 3: 4, 4: 2, 5: 4, 6: 2, 7: 4, 10: 4, 12: 4, 14: 1, 15: 2,
   };
+  // Guest color format → the WebGPU color target, following xenia's own host
+  // mapping (RenderTargetCache::GetColorDXGIFormat + GetBaseColorFormat):
+  //   k_8_8_8_8 / k_8_8_8_8_GAMMA → R8G8B8A8_UNORM (8-bit unorm RGBA)
+  //   k_2_10_10_10                  → R10G10B10A2_UNORM
+  //   k_2_10_10_10_FLOAT            → R16G16B16A16_FLOAT
+  //   k_16_16                       → R16G16_SNORM
+  //   k_16_16_16_16                 → R16G16B16A16_SNORM
+  //   k_16_16_FLOAT                 → R16G16_FLOAT
+  //   k_16_16_16_16_FLOAT           → R16G16B16A16_FLOAT
+  //   k_2_10_10_10_AS_10_10_10_10   → base k_2_10_10_10 (the extra alpha
+  //                                   planes are MRT — oC1..oC3, which the
+  //                                   translator traps on)
+  //   k_2_10_10_10_FLOAT_AS_16_16_16_16 → base k_2_10_10_10_FLOAT
+  //   k_32_FLOAT                    → R32_FLOAT
+  //   k_32_32_FLOAT                 → R32G32_FLOAT
+  // `webgpu: null` means the canvas format itself (the canvas is 8-bit unorm
+  // RGBA, so k_8_8_8_8 and k_8_8_8_8_GAMMA render straight into it).
+  // `channels` is the WebGPU channel mask (R=1, G=2, B=4, A=8) the format has —
+  // the guest's write mask is restricted to it (the absent channels do not
+  // exist on the hardware either).
+  // `blendable` follows the WebGPU texture-format table: r32float/rg32float
+  // are only blendable with the optional "float32-blendable" feature, which
+  // this port does not request (xenia's D3D12 host cannot blend them either).
+  // `tier1` marks the 16-bit snorm formats — WebGPU exposes them only with
+  // the optional "texture-formats-tier1" feature.
+  const COLOR_FORMAT_TARGET = {
+    0: { webgpu: null, channels: 0xF, blendable: true },
+    1: { webgpu: null, channels: 0xF, blendable: true },
+    2: { webgpu: 'rgb10a2unorm', channels: 0xF, blendable: true },
+    3: { webgpu: 'rgba16float', channels: 0xF, blendable: true },
+    4: { webgpu: 'rg16snorm', channels: 0x3, blendable: true, tier1: true },
+    5: { webgpu: 'rgba16snorm', channels: 0xF, blendable: true, tier1: true },
+    6: { webgpu: 'rg16float', channels: 0x3, blendable: true },
+    7: { webgpu: 'rgba16float', channels: 0xF, blendable: true },
+    10: { webgpu: 'rgb10a2unorm', channels: 0xF, blendable: true },
+    12: { webgpu: 'rgba16float', channels: 0xF, blendable: true },
+    14: { webgpu: 'r32float', channels: 0x1, blendable: false },
+    15: { webgpu: 'rg32float', channels: 0x3, blendable: false },
+  };
 
   // xenos::BlendFactor → GPUBlendFactor (32 slots; unlisted values are zero,
   // like xenia's static PipelineBlendFactor tables).
@@ -510,19 +549,31 @@
       alphaTest = { compare: alphaFunc, referenceDword: alphaRef >>> 0 };
     }
 
-    // --- RB_COLOR_INFO RT0: format must be representable when written ------
-    // k_8_8_8_8 (0) is the canvas format; k_8_8_8_8_GAMMA (1) is honored by
-    // gamma-encoding in the translated PS (xenia's RTV path; blending then
-    // happens on gamma-encoded values — same caveat as xenia). Everything else
-    // needs the EDRAM render-target cache (step 7) and traps.
+    // --- RB_COLOR_INFO RT0: the format decides the color attachment -------
+    // The guest's color format maps to a WebGPU color target exactly like
+    // xenia's host mapping (COLOR_FORMAT_TARGET above). k_8_8_8_8 and
+    // k_8_8_8_8_GAMMA are 8-bit unorm RGBA — the canvas format itself, so
+    // they render straight into the canvas; every other representable format
+    // renders into an offscreen texture with exactly that format (so the
+    // guest's writes are quantized and ranged like the hardware's), which the
+    // backend presents to the canvas with a blit at swap().
     const colorInfo0 = decodeColorInfo(raw.colorInfo0);
+    const colorTarget = COLOR_FORMAT_TARGET[colorInfo0.format] ?? null;
     if (psExportsColor0) {
-      if (colorInfo0.format !== 0 && colorInfo0.format !== 1) {
+      if (!colorTarget) {
         throw new XenosRenderStateError(
-          `render target 0 has format ${colorInfo0.formatName} — the only formats representable on the ` +
-          'scanout target today are k_8_8_8_8 and k_8_8_8_8_GAMMA; other formats need the EDRAM render-target cache (step 7). Refusing to draw');
+          `render target 0 has format ${colorInfo0.formatName} — no WebGPU color target represents it ` +
+          '(the 16-bit snorm formats need WebGPU\'s optional "texture-formats-tier1" feature, and the ' +
+          'remaining formats are not guest color formats at all). Refusing to draw');
+      }
+      if (colorTarget.tier1) {
+        throw new XenosRenderStateError(
+          `render target 0 has format ${colorInfo0.formatName} — WebGPU's ${colorTarget.webgpu} is an optional ` +
+          'format ("texture-formats-tier1") that this port does not request. Refusing to draw');
       }
     }
+    // The color attachment format: null = the canvas format (8-bit unorm RGBA).
+    const colorFormat = (colorTarget && !colorTarget.tier1) ? colorTarget.webgpu : null;
     // The gamma encode is a no-op unless the PS statically exports oC0 (the
     // translator enforces that itself); the flag records the RT's format.
     const convertColor0ToGamma = colorInfo0.format === 1;
@@ -565,12 +616,24 @@
 
     // --- write mask ---------------------------------------------------------
     const colorMask = raw.colorMask >>> 0;
-    const writeMask = normalizeWriteMask((colorMask >>> 0) & 0xF, colorInfo0.componentCount);
+    // The guest's mask, restricted to the channels the format actually has
+    // (the absent channels do not exist on the hardware either — xenia hands
+    // the raw nibble to D3D12, which ignores the bits the format lacks).
+    const writeMask = (normalizeWriteMask((colorMask >>> 0) & 0xF, colorInfo0.componentCount) &
+      (colorTarget ? colorTarget.channels : 0xF)) >>> 0;
 
     // --- blend --------------------------------------------------------------
     const blend0 = decodeBlendControl(raw.blendControl0);
     let blend = null;
     if (blendEnabled(blend0)) {
+      if (colorTarget && !colorTarget.blendable) {
+        // WebGPU: r32float/rg32float are only blendable with the optional
+        // "float32-blendable" feature. xenia's D3D12 host cannot blend these
+        // formats either (D3D12 requires a blendable format).
+        throw new XenosRenderStateError(
+          `render target 0 has format ${colorInfo0.formatName} — WebGPU cannot blend a ${colorTarget.webgpu} ` +
+          'target (it needs the optional "float32-blendable" feature, which this port does not request). Refusing to draw');
+      }
       blend = { color: { ...blend0.color }, alpha: { ...blend0.alpha } };
     }
     const blendConstant = [
@@ -629,6 +692,9 @@
       surfacePitch: surfaceInfo & 0x3FFF,
       convertColor0ToGamma,
       colorFormatName: colorInfo0.formatName,
+      // The WebGPU color target format for this draw (null = the canvas
+      // format — the guest's format is 8-bit unorm RGBA).
+      colorFormat,
       depthFormatName: depthInfo.formatName,
     };
     if (rtDecodeCache.size >= RT_DECODE_CACHE_LIMIT) rtDecodeCache.clear();

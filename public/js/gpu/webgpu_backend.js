@@ -159,6 +159,30 @@
 }
 `;
 
+  /**
+   * The present blit: a fullscreen triangle that copies the offscreen
+   * render target into the canvas texture. The guest's render-target format
+   * is not the canvas format (8-bit unorm RGBA), so the frame is drawn into a
+   * texture with the guest's format and copied here — textureLoad, so the
+   * copy is exact (no filtering, no colour-space conversion beyond what the
+   * canvas format does on write).
+   */
+  const PRESENT_BLIT_WGSL = `
+@group(0) @binding(0) var src: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+  // One oversized triangle covering the whole target.
+  var pos = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(pos[index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  return textureLoad(src, vec2i(pos.xy), 0);
+}
+`;
+
   /** Integer-component GPUVertexFormat strings (need vec4<u32>/vec4<i32> shader locations, not vec4<f32>). */
   function isIntegerGpuVertexFormat(format) {
     return format.startsWith('uint') || format.startsWith('sint');
@@ -292,7 +316,10 @@
       this.boolConstantBuffer = null;    // GPUBuffer, persistent likewise
       this.aluHash = -1;                 // content hash of the last uploaded ALU constants (-1 = never)
       this.boolHash = -1;
-      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0 };
+      this.uploads = { indexBuffers: 0, indexBytes: 0, vertexBuffers: 0, vertexBytes: 0, frames: 0, vertexBufferCacheHits: 0, indexBufferCacheHits: 0, constantUploads: 0, presents: 0 };
+      this._offscreenColor = null; // { key, texture, format } — the guest's RT texture (non-canvas formats)
+      this._presentPending = false; // an offscreen frame is waiting to be blitted to the canvas
+      this._presentPipeline = new Map(); // source format -> { pipeline, bindGroup } for the present blit
       this.implicitIndexCache = new Map();
       this.implicitIndexBytes = 0;
       this.implicitIndexClock = 0;
@@ -357,7 +384,17 @@
     }
 
     /** Resize depth attachment to the canvas size (call before drawing after a resize). */
-    resize() { this._flushFrame(); this._recreateDepth(); }
+    resize() {
+      this._flushFrame();
+      // The offscreen target is sized like the canvas (the guest's RT extent
+      // is assumed to be the canvas extent) — drop it so it is recreated.
+      if (this._offscreenColor) {
+        this._offscreenColor.texture.destroy();
+        this._offscreenColor = null;
+        this._presentPipeline.clear();
+      }
+      this._recreateDepth();
+    }
 
     // --- IXenosGpuBackend ----------------------------------------------------
 
@@ -626,7 +663,11 @@
 
     /** The color target descriptor for the canvas attachment (format + write mask + blend). */
     _colorTargetDesc(rtState, writesColor = true) {
-      const target = { format: this.format, writeMask: writesColor ? (rtState ? rtState.writeMask : 0xF) : 0x0 };
+      // The target format is the guest's render-target format (render_state.js
+      // maps it exactly like xenia maps it to a host format); null means the
+      // canvas format (8-bit unorm RGBA — k_8_8_8_8 / k_8_8_8_8_GAMMA).
+      const format = (rtState && rtState.colorFormat) ? rtState.colorFormat : this.format;
+      const target = { format, writeMask: writesColor ? (rtState ? rtState.writeMask : 0xF) : 0x0 };
       if (writesColor && rtState && rtState.blend) target.blend = rtState.blend;
       return target;
     }
@@ -719,20 +760,81 @@
 
     _flushFrame() {
       if (!this._frame) return;
-      const { encoder, pass } = this._frame;
+      const { encoder, pass, offscreen } = this._frame;
       this._frame = null; // release before submit so a re-entrant draw starts a fresh frame
       pass.end();
       this.device.queue.submit([encoder.finish()]);
+      // A frame that rendered into the offscreen target has not reached the
+      // canvas yet — swap() presents it.
+      if (offscreen) this._presentPending = true;
+    }
+
+    /**
+     * The color attachment for the frame's pass. The guest's render-target
+     * format decides where the frame is drawn:
+     *   - k_8_8_8_8 / k_8_8_8_8_GAMMA (8-bit unorm RGBA) go straight into the
+     *     canvas texture — the same format the canvas is.
+     *   - every other representable format goes into an offscreen texture with
+     *     exactly that format, so the guest's writes are quantized and ranged
+     *     like the hardware's; the offscreen target is presented to the canvas
+     *     by a blit at swap() (_presentOffscreen).
+     */
+    _colorAttachment(rtState) {
+      const format = rtState?.colorFormat ?? null;
+      if (!format) {
+        return { view: this.context.getCurrentTexture().createView(), format: this.format, offscreen: false };
+      }
+      const texture = this._offscreenColorTexture(format);
+      return { view: texture.createView(), format, offscreen: true };
+    }
+
+    /**
+     * The offscreen color target for a guest render-target format that the
+     * canvas cannot carry. Recreated when the format or the canvas size
+     * changes (the guest's RT extent is assumed to be the canvas extent, like
+     * the viewport decode assumes).
+     */
+    _offscreenColorTexture(format) {
+      const width = Math.max(1, (this.canvas?.width ?? 1) | 0);
+      const height = Math.max(1, (this.canvas?.height ?? 1) | 0);
+      const key = `${format}:${width}x${height}`;
+      if (this._offscreenColor && this._offscreenColor.key === key) return this._offscreenColor.texture;
+      if (this._offscreenColor) {
+        this._offscreenColor.texture.destroy();
+        this._offscreenColor = null;
+        // the cached blit bind group referenced the destroyed texture
+        this._presentPipeline.clear();
+      }
+      if (typeof GPUTextureUsage === 'undefined') throw new XenosWebGpuError('GPUTextureUsage is not defined in this environment');
+      const texture = this.device.createTexture({
+        label: `xenos-rt-${format}`,
+        size: [width, height, 1],
+        format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      });
+      this._offscreenColor = { key, texture, format };
+      return texture;
     }
 
     /** Open (or reuse) the batched frame's pass. Returns the pass — never ends it per draw. */
-    _openFrame() {
+    _openFrame(rtState = null) {
       if (this._frame && this._frame.draws >= XenosWebGpuBackend.MAX_DRAWS_PER_SUBMIT) this._flushFrame();
+      // A render pass has one color attachment format: if the guest changed the
+      // render-target format mid-frame, end the pass and start a new one. The
+      // old frame's canvas update is dropped (its offscreen content is
+      // superseded by the new frame — a guest that changes the render-target
+      // format mid-frame is not a shape this port reproduces faithfully).
+      if (this._frame && this._frame.colorFormat !== ((rtState?.colorFormat) ?? this.format)) {
+        this._flushFrame();
+        this._presentPending = false;
+        this._frameClearColor = false;
+        this._frameClearDepth = false;
+      }
       if (!this._frame) {
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
-        const colorView = this.context.getCurrentTexture().createView();
-        const pass = this._beginFramePass(encoder, colorView);
-        this._frame = { encoder, pass, colorView, draws: 0 };
+        const attachment = this._colorAttachment(rtState);
+        const pass = this._beginFramePass(encoder, attachment.view);
+        this._frame = { encoder, pass, colorView: attachment.view, draws: 0, colorFormat: attachment.format, offscreen: attachment.offscreen };
       }
       return this._frame.pass;
     }
@@ -1110,7 +1212,7 @@
         if (!rtState) return;
         const scissor = this._resolveScissor(params);
         const { pipeline, bindGroup } = this._getTranslatedProgramResources(code, psCode, plan, topology, program, rtState);
-        const pass = this._openFrame();
+        const pass = this._openFrame(rtState);
         this._frameDrawState(pass, rtState, scissor);
         pass.setPipeline(pipeline);
         if (bindGroup) pass.setBindGroup(0, bindGroup);
@@ -1131,7 +1233,7 @@
         if (!rtState) return;
         const scissor = this._resolveScissor(params);
         const plan = this.prepareVertexFetch({ vertexShaderCode: this.shaders.vertex.code, fetchConstants: params.vertexFetchConstants });
-        const pass = this._openFrame();
+        const pass = this._openFrame(rtState);
         this._frameDrawState(pass, rtState, scissor);
         if (plan.descriptors.length > 0) {
           const buffers = this.uploadVertexBuffers(plan);
@@ -1153,7 +1255,7 @@
       const rtState = this._resolveRenderTargets(params, null);
       if (!rtState) return;
       const scissor = this._resolveScissor(params);
-      const pass = this._openFrame();
+      const pass = this._openFrame(rtState);
       this._frameDrawState(pass, rtState, scissor);
       pass.setPipeline(this._getPlaceholderPipeline(rtState));
       pass.draw(3);
@@ -1187,9 +1289,55 @@
       pass.draw(params.numIndices);
     }
 
+    /**
+     * Present the offscreen color target to the canvas (the guest's
+     * render-target format is not the canvas format). One blit per frame; the
+     * pipeline and bind group are cached per source format.
+     */
+    _presentOffscreen() {
+      if (!this._presentPending) return;
+      this._presentPending = false;
+      const source = this._offscreenColor;
+      if (!source) return;
+      const canvasTexture = this.context.getCurrentTexture();
+      let entry = this._presentPipeline.get(source.format);
+      if (!entry) {
+        const module = this.device.createShaderModule({ code: PRESENT_BLIT_WGSL, label: 'xenos-present-blit' });
+        const pipeline = this.device.createRenderPipeline({
+          label: 'xenos-present-blit',
+          layout: 'auto',
+          vertex: { module, entryPoint: 'vs_main' },
+          fragment: { module, entryPoint: 'fs_main', targets: [{ format: this.format }] },
+          primitive: { topology: 'triangle-list' },
+        });
+        const bindGroup = this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout(0),
+          entries: [{ binding: 0, resource: source.texture.createView() }],
+        });
+        entry = { pipeline, bindGroup };
+        this._presentPipeline.set(source.format, entry);
+      }
+      const encoder = this.device.createCommandEncoder({ label: 'xenos-present' });
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: canvasTexture.createView(),
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        }],
+      });
+      pass.setPipeline(entry.pipeline);
+      pass.setBindGroup(0, entry.bindGroup);
+      pass.draw(3);
+      pass.end();
+      this.device.queue.submit([encoder.finish()]);
+      this.uploads.presents++;
+    }
+
     /** Frame boundary from PM4_XE_SWAP — xenia uses this to trigger present/swap on the host. */
     swap() {
       this._flushFrame();
+      this._presentOffscreen();
       this._frameClearColor = false;
       this._frameClearDepth = false;
       this.lastFrame = { at: (typeof performance !== 'undefined' ? performance.now() : Date.now()) };
@@ -1202,6 +1350,8 @@
       if (this.depthTexture) { this.depthTexture.destroy(); this.depthTexture = null; this.depthView = null; }
       if (this.aluConstantBuffer) { this.aluConstantBuffer.destroy(); this.aluConstantBuffer = null; }
       if (this.viewportBuffer) { this.viewportBuffer.destroy(); this.viewportBuffer = null; this._viewportLast = null; }
+      if (this._offscreenColor) { this._offscreenColor.texture.destroy(); this._offscreenColor = null; }
+      this._presentPipeline.clear();
       for (const entry of this.implicitIndexCache.values()) if (entry.buffer.destroy) entry.buffer.destroy();
       this.implicitIndexCache.clear();
       this.implicitIndexBytes = 0;
@@ -1215,7 +1365,7 @@
   }
 
   // Internals exposed for unit tests only — unstable shapes, not public API.
-  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
+  const _internal = { topologyForPrimType, isPrimitivePolygonal, isIntegerGpuVertexFormat, FLAT_FRAGMENT_WGSL, PRESENT_BLIT_WGSL, PRIM_TYPE_TOPOLOGY, PRIM_TYPE_CONVERT, expandConvertedIndices };
 
   const api = { XenosWebGpuBackend, XenosWebGpuError, PLACEHOLDER_WGSL, _internal };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

@@ -46,15 +46,61 @@ test('unknown color-format nibbles decode to a named, unrecognized value (and tr
   }
 });
 
-test('every other color format traps with its xenia name when the PS writes oC0', () => {
+test('every guest color format maps to a WebGPU color target exactly like xenia maps it', () => {
+  // xenia: RenderTargetCache::GetColorDXGIFormat + GetBaseColorFormat.
+  // null = the canvas format itself (8-bit unorm RGBA).
   const cases = [
-    [2, 'k_2_10_10_10'], [3, 'k_2_10_10_10_FLOAT'], [4, 'k_16_16'], [5, 'k_16_16_16_16'],
-    [6, 'k_16_16_FLOAT'], [7, 'k_16_16_16_16_FLOAT'], [10, 'k_2_10_10_10_AS_10_10_10_10'],
-    [12, 'k_2_10_10_10_FLOAT_AS_16_16_16_16'], [14, 'k_32_FLOAT'], [15, 'k_32_32_FLOAT'],
+    [0, 'k_8_8_8_8', null],
+    [1, 'k_8_8_8_8_GAMMA', null],
+    [2, 'k_2_10_10_10', 'rgb10a2unorm'],
+    [3, 'k_2_10_10_10_FLOAT', 'rgba16float'],
+    [6, 'k_16_16_FLOAT', 'rg16float'],
+    [7, 'k_16_16_16_16_FLOAT', 'rgba16float'],
+    [10, 'k_2_10_10_10_AS_10_10_10_10', 'rgb10a2unorm'], // xenia's base format
+    [12, 'k_2_10_10_10_FLOAT_AS_16_16_16_16', 'rgba16float'], // xenia's base format
+    [14, 'k_32_FLOAT', 'r32float'],
+    [15, 'k_32_32_FLOAT', 'rg32float'],
   ];
-  for (const [format, name] of cases) {
-    assert.throws(() => rtState({ colorInfo0: format << 16 }), (e) => e instanceof RS.XenosRenderStateError && e.message.includes(name));
+  for (const [format, name, webgpu] of cases) {
+    const state = rtState({ colorInfo0: format << 16 });
+    assert.equal(state.colorFormatName, name, name);
+    assert.equal(state.colorFormat, webgpu, name);
   }
+});
+
+test('the 16-bit snorm color formats trap: WebGPU exposes them only with an optional feature', () => {
+  for (const [format, name] of [[4, 'k_16_16'], [5, 'k_16_16_16_16']]) {
+    assert.throws(
+      () => rtState({ colorInfo0: format << 16 }),
+      (e) => e instanceof RS.XenosRenderStateError && e.message.includes(name) && /texture-formats-tier1/.test(e.message),
+      name);
+  }
+});
+
+test('an unknown color format traps with its xenia name', () => {
+  assert.throws(
+    () => rtState({ colorInfo0: 9 << 16 }),
+    (e) => e instanceof RS.XenosRenderStateError && /unrecognized/.test(e.message));
+});
+
+test('blending a format WebGPU cannot blend traps (r32float/rg32float need an optional feature)', () => {
+  // blendControl0 = 0x00010001 is the "enabled" pattern the harness uses; a
+  // real blend needs a non-trivial factor.
+  assert.throws(
+    () => rtState({ colorInfo0: 14 << 16, blendControl0: 0x00040001 }),
+    (e) => e instanceof RS.XenosRenderStateError && /float32-blendable/.test(e.message));
+  // the same format without blending is fine
+  const state = rtState({ colorInfo0: 14 << 16 });
+  assert.equal(state.colorFormat, 'r32float');
+});
+
+test('the write mask is restricted to the channels the format has', () => {
+  // k_32_FLOAT has one channel: only RED can be written.
+  assert.equal(rtState({ colorInfo0: 14 << 16, colorMask: 0x0000000F }).writeMask, 0x1);
+  // k_16_16_FLOAT has two: RED|GREEN.
+  assert.equal(rtState({ colorInfo0: 6 << 16, colorMask: 0x0000000F }).writeMask, 0x3);
+  // four-channel formats keep the guest's mask as-is.
+  assert.equal(rtState({ colorInfo0: 0, colorMask: 0x00000005 }).writeMask, 0x5);
 });
 
 test('k_8_8_8_8_GAMMA decodes (the PWL gamma encode happens in the translated PS, not here)', () => {
@@ -254,11 +300,11 @@ test('a missing snapshot traps with a named reason (no fabricated ROP state)', (
 
 test('the error class is stable and carries the message', () => {
   try {
-    rtState({ colorInfo0: 7 << 16 });
+    rtState({ colorInfo0: 5 << 16 }); // k_16_16_16_16 — the optional-format trap
     assert.fail('should have thrown');
   } catch (e) {
     assert.ok(e instanceof RS.XenosRenderStateError);
-    assert.match(e.message, /k_16_16_16_16_FLOAT/);
+    assert.match(e.message, /k_16_16_16_16/);
   }
 });
 

@@ -129,7 +129,11 @@ function makeFakeDevice() {
       submit() { log.submits++; },
     },
     createBuffer(desc) { const b = { desc }; log.buffers.push(b); return b; },
-    createTexture() { return { destroy() {}, createView() { return { kind: 'texture-view' }; } }; },
+    createTexture(desc) {
+      const tex = { desc, destroy() { tex.destroyed = true; }, createView() { return { kind: 'texture-view' }; } };
+      (log.textures ??= []).push(tex);
+      return tex;
+    },
     createShaderModule(desc) { log.modules.push(desc); return { desc }; },
     createRenderPipeline(desc) {
       const pipeline = { desc, getBindGroupLayout() { return { kind: 'fake-bgl' }; } };
@@ -655,14 +659,110 @@ test('GAMMA RT0: the translated PS is gamma-encoded (xenia PWL); the draw runs, 
   assert.doesNotMatch(fsModule2.code, /fn xenosGamma/);
 });
 
-test('traps: float color format is refused naming the format', () => {
+test('traps: a color format WebGPU only has behind an optional feature is refused naming the format', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 7 << 16 }) })),
-    /k_16_16_16_16_FLOAT/);
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 5 << 16 }) })),
+    /k_16_16_16_16/);
+});
+
+test('a guest color format the canvas cannot carry renders into an offscreen target of that format', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // k_2_10_10_10 → rgb10a2unorm (xenia's GetColorDXGIFormat)
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  // the pipeline's color target carries the guest's format
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].format, 'rgb10a2unorm');
+  // the frame renders into an offscreen texture of that format, not the canvas
+  const rt = log.textures.find((t) => t.desc.label === 'xenos-rt-rgb10a2unorm');
+  assert.ok(rt, 'the offscreen render target exists');
+  assert.equal(rt.desc.format, 'rgb10a2unorm');
+  assert.equal(rt.desc.size[0], 64);
+  assert.equal(rt.desc.size[1], 64);
+  // ... and the canvas is NOT the pass's color attachment (the frame renders offscreen)
+  assert.equal(log.passes.length, 1);
+  assert.ok(log.textures.some((t) => t.desc.label === 'xenos-rt-rgb10a2unorm'));
+});
+
+test('the present blit shader compiles with Dawn', async () => {
+  await assertValidWgsl(INTERNAL.PRESENT_BLIT_WGSL);
+});
+
+test('a frame that rendered into the canvas is not overwritten by a stale offscreen target', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  // frame 1: an offscreen format → the canvas is only updated at swap()
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  backend.swap();
+  const drawsAfterFirstSwap = log.drawCalls.length;
+  // frame 2: the canvas format → the frame goes straight to the canvas
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  backend.swap();
+  assert.equal(log.drawCalls.length, drawsAfterFirstSwap + 1, 'only the guest draw — no stale blit over the canvas');
+});
+
+test('the offscreen target is presented to the canvas with a blit at swap()', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  const submitsBefore = log.submits;
+  const passesBefore = log.passes.length;
+  backend.swap();
+  assert.equal(log.submits, submitsBefore + 2, 'the frame flush and the present pass are submitted');
+  assert.equal(log.passes.length, passesBefore + 1, 'the present pass is a new pass');
+  // the blit is a fullscreen triangle into the canvas texture
+  const blit = log.drawCalls.at(-1);
+  assert.deepEqual(blit, ['draw', 3]);
+  // the blit pipeline targets the canvas format and samples the offscreen texture
+  const blitPipeline = log.pipelines.at(-1);
+  assert.equal(blitPipeline.desc.fragment.targets[0].format, 'bgra8unorm');
+  assert.match(blitPipeline.desc.label, /present/);
+});
+
+test('k_8_8_8_8 still renders straight into the canvas (no offscreen target, no blit)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  assert.equal(log.pipelines[0].desc.fragment.targets[0].format, 'bgra8unorm');
+  assert.equal(log.textures.filter((t) => t.desc.label?.startsWith('xenos-rt-')).length, 0, 'no offscreen target');
+  const drawsBefore = log.drawCalls.length;
+  backend.swap();
+  assert.equal(log.drawCalls.length, drawsBefore, 'no present blit — the canvas already holds the frame');
+});
+
+test('the guest changing the render-target format mid-frame ends the pass and starts a new one', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 0 }) }));
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  assert.equal(log.passes.length, 2, 'a render pass has one color attachment format');
+});
+
+test('the offscreen target is released on resize() and destroy()', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ colorInfo0: 2 << 16 }) }));
+  const rt = log.textures.find((t) => t.desc.label === 'xenos-rt-rgb10a2unorm');
+  assert.ok(rt);
+  let destroyed = false;
+  rt.destroy = () => { destroyed = true; };
+  backend.resize();
+  assert.equal(destroyed, true, 'the stale offscreen target is destroyed on resize');
 });
 
 test('traps: kD24FS8 float depth refused when depth testing is enabled', () => {
