@@ -604,6 +604,36 @@ test('a draw with RB_SURFACE_INFO.surface_pitch == 0 does not draw (xenia: "does
   assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'the draw never reaches the backend');
 });
 
+test('the binned draw opcodes refuse loudly (tiled rendering is not implemented)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = enableDraws(makeCP(guest, backend));
+  const initiator = ((3 & 0xffff) << 16) | (PM4.SOURCE_SELECT.kAutoIndex << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  // PM4_DRAW_INDX_BIN: viz query, draw indicator, bin base, bin size, dma base, dma size.
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([
+      PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_BIN, 6),
+      0x00000000, initiator, 0x00000000, 0x00000003, 0x00000000, 0x00000006,
+    ])),
+    /tiled rendering/);
+  // PM4_DRAW_INDX_2_BIN: draw indicator, bin base, bin size, dma base, dma size.
+  assert.throws(
+    () => cp.executeCommandBuffer(beWords([
+      PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX_2_BIN, 5),
+      initiator, 0x00000000, 0x00000003, 0x00000000, 0x00000006,
+    ])),
+    /tiled rendering/);
+  assert.equal(backend.calls.filter((c) => c.kind === 'draw').length, 0, 'no bin draw reached the backend');
+});
+
+test('SET_BIN_BASE_OFFSET is recorded (xenia does not implement the opcode either)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = makeCP(guest, backend);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_SET_BIN_BASE_OFFSET, 1), 0x00001234]));
+  assert.equal(cp.binBaseOffset, 0x1234);
+});
+
 test('PM4_VIZ_QUERY traps loudly (occlusion queries unimplemented — step 9)', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);

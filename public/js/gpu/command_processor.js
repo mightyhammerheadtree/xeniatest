@@ -88,6 +88,8 @@
       /** @type {bigint} 64-bit bin mask/select for predicated (tiled) rendering */
       this.binMask = 0n;
       this.binSelect = 0n;
+      /** Bin base offset programmed by PM4_SET_BIN_BASE_OFFSET (tiled rendering; recorded only). */
+      this.binBaseOffset = 0;
       /** Shaders loaded via IM_LOAD*; opaque descriptors owned by the backend. */
       this.vertexShader = null;
       this.pixelShader = null;
@@ -322,12 +324,27 @@
         }
         case op.PM4_DRAW_INDX_2:
           return this._draw(u32s, start, end, parsed.opcodeName, 0, false);
-        case op.PM4_DRAW_INDX_BIN: {
-          const vizQueryCondition = u32s[start];
-          return this._draw(u32s, start + 1, end, parsed.opcodeName, vizQueryCondition, true);
-        }
+        case op.PM4_DRAW_INDX_BIN:
         case op.PM4_DRAW_INDX_2_BIN:
-          return this._draw(u32s, start, end, parsed.opcodeName, 0, false);
+          // Tiled (binned) rendering. The binned draw packets carry the bin
+          // base and the bin size *ahead of* the index-buffer DMA base/size
+          // (the R6xx/R7xx tiled layout the Xenos inherits):
+          //   PM4_DRAW_INDX_BIN   : viz query, draw indicator, bin base, bin
+          //                          size, dma base, dma size
+          //   PM4_DRAW_INDX_2_BIN : draw indicator, bin base, bin size,
+          //                          dma base, dma size
+          // xenia implements neither: its switch has no case for them, so the
+          // packet falls into the default branch — "Unimplemented GPU OPCODE"
+          // and an assert (in a release build the assert is compiled out and
+          // the packet is skipped). This port cannot honor a bin draw either
+          // (there is no bin/EDRAM tiling here), and decoding one as an
+          // ordinary draw would read the bin base and bin size as the
+          // index-buffer DMA base and size — a silent miscompile. Refuse.
+          throw new XenosGpuError(
+            `${parsed.opcodeName}: tiled rendering (a binned draw) is not implemented in this port — the packet ` +
+            'carries a bin base and bin size that an ordinary draw cannot honor, and xenia does not implement ' +
+            'the opcode either (its switch logs "Unimplemented GPU OPCODE" and asserts). Refusing rather than ' +
+            'rasterizing the bin draw as a normal draw');
 
         // --- events / synchronization ----------------------------------------
         case op.PM4_EVENT_WRITE:
@@ -396,8 +413,16 @@
           return end;
         }
         case op.PM4_COND_EXEC: {
-          // conditional execution based on a register/memory compare — not yet modeled; trap loudly
-          throw new XenosGpuError('PM4_COND_EXEC: conditional execution is not implemented (xenia models it; port the compare logic before enabling)');
+          // A conditional block of packets. xenia does not implement this
+          // opcode either (its switch has no case for it — the default branch
+          // logs "Unimplemented GPU OPCODE" and skips the packet, which would
+          // run the conditional block unconditionally). This port refuses
+          // loudly instead of running a block the guest meant to be
+          // conditional.
+          throw new XenosGpuError(
+            'PM4_COND_EXEC: conditional execution is not implemented — xenia does not implement the opcode either ' +
+            '(its command processor logs "Unimplemented GPU OPCODE" and skips the packet, which would run the ' +
+            'conditional block unconditionally). Refusing rather than running a block the guest meant to be conditional');
         }
         case op.PM4_COND_WRITE:
           return this._condWrite(u32s, start, end, parsed.opcodeName);
@@ -436,8 +461,13 @@
           return end;
         }
         case op.PM4_SET_BIN_BASE_OFFSET:
-          // bin base offset for tiled rendering — records into registers like xenia would via RB path; no sink yet
-          this.log('debug', `SET_BIN_BASE_OFFSET 0x${u32s[start].toString(16)} (no tiled-rendering sink yet)`);
+          // The offset added to the bin base of a DRAW_INDX_BIN packet.
+          // xenia does not implement this opcode either (its switch has no
+          // case for it), so it is only meaningful for the binned draws —
+          // which this port refuses. It is recorded for diagnostics and the
+          // packet is skipped.
+          this.binBaseOffset = u32s[start] >>> 0;
+          this.log('debug', `SET_BIN_BASE_OFFSET 0x${this.binBaseOffset.toString(16)} (recorded; tiled rendering is not implemented)`);
           return end;
 
         default:
