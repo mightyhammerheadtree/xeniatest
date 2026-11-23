@@ -53,7 +53,7 @@
    * missing methods trap loudly with the opcode that needed them.
    *
    *   memWrite(address /* guest physical, 0x3FFFFFFF-masked *\/, bytes /* Uint8Array *\/)
-   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/, depthOnly /* RB_MODECONTROL.edram_mode = kDepth: depth only, no color output *\/ })
+   *   draw({ primType, numIndices, isIndexed, indexGuestBase, indexCount, indexFormat /* 0=int16 1=int32 *\/, indexEndianness /* swap_mode 0..3 *\/, multiPrimIbEnable /* PA_SU_SC_MODE_CNTL.multi_prim_ib_ena *\/, multiPrimResetIndex /* VGT_MULTI_PRIM_IB_RESET_INDX *\/, vizQueryCondition, majorModeExplicit, vertexFetchConstants /* 192 dwords *\/, aluConstants /* 1024 dwords *\/, boolConstants /* 8 dwords *\/, renderTargets /* raw RB_* render-target register snapshot for the backend to decode (write mask, blend, depth/stencil, alpha test, PA_SU_* rasterizer state) *\/, scissor /* raw PA_SC_* scissor register snapshot *\/, depthOnly /* RB_MODECONTROL.edram_mode = kDepth: depth only, no color output *\/ })
    *   setShaders({ vertex, pixel })           // loaded via IM_LOAD*, shader objects are opaque to the CP
    *   eventWrite({ eventType, address /* may be 0 for none *\/, data /* may be null *\/, timestamp })
    *   interrupt(mask)                          // PM4_INTERRUPT — guest-visible interrupt request
@@ -713,11 +713,25 @@
       let consumed = start + 1;
       if (source === pm4().SOURCE_SELECT.kDMA) {
         if (consumed + 2 > end) throw new XenosGpuError(`${opcodeName}: indexed draw packet too small for VGT_DMA_BASE/SIZE`);
-        indexGuestBase = u32s[consumed] & 0x1fffffff; // xenia CpuToGpu: GPU bus is 29 bits
+        // xenia's primitive processor: "The base should already be aligned
+        // according to the R6xx documentation, but aligning here too for
+        // safety" — the base is aligned down to the index element size and
+        // kept as the full 32-bit guest physical address.
+        indexGuestBase = (u32s[consumed] & ~((di.indexSize === 1 ? 4 : 2) - 1)) >>> 0;
         const dmaSizeWord = u32s[consumed + 1];
         const dmaSize = pm4().parseVgtDmaSize(dmaSizeWord);
         indexEndianness = dmaSize.swapMode;
         indexLengthWords = dmaSize.numWords;
+        // xenia's primitive processor clamps the drawn vertex count to the
+        // index buffer's declared size: "N vertices attempted to be drawn with
+        // an index buffer only containing M. Should be fetching zero indices
+        // instead of overflowing ones, but this is a rare situation, so not
+        // handled yet." (xenia primitive_processor.cc) — the draw fetches
+        // min(num_indices, num_words) indices.
+        if (di.numIndices > indexLengthWords) {
+          this.log('warn', `${opcodeName}: ${di.numIndices} indices requested but the index buffer only declares ${indexLengthWords} — the draw is clamped to the declared range (xenia clamps it the same way)`);
+          indexCount = indexLengthWords;
+        }
         this._writeRegister(regFile().XE_GPU_REG_VGT_DMA_BASE, indexGuestBase);
         this._writeRegister(regFile().XE_GPU_REG_VGT_DMA_SIZE, dmaSizeWord);
         consumed += 2;
@@ -757,6 +771,7 @@
       const RB_DEPTHCONTROL = 0x2200, RB_BLENDCONTROL0 = 0x2201, RB_COLORCONTROL = 0x2202;
       const RB_BLENDCONTROL1 = 0x2209, RB_BLENDCONTROL2 = 0x220a, RB_BLENDCONTROL3 = 0x220b;
       const PA_SC_VIZ_QUERY = 0x2293;
+      const VGT_MULTI_PRIM_IB_RESET_INDX = 0x2103;
       const PA_SU_SC_MODE_CNTL = 0x2205, PA_SU_VTX_CNTL = 0x2302;
       const PA_CL_CLIP_CNTL = 0x2204, PA_CL_VTE_CNTL = 0x2206;
       const PA_CL_VPORT_XSCALE = 0x210F, PA_CL_VPORT_XOFFSET = 0x2110, PA_CL_VPORT_YSCALE = 0x2111, PA_CL_VPORT_YOFFSET = 0x2112;
@@ -843,12 +858,17 @@
       draw({
         primType: di.primType,
         primTypeName: di.primTypeName,
-        numIndices: di.numIndices,
+        numIndices: indexCount,
         isIndexed: source === pm4().SOURCE_SELECT.kDMA,
         indexGuestBase,
         indexFormat,
         indexEndianness,
         indexLengthWords,
+        // xenia's primitive reset index (multi-primitive index buffers):
+        // PA_SU_SC_MODE_CNTL.multi_prim_ib_ena enables it, and the reset value
+        // itself comes from VGT_MULTI_PRIM_IB_RESET_INDX.
+        multiPrimIbEnable: ((this.registers.read(PA_SU_SC_MODE_CNTL) >>> 21) & 1) !== 0,
+        multiPrimResetIndex: this.registers.read(VGT_MULTI_PRIM_IB_RESET_INDX) >>> 0,
         vizQueryCondition,
         majorModeExplicit,
         vertexFetchConstants,

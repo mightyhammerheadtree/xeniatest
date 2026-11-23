@@ -217,8 +217,9 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   // Host-side index conversion for the primitives WebGPU has no topology for.
   // Mirrors xenia's primitive_processor.cc conversion paths (used there when
   // the host lacks the primitive natively — WebGPU always lacks these):
-  //   kTriangleFan → triangle-list: triangles (i0, i1, i2), (i0, i2, i3), …
-  //                  (cyclic rotation of xenia's (i-1, i, i0) — same winding)
+  //   kTriangleFan → triangle-list: triangles (i-1, i, i0) — xenia's
+  //                  TriangleFanToList order: the previous index, the current
+  //                  one and the fan's first index close every triangle.
   //   kLineLoop    → line-strip with the loop closed (first index re-appended)
   //   kQuadList    → triangle-list: (v0,v1,v2), (v0,v2,v3) per quad (xenia order)
   // Leftover indices that do not complete a primitive are dropped, matching
@@ -229,34 +230,104 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     [0x0C /* kLineLoop */, { topology: 'line-strip', kind: 'loop' }],
     [0x0D /* kQuadList */, { topology: 'triangle-list', kind: 'quads' }],
   ]);
+  // The primitive types for which xenia's primitive processor honors the
+  // guest's primitive reset index (VGT_MULTI_PRIM_IB_RESET_INDX). The list
+  // topologies are deliberately excluded: "Vulkan explicitly disallows
+  // primitive restart index for 'list' topologies. In Direct3D 12, it's valid
+  // for non-strips, but has implementation-defined behavior." (xenia
+  // primitive_processor.cc).
+  const PRIM_TYPE_RESETTABLE = new Set([
+    0x03 /* kLineStrip */, 0x05 /* kTriangleFan */, 0x06 /* kTriangleStrip */,
+    0x0C /* kLineLoop */, 0x0E /* kQuadStrip */, 0x0F /* kPolygon */,
+    0x15 /* k2DLineStrip */, 0x16 /* k2DTriStrip */,
+  ]);
+  // The resettable topologies WebGPU has natively. The guest's reset index
+  // terminates the strip, so every range between two reset markers is a strip
+  // of its own — xenia hands the whole buffer to the host with the host's
+  // primitive restart enabled; WebGPU's restart index is fixed at
+  // 0xFFFF/0xFFFFFFFF, so the same result is produced by drawing each range
+  // separately. The remaining resettable topologies (quad strip, polygon, the
+  // 2D copies) are not encodable in WebGPU at all and trap before this point.
+  const PRIM_TYPE_STRIP_RESETTABLE = new Set([
+    0x03 /* kLineStrip */, 0x06 /* kTriangleStrip */,
+  ]);
+  // Split an index buffer at the guest's primitive reset index; the marker
+  // itself is dropped and every range is drawn on its own. Mirrors xenia's
+  // GetMultiPrimitiveHostIndexCountAndRanges range gathering.
+  function splitResetRanges(indices, isResetIndex) {
+    const ranges = [];
+    let start = 0;
+    for (let i = 0; i < indices.length; i++) {
+      if (!isResetIndex(indices[i])) continue;
+      if (i > start) ranges.push([start, i - start]);
+      start = i + 1;
+    }
+    if (start < indices.length) ranges.push([start, indices.length - start]);
+    return ranges;
+  }
   // Expand a decoded (little-endian, in-register typed array) index buffer for
   // a converted primitive type. Returns null when there is nothing to draw.
-  function expandConvertedIndices(indices, kind) {
+  // When isResetIndex is given, the index buffer is split at the guest's
+  // primitive reset index and every range is converted on its own — xenia's
+  // GetMultiPrimitiveHostIndexCountAndRanges + ConvertSinglePrimitiveRanges.
+  function expandConvertedIndices(indices, kind, isResetIndex = null) {
     const n = indices.length;
-    if (kind === 'fan') {
-      if (n < 3) return null;
-      const out = new indices.constructor((n - 2) * 3);
-      const v0 = indices[0];
+    // xenia's index-count getters: GetTriangleFanListIndexCount,
+    // GetLineLoopStripIndexCount, GetQuadListTriangleListIndexCount.
+    const convertedCount = (count) => {
+      if (kind === 'fan') return count > 2 ? (count - 2) * 3 : 0;
+      if (kind === 'loop') return count > 1 ? count + 1 : 0;
+      return Math.floor(count / 4) * 6;
+    };
+    const convertRange = (src, count) => {
+      const out = new src.constructor(convertedCount(count));
+      // xenia's converters bail out when the range cannot complete a primitive
+      // ("if (source_index_count <= 2) return;" / "<= 1" / a whole number of
+      // quads) — the destination stays empty and the range contributes nothing.
+      if (out.length === 0) return out;
+      if (kind === 'fan') {
+        // xenia's TriangleFanToList (primitive_processor.h): every triangle is
+        // (previous, current, first) — the fan's first index closes each
+        // triangle. The winding matches the hardware's fan assembly.
+        let o = 0;
+        for (let i = 2; i < count; i++) { out[o++] = src[i - 1]; out[o++] = src[i]; out[o++] = src[0]; }
+        return out;
+      }
+      if (kind === 'loop') {
+        // xenia's LineLoopToStrip: the source, with the first index re-appended.
+        out.set(src.subarray(0, count), 0);
+        out[count] = src[0];
+        return out;
+      }
+      // quads: two triangles per quad, xenia's order (v0,v1,v2), (v0,v2,v3)
       let o = 0;
-      for (let i = 2; i < n; i++) { out[o++] = v0; out[o++] = indices[i - 1]; out[o++] = indices[i]; }
+      for (let q = 0; q < Math.floor(count / 4); q++) {
+        const b = q * 4, i0 = src[b], i1 = src[b + 1], i2 = src[b + 2], i3 = src[b + 3];
+        out[o++] = i0; out[o++] = i1; out[o++] = i2;
+        out[o++] = i0; out[o++] = i2; out[o++] = i3;
+      }
       return out;
+    };
+    if (!isResetIndex) {
+      if (convertedCount(n) === 0) return null;
+      return convertRange(indices, n);
     }
-    if (kind === 'loop') {
-      if (n < 2) return null;
-      const out = new indices.constructor(n + 1);
-      out.set(indices, 0);
-      out[n] = indices[0];
-      return out;
+    // Split at the reset index; the reset value itself is dropped.
+    const ranges = [];
+    let start = 0;
+    for (let i = 0; i < n; i++) {
+      if (isResetIndex(indices[i])) { ranges.push([start, i - start]); start = i + 1; }
     }
-    // quads: two triangles per quad, xenia's order (v0,v1,v2), (v0,v2,v3)
-    const quads = Math.floor(n / 4);
-    if (quads === 0) return null;
-    const out = new indices.constructor(quads * 6);
+    ranges.push([start, n - start]);
+    let total = 0;
+    for (const [, count] of ranges) total += convertedCount(count);
+    if (total === 0) return null;
+    const out = new indices.constructor(total);
     let o = 0;
-    for (let q = 0; q < quads; q++) {
-      const b = q * 4, i0 = indices[b], i1 = indices[b + 1], i2 = indices[b + 2], i3 = indices[b + 3];
-      out[o++] = i0; out[o++] = i1; out[o++] = i2;
-      out[o++] = i0; out[o++] = i2; out[o++] = i3;
+    for (const [off, count] of ranges) {
+      const part = convertRange(indices.subarray(off, off + count), count);
+      out.set(part, o);
+      o += part.length;
     }
     return out;
   }
@@ -1111,10 +1182,19 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
      * object carries the effective index format and the (possibly expanded) count —
      * 0 means fewer guest indices than one primitive; the caller skips the draw.
      */
-    uploadIndexBuffer({ indexGuestBase, numIndices, indexFormat /* 0=int16, 1=int32 */, indexEndianness /* swap_mode 0..3 from VGT_DMA_SIZE */, primType = 0 }) {
+    uploadIndexBuffer({ indexGuestBase, numIndices, indexFormat /* 0=int16, 1=int32 */, indexEndianness /* swap_mode 0..3 from VGT_DMA_SIZE */, primType = 0, multiPrimIbEnable = false, multiPrimResetIndex = 0 }) {
       if (!this.device) throw new XenosWebGpuError('uploadIndexBuffer before attach()');
       const bytesPerIndex = indexFormat === 1 ? 4 : 2;
       const total = numIndices * bytesPerIndex;
+      // xenia's primitive processor normalizes the swap mode for 16-bit
+      // indices: "32-bit endian swap mode {} is used for 16-bit indices ...
+      // Currently disabling the swap for 16-and-32 and replacing 8-in-32 with
+      // 8-in-16."
+      let swapMode = indexEndianness | 0;
+      if (indexFormat === 0 && swapMode !== 0 && swapMode !== 1) {
+        this.log('warn', `draw: 32-bit endian swap mode ${swapMode} is used for 16-bit indices — xenia replaces 8-in-32 with 8-in-16 and disables the other 32-bit modes`);
+        swapMode = swapMode === 2 ? 1 : 0;
+      }
       const view = this.readGuestMemory(indexGuestBase >>> 0);
       if (!view) throw new XenosWebGpuError(`index buffer at guest physical 0x${(indexGuestBase >>> 0).toString(16)} is not mapped`);
       const paddedTotal = Math.ceil(total / 4) * 4;
@@ -1122,17 +1202,51 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       const src = view instanceof Uint8Array ? view : new Uint8Array(view.buffer, view.byteOffset ?? 0, view.byteLength ?? view.buffer.byteLength);
       be.set(src.subarray(0, total));
       // The GPU fetch path applies the VGT_DMA_SIZE swap_mode to raw guest bytes; we mirror that on upload:
-      // read each 32-bit word big-endian, apply GpuSwap(swap_mode), write it little-endian for the LE GPU.
+      // read the guest words big-endian, apply GpuSwap(swap_mode), write them little-endian for the LE GPU.
+      // The swap width follows the index width: 16-bit indices are swapped with
+      // GpuSwap16 (xenia's xenos.h uint16 overload — the 32-bit-only modes are
+      // normalized away above), 32-bit indices with GpuSwap32.
       const gpuSwap32 = pm4().gpuSwap32;
+      const gpuSwap16 = pm4().gpuSwap16;
       const base = indexGuestBase >>> 0;
       const decode = () => {
         // The swap is only forced for primitive conversion — the plain path swaps lazily
         // on cache miss, so identical repeated index buffers cost only the hash below.
         const decoded = new Uint8Array(paddedTotal);
         const s = new DataView(be.buffer), d = new DataView(decoded.buffer);
-        for (let i = 0; i < paddedTotal; i += 4) d.setUint32(i, gpuSwap32(s.getUint32(i, false), indexEndianness | 0), true);
+        if (indexFormat === 1) {
+          for (let i = 0; i + 3 < paddedTotal; i += 4) d.setUint32(i, gpuSwap32(s.getUint32(i, false), swapMode), true);
+        } else {
+          for (let i = 0; i + 1 < paddedTotal; i += 2) d.setUint16(i, gpuSwap16(s.getUint16(i, false), swapMode), true);
+        }
         return decoded;
       };
+      // xenia's primitive reset index: it applies only when the guest enables
+      // multi-primitive index buffers (PA_SU_SC_MODE_CNTL.multi_prim_ib_ena)
+      // and only to the strip-like primitive types. The reset value is
+      // compared in the guest's index endianness (xenia:
+      // "guest_primitive_reset_index_guest_endian = GpuSwap(reset_indx,
+      // guest_index_endian)"), so the same swap the indices went through is
+      // applied to the reset index before the comparison; 16-bit indices
+      // compare all 16 bits, 32-bit indices only the low 24 (xenia's vertex
+      // index mask).
+      let resetMatcher = null;
+      if (multiPrimIbEnable && PRIM_TYPE_RESETTABLE.has((primType ?? 0) & 0x3f)) {
+        const resetIndex = multiPrimResetIndex >>> 0;
+        if (indexFormat === 0) {
+          // xenia only enables the reset for 16-bit indices when the reset
+          // index fits into 16 bits ("guest_primitive_reset_index_guest_endian
+          // <= UINT16_MAX"); a wider guest value cannot be represented and
+          // would silently alias a real index.
+          if ((resetIndex >>> 16) === 0) {
+            const value = gpuSwap16(resetIndex, swapMode);
+            resetMatcher = (i) => i === value;
+          }
+        } else {
+          const value = gpuSwap32(resetIndex, swapMode) & 0xffffff;
+          resetMatcher = (i) => (i & 0xffffff) === value;
+        }
+      }
       // Host-side primitive conversion (fan/loop/quad-list → list/strip).
       const convert = PRIM_TYPE_CONVERT.get((primType ?? 0) & 0x3f);
       if (convert) {
@@ -1141,13 +1255,13 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
           this.log('warn', `draw: ${numIndices} indices do not complete ${Math.floor(numIndices / 4)} quad(s) — the ${numIndices & 3} leftover index value(s) are dropped (hardware primitive assembly behaves the same)`);
         }
         const typed = new (indexFormat === 1 ? Uint32Array : Uint16Array)(decoded.buffer, decoded.byteOffset, numIndices);
-        const expanded = expandConvertedIndices(typed, convert.kind);
+        const expanded = expandConvertedIndices(typed, convert.kind, resetMatcher);
         if (!expanded) {
           return { buffer: null, numIndices: 0, indexFormat }; // fewer indices than one primitive — nothing to draw
         }
         const finalBytes = new Uint8Array(expanded.buffer, expanded.byteOffset, expanded.byteLength);
         // salt the cache key so the converted buffer at the same guest base never aliases the raw one
-        const salt = ((indexEndianness | 0) | ((primType & 0x3f) << 4)) >>> 0;
+        const salt = ((swapMode | 0) | ((primType & 0x3f) << 4) | (resetMatcher ? 0x40 : 0) | ((multiPrimResetIndex & 0xffffff) << 8)) >>> 0;
         const { buffer, hit } = this._cachedBuffer('ib', base, finalBytes.byteLength, salt, finalBytes, () => {
           const buf = this.device.createBuffer({ size: Math.ceil(finalBytes.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: 'xenos-index' });
           const padded = new Uint8Array(Math.ceil(finalBytes.byteLength / 4) * 4);
@@ -1161,7 +1275,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         }
         return { buffer, numIndices: expanded.length, indexFormat };
       }
-      const { buffer, hit } = this._cachedBuffer('ib', base, total, indexEndianness | 0, be, () => {
+      const { buffer, hit } = this._cachedBuffer('ib', base, total, swapMode | 0, be, () => {
         const buf = this.device.createBuffer({ size: paddedTotal, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST, label: 'xenos-index' });
         this.device.queue.writeBuffer(buf, 0, decode());
         return buf;
@@ -1170,7 +1284,15 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
         this.uploads.indexBuffers++;
         this.uploads.indexBytes += total;
       }
-      return { buffer, numIndices, indexFormat };
+      // The guest's primitive reset index ends a strip: the markers are not
+      // vertices, and every range between two markers is a separate strip.
+      let ranges = null;
+      if (resetMatcher && PRIM_TYPE_STRIP_RESETTABLE.has((primType ?? 0) & 0x3f)) {
+        const decoded = decode();
+        const typed = new (indexFormat === 1 ? Uint32Array : Uint16Array)(decoded.buffer, decoded.byteOffset, numIndices);
+        ranges = splitResetRanges(typed, resetMatcher);
+      }
+      return { buffer, numIndices, indexFormat, ranges };
     }
 
     /**
@@ -1359,9 +1481,19 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
           indexFormat: params.indexFormat,
           indexEndianness: params.indexEndianness,
           primType,
+          multiPrimIbEnable: !!params.multiPrimIbEnable,
+          multiPrimResetIndex: params.multiPrimResetIndex >>> 0,
         });
         if (ib.numIndices === 0) { this.log('info', `draw: prim 0x${primType.toString(16)} with fewer indices than one primitive — nothing to draw`); return; }
         pass.setIndexBuffer(ib.buffer, ib.indexFormat === 1 ? 'uint32' : 'uint16');
+        // A guest primitive reset splits the strip into several strips — one
+        // draw per range (the reset markers themselves are not vertices).
+        if (ib.ranges && ib.ranges.length > 1) {
+          for (const [first, count] of ib.ranges) {
+            if (count > 0) pass.drawIndexed(count, 1, first, 0, 0);
+          }
+          return;
+        }
         pass.drawIndexed(ib.numIndices, 1, 0, 0, 0);
         return;
       }

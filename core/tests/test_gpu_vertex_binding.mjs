@@ -190,6 +190,27 @@ test('fetch draw uploads the guest vertex buffer with BE→LE dword swap and bin
   assert.equal(pass.ib, null);
 });
 
+test('the fetch constant address counts dwords — a non-round address selects the right buffer (xenia)', () => {
+  // xenia's xe_gpu_vertex_fetch_t.address counts *dwords* and the guest
+  // address is "vfetch_constant.address << 2" (xenia
+  // d3d12_command_processor.cc: shared_memory_->RequestRange(
+  // vfetch_constant.address << 2, ...)). The address below (0x00100004) is not
+  // a multiple of 16 bytes, so an implementation that read the field as a byte
+  // address would upload a different buffer.
+  const guest = makeGuest();
+  const view = new DataView(guest.arena.buffer);
+  const VB2 = 0x00100004;
+  for (let i = 0; i < 9; i++) view.setFloat32(VB2 + i * 4, 100 + i, false);
+  const backend = makeBackend(guest);
+  const consts = new Uint32Array(192);
+  consts[0] = ((VB2 >> 2) << 2) | 3; // type=vertex, address field = 0x00040001 dwords
+  consts[1] = 9 << 2;                // sizeWords 9 (36 bytes), endian kNone
+  backend.draw({ ...baseParams, vertexFetchConstants: consts });
+  const wb = backend.device.calls.writeBuffer[0];
+  const floats = new Float32Array(wb.data.buffer, wb.data.byteOffset, 9);
+  assert.deepEqual([...floats], [100, 101, 102, 103, 104, 105, 106, 107, 108]);
+});
+
 test('fetch draw declares the descriptor layout on the placeholder pipeline', () => {
   const guest = makeGuest();
   const backend = makeBackend(guest);

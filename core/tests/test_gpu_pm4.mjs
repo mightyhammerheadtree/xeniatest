@@ -335,17 +335,36 @@ test('DRAW_INDX (indexed, DMA) decodes the initiator and notifies the backend', 
   const sourceSelect = PM4.SOURCE_SELECT.kDMA;
   const initiator = ((numIndices & 0xffff) << 16) | (0 << 12) | (0 << 11) | (sourceSelect << 6) | primType;
   const dmaBase = 0x00c00000; // GPU bus (29 bits)
-  const dmaSize = (6 & 0x00ffffff) | (2 << 30); // 6 words, k8in32
+  // xenia counts the declared index buffer in elements (index_buffer_info.length
+  // = num_words * index_size_bytes), so 0xF0 words cover the 0xF0 indices.
+  const dmaSize = (0xf0 & 0x00ffffff) | (2 << 30); // 0xF0 words, k8in32
   cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX, 4), 0x00000000 /* viz */, initiator, dmaBase, dmaSize]));
   const draws = backend.calls.filter((c) => c.kind === 'draw');
   assert.equal(draws.length, 1);
   assert.deepEqual(
     { primType: draws[0].primType, numIndices: draws[0].numIndices, isIndexed: draws[0].isIndexed, indexGuestBase: draws[0].indexGuestBase, indexFormat: draws[0].indexFormat, indexEndianness: draws[0].indexEndianness, indexLengthWords: draws[0].indexLengthWords, majorModeExplicit: draws[0].majorModeExplicit },
-    { primType: 4, numIndices: 0x00f0, isIndexed: true, indexGuestBase: 0x00c00000, indexFormat: 0, indexEndianness: 2, indexLengthWords: 6, majorModeExplicit: false },
+    { primType: 4, numIndices: 0x00f0, isIndexed: true, indexGuestBase: 0x00c00000, indexFormat: 0, indexEndianness: 2, indexLengthWords: 0xf0, majorModeExplicit: false },
   );
   assert.equal(cp.registers.read(0x21fc), initiator >>> 0, 'VGT_DRAW_INITIATOR written');
   assert.equal(cp.registers.read(0x21fa), 0x00c00000, 'VGT_DMA_BASE written');
   assert.equal(cp.stats.draws, 1);
+});
+
+test('DRAW_INDX clamps the index count to the declared VGT_DMA_SIZE range (xenia)', () => {
+  const guest = makeGuest();
+  const backend = makeBackend(guest);
+  const cp = enableDraws(makeCP(guest, backend));
+  const numIndices = 0x00f0;
+  const initiator = ((numIndices & 0xffff) << 16) | (PM4.SOURCE_SELECT.kDMA << 6) | PM4.PRIMITIVE_TYPE.kTriangleList;
+  // The index buffer only declares 6 elements, the draw asks for 0xF0.
+  const dmaSize = (6 & 0x00ffffff) | (0 << 30);
+  cp.executeCommandBuffer(beWords([PM4.makePacketType3(PM4.PM4_OPCODE.PM4_DRAW_INDX, 4), 0x00000000 /* viz */, initiator, 0x00c00000, dmaSize]));
+  const draws = backend.calls.filter((c) => c.kind === 'draw');
+  assert.equal(draws.length, 1);
+  // xenia's primitive processor: "N vertices attempted to be drawn with an
+  // index buffer only containing M ... " -> the count is clamped to M.
+  assert.equal(draws[0].numIndices, 6, 'the draw is clamped to the declared index count');
+  assert.equal(draws[0].indexLengthWords, 6);
 });
 
 test('DRAW_INDX_2 (auto-index) draws without an index DMA', () => {

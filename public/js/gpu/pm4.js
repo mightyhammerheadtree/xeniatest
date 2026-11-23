@@ -173,6 +173,31 @@
     return v;
   }
 
+  /**
+   * GpuSwap for 16-bit values; endianness: 0=kNone, 1=k8in16.
+   *
+   * xenia (gpu/xenos.h):
+   *   inline uint16_t GpuSwap(uint16_t value, Endian endianness) {
+   *     switch (endianness) {
+   *       case Endian::kNone:   return value;
+   *       case Endian::k8in16:  return ((value << 8) & 0xFF00FF00) | ((value >> 8) & 0x00FF00FF);
+   *       default: assert_unhandled_case(endianness); return value;
+   *     }
+   *   }
+   * The 16-bit k8in16 form swaps the two bytes of the half word (the mask is
+   * wider than the value, so it truncates to the swapped 16-bit result).
+   * The 32-bit-only modes (k8in32/k16in32) are rejected by xenia for 16-bit
+   * index data — the caller normalizes them away before calling this.
+   */
+  function gpuSwap16(value, endianness) {
+    const v = value & 0xffff;
+    switch (endianness & 0x3) {
+      case 0: return v; // kNone
+      case 1: return ((v << 8) & 0xff00) | ((v >>> 8) & 0x00ff); // k8in16
+      default: return v;
+    }
+  }
+
   /** VGT_DMA_SIZE bitfield decode. */
   function parseVgtDmaSize(value) {
     const v = value >>> 0;
@@ -195,6 +220,7 @@
     parsePacketHeader,
     parseVgtDrawInitiator,
     parseVgtDmaSize,
+    gpuSwap16,
     gpuSwap32,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = XenosPM4;

@@ -1264,11 +1264,11 @@ test('triangle-fan (indexed): guest indices expand fan→list, pipeline uses tri
   backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', isIndexed: true, indexGuestBase: IB, indexFormat: 0, indexEndianness: 3 /* k16in32: swap 16-bit lanes in each 32-bit word — BE uint16 -> LE */, numIndices: 5 }));
   assert.equal(log.pipelines[0].desc.primitive.topology, 'triangle-list');
   assert.equal(log.vertexBindings.length, 1);
-  assert.deepEqual(log.drawCalls, [['drawIndexed', 9]]); // (7,8,9),(7,9,10),(7,10,11)
+  assert.deepEqual(log.drawCalls, [['drawIndexed', 9]]); // (8,9,7),(9,10,7),(10,11,7) — xenia's TriangleFanToList order
   assert.equal(log.indexBuffer.format, 'uint16');
   const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
   const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 9);
-  assert.deepEqual([...out], [7, 8, 9, 7, 9, 10, 7, 10, 11]);
+  assert.deepEqual([...out], [8, 9, 7, 9, 10, 7, 10, 11, 7]);
 });
 
 test('triangle-fan: the converted index buffer is content-cached across draws (one upload)', () => {
@@ -1328,7 +1328,7 @@ test('triangle-fan (implicit vertices, non-indexed): a synthetic index buffer is
   assert.equal(log.indexBuffer.format, 'uint16');
   const wp = log.writes.find((w) => w.buffer === log.indexBuffer.buffer);
   const out = new Uint16Array(wp.bytes.buffer, wp.bytes.byteOffset, 6);
-  assert.deepEqual([...out], [0, 1, 2, 0, 2, 3]);
+  assert.deepEqual([...out], [1, 2, 0, 2, 3, 0]);
   // and the synthetic buffer is memoized
   backend.draw(drawParams({ primType: 5, primTypeName: 'kTriangleFan', numIndices: 4, isIndexed: false }));
   const ibWrites = log.writes.filter((w) => w.buffer === log.indexBuffer.buffer);
@@ -1377,8 +1377,8 @@ test('degenerate fan/loop draws (fewer indices than one primitive) skip the draw
 
 test('expandConvertedIndices unit semantics (fan/loop/quads, widths preserved, degenerates)', () => {
   const { expandConvertedIndices } = INTERNAL;
-  assert.deepEqual([...expandConvertedIndices(new Uint16Array([0, 1, 2, 3, 4]), 'fan')], [0, 1, 2, 0, 2, 3, 0, 3, 4]);
-  assert.deepEqual([...expandConvertedIndices(new Uint32Array([9, 8, 7]), 'fan')], [9, 8, 7]);
+  assert.deepEqual([...expandConvertedIndices(new Uint16Array([0, 1, 2, 3, 4]), 'fan')], [1, 2, 0, 2, 3, 0, 3, 4, 0]);
+  assert.deepEqual([...expandConvertedIndices(new Uint32Array([9, 8, 7]), 'fan')], [8, 7, 9]);
   assert.equal(expandConvertedIndices(new Uint16Array([0, 1]), 'fan'), null);
   assert.deepEqual([...expandConvertedIndices(new Uint16Array([5, 6]), 'loop')], [5, 6, 5]);
   assert.equal(expandConvertedIndices(new Uint16Array([5]), 'loop'), null);
