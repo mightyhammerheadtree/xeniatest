@@ -38,8 +38,11 @@
  *     loudly (they need the EDRAM render-target cache, step 7). k_8_8_8_8_GAMMA
  *     is honored by gamma-encoding oC0's RGB in the translated PS (xenia's RTV
  *     path); blending then happens on gamma-encoded values (same caveat as xenia).
- *   - kD24S8 depth maps to WebGPU depth24plus-stencil8. kD24FS8 (20e4 float
- *     depth) is not representable and traps.
+ *   - kD24S8 depth maps to WebGPU depth24plus-stencil8; kD24FS8 (20e4 float
+ *     depth) maps to depth32float — WebGPU's float depth format, which has no
+ *     stencil, so a guest that wants stencil with a float depth traps. The
+ *     precision differs (float32 vs the guest's float24); the compare/write
+ *     semantics and the z remap are the guest's.
  *   - RB_SURFACE_INFO.msaa_samples selects the sample count of the frame's
  *     attachments: k1X renders single-sampled, k4X renders into a multisampled
  *     color and depth attachment whose resolve (a box filter over the samples)
@@ -595,17 +598,22 @@
     // translator enforces that itself); the flag records the RT's format.
     const convertColor0ToGamma = colorInfo0.format === 1;
 
-    // --- RB_DEPTH_INFO: D24S8 maps to depth24plus-stencil8; D24FS8 traps ----
+    // --- RB_DEPTH_INFO: D24S8 maps to depth24plus-stencil8; D24FS8 → depth32float ----
+    // xenia's D3D12 host uses a float depth format for the 20e4 depth target
+    // (the EDRAM clear/load/store shaders for kD24FS8 are float ones); WebGPU's
+    // float depth format (depth32float) has no stencil, so a guest that wants
+    // stencil with a float depth traps loudly.
     const depthInfo = decodeDepthInfo(raw.depthInfo);
     const depthControl = raw.depthControl >>> 0;
     const zEnable = (depthControl & 0x2) !== 0;
     const zWriteEnable = (depthControl & 0x4) !== 0;
     const stencilEnable = (depthControl & 0x1) !== 0;
     const backfaceEnable = (depthControl & 0x80) !== 0;
-    if (depthInfo.format === 1 && (zEnable || stencilEnable || psExportsDepth)) {
+    const floatDepth = depthInfo.format === 1;
+    if (floatDepth && stencilEnable) {
       throw new XenosRenderStateError(
-        'depth render target has format kD24FS8 (20e4 float depth) — not representable as depth24plus-stencil8; ' +
-        'the float24 depth path is part of the EDRAM render-target cache work (step 7). Refusing to draw');
+        'depth render target has format kD24FS8 (20e4 float depth) with stencil enabled — WebGPU has no float ' +
+        'depth format with a stencil plane (depth32float has none). Refusing to draw');
     }
 
     // --- stencil reference + masks (one pair per pass in WebGPU) -------------
@@ -662,7 +670,8 @@
 
     // --- depth/stencil state ------------------------------------------------
     const depthStencil = {
-      format: 'depth24plus-stencil8',
+      // The attachment format follows the guest's depth format.
+      format: floatDepth ? 'depth32float' : 'depth24plus-stencil8',
       depthWriteEnabled: zEnable && zWriteEnable,
       depthCompare: zEnable ? cmp(depthControl >>> 4) : 'always',
     };

@@ -9,7 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertValidWgsl, checkProgramLinks } from './helpers/dawn_validate.mjs';
+import { assertValidWgsl, checkProgramLinks, checkAttachmentFormats } from './helpers/dawn_validate.mjs';
 import '../../public/js/gpu/xenos_registers.js';
 import '../../public/js/gpu/register_file.js';
 import '../../public/js/gpu/pm4.js';
@@ -765,13 +765,34 @@ test('the offscreen target is released on resize() and destroy()', () => {
   assert.equal(destroyed, true, 'the stale offscreen target is destroyed on resize');
 });
 
-test('traps: kD24FS8 float depth refused when depth testing is enabled', () => {
+test('kD24FS8 float depth uses a depth32float attachment (xenia uses a float depth target for 20e4)', () => {
+  const guest = makeGuest();
+  seedVertexBuffer(guest);
+  const { backend, log } = makeBackend(guest);
+  backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
+  backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x2 | 0x4 }) }));
+  const depth = log.textures.filter((t) => t.desc.label === 'xenos-depth').at(-1);
+  assert.ok(depth, 'the depth attachment was created');
+  assert.equal(depth.desc.format, 'depth32float');
+  const pass = log.passes.at(-1);
+  assert.ok(pass, 'a render pass was recorded');
+  assert.ok(pass.depthStencilAttachment, 'the pass has a depth attachment');
+  assert.equal(pass.depthStencilAttachment.stencilLoadOp, undefined, 'a stencil-less depth attachment has no stencil ops');
+  assert.equal(pass.depthStencilAttachment.depthLoadOp, 'clear');
+});
+
+test('Dawn accepts the depth attachment formats this port chooses (depth24plus-stencil8, depth32float)', async () => {
+  assert.equal(await checkAttachmentFormats({ depthFormat: 'depth24plus-stencil8', stencil: true }), null);
+  assert.equal(await checkAttachmentFormats({ depthFormat: 'depth32float' }), null);
+});
+
+test('traps: kD24FS8 float depth with stencil is refused (WebGPU has no float depth format with a stencil plane)', () => {
   const guest = makeGuest();
   seedVertexBuffer(guest);
   const { backend } = makeBackend(guest);
   backend.shaders.vertex = { kind: 'vertex', code: FETCH_VS, dwords: FETCH_VS.length };
   assert.throws(
-    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x2 }) })),
+    () => backend.draw(drawParams({ renderTargets: defaultRenderTargets({ depthInfo: 1 << 16, depthControl: 0x1 | 0x2 }) })),
     /kD24FS8/);
 });
 

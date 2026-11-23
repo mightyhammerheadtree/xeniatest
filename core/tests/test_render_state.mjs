@@ -263,15 +263,26 @@ test('equal BF reference is fine', () => {
 });
 
 // ------------------------------------------------------------ traps
-test('kD24FS8 depth traps when depth/stencil is active', () => {
+test('kD24FS8 depth maps to WebGPU depth32float (xenia uses a float depth target for 20e4)', () => {
   const fs8 = 1 << 16;
-  assert.throws(() => rtState({ depthInfo: fs8, depthControl: 0x2 }), /kD24FS8/);
+  const st = rtState({ depthInfo: fs8, depthControl: 0x2 | 0x4 | 0x10 }); // z_enable | z_write | zfunc=less
+  assert.equal(st.depthStencil.format, 'depth32float');
+  assert.equal(st.depthStencil.depthWriteEnabled, true);
+  assert.equal(st.depthStencil.depthCompare, 'less');
+  assert.equal(st.depthFormatName, 'kD24FS8');
+});
+
+test('kD24FS8 depth with stencil traps (WebGPU has no float depth format with a stencil plane)', () => {
+  const fs8 = 1 << 16;
   assert.throws(() => rtState({ depthInfo: fs8, depthControl: 0x1 }), /kD24FS8/);
+  assert.throws(() => rtState({ depthInfo: fs8, depthControl: 0x1 | 0x2 }), /kD24FS8/);
   assert.doesNotThrow(() => rtState({ depthInfo: fs8, depthControl: 0 }), 'inactive depth state is not decoded');
 });
 
-test('kD24FS8 depth traps when the PS exports oDepth', () => {
-  assert.throws(() => rtState({ depthInfo: 1 << 16 }, { psExportsDepth: true }), /kD24FS8/);
+test('kD24S8 depth maps to WebGPU depth24plus-stencil8', () => {
+  const st = rtState({ depthInfo: 0, depthControl: 0x2 | 0x4 | 0x10 });
+  assert.equal(st.depthStencil.format, 'depth24plus-stencil8');
+  assert.equal(st.depthFormatName, 'kD24S8');
 });
 
 test('alpha test decodes (applied by the translated PS, not pipeline state)', () => {
@@ -550,7 +561,7 @@ test('rasterizer state: para polygon offset (points/lines) uses the FRONT regist
 
 test('rasterizer state: kD24FS8 depth uses the float24-ULP offset factor (xenia GetD3D10IntegerPolygonOffset)', () => {
   const s = rtState({
-    depthInfo: 1 << 16, // kD24FS8 (but no depth writes/tests → the D24FS8 trap does not fire)
+    depthInfo: 1 << 16, // kD24FS8 (float depth → depth32float)
     paSuScModeCntl: 0x800,
     paSuPolyOffsetFrontScale: bits(0.0),
     paSuPolyOffsetFrontOffset: bits(1.0),

@@ -375,6 +375,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       this._frameClearColor = false;
       this._frameClearDepth = false;
       this.depthSampleCount = 1;
+      this.depthAttachmentFormat = this.depthFormat;
       this.depthTexture = this.device.createTexture({
         size: [width, height, 1],
         format: this.depthFormat,
@@ -391,17 +392,18 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
      * color attachment's), so the depth texture is recreated when the guest
      * switches between 1x and multisampled rendering.
      */
-    _ensureDepthTexture(sampleCount) {
-      if (this.depthTexture && this.depthSampleCount === sampleCount) return;
+    _ensureDepthTexture(sampleCount, format = this.depthFormat) {
+      if (this.depthTexture && this.depthSampleCount === sampleCount && this.depthAttachmentFormat === format) return;
       if (!this.device || !this.canvas) return;
       const width = Math.max(1, this.canvas.width | 0);
       const height = Math.max(1, this.canvas.height | 0);
       if (this.depthTexture) this.depthTexture.destroy();
       this.depthSampleCount = sampleCount;
+      this.depthAttachmentFormat = format;
       this._frameClearDepth = false; // the new attachment starts undefined
       this.depthTexture = this.device.createTexture({
         size: [width, height, 1],
-        format: this.depthFormat,
+        format,
         sampleCount,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
         label: 'xenos-depth',
@@ -886,7 +888,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       if (!this._frame) {
         const encoder = this.device.createCommandEncoder({ label: 'xenos-frame' });
         const attachment = this._colorAttachment(rtState);
-        this._ensureDepthTexture(attachment.sampleCount);
+        this._ensureDepthTexture(attachment.sampleCount, rtState?.depthStencil?.format ?? this.depthFormat);
         const pass = this._beginFramePass(encoder, attachment);
         this._frame = {
           encoder, pass, colorView: attachment.view, draws: 0,
@@ -909,22 +911,22 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
       this._frameClearColor = true;
       const desc = { colorAttachments: [colorAttachment] };
       if (this.depthView) {
+        // A float depth attachment (depth32float) has no stencil plane — the
+        // stencil load/store ops must be omitted for it.
+        const hasStencil = this.depthAttachmentFormat !== 'depth32float';
         desc.depthStencilAttachment = this._frameClearDepth
           ? {
             view: this.depthView,
             depthLoadOp: 'load',
             depthStoreOp: 'store',
-            stencilLoadOp: 'load',
-            stencilStoreOp: 'store',
+            ...(hasStencil ? { stencilLoadOp: 'load', stencilStoreOp: 'store' } : {}),
           }
           : {
             view: this.depthView,
             depthLoadOp: 'clear',
             depthClearValue: 1.0,
             depthStoreOp: 'store',
-            stencilLoadOp: 'clear',
-            stencilClearValue: 0,
-            stencilStoreOp: 'store',
+            ...(hasStencil ? { stencilLoadOp: 'clear', stencilClearValue: 0, stencilStoreOp: 'store' } : {}),
           };
         this._frameClearDepth = true;
       }
